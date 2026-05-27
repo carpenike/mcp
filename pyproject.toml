@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "homelab-mcp"
+version = "0.1.0"
+description = "Homelab MCP server: cooklang + gatus tools exposed via Model Context Protocol"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Holt" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    # Core MCP transport. streamable-http transport requires >= 1.10.
+    "mcp>=1.10",
+    "starlette>=0.41",
+    "uvicorn[standard]>=0.32",
+    # HTTP client for upstream APIs (cooklang, federation, gatus).
+    "httpx>=0.27",
+    # Cloudflare Access JWT validation.
+    "pyjwt[crypto]>=2.10",
+    "cryptography>=43",
+    # Config / env handling.
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[project.scripts]
+homelab-mcp = "homelab_mcp.app:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-httpx>=0.34",
+]
+
+[project.urls]
+Homepage = "https://github.com/carpenike/mcp"
+Issues = "https://github.com/carpenike/mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/homelab_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "UP",    # pyupgrade
+    "N",     # pep8-naming
+    "ASYNC", # flake8-async
+    "S",     # bandit (security)
+    "SIM",   # simplifications
+]
+ignore = [
+    "S101", # asserts ok in tests
+    "E501", # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "N802"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_any_generics = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# The MCP SDK doesn't ship complete type stubs yet.
+module = ["mcp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers"]
