@@ -67,6 +67,15 @@ class Settings(BaseSettings):
             "Set this only if upstream changes the token shape."
         ),
     )
+    public_base_url: str = Field(
+        default="",
+        description=(
+            "The public URL clients use to reach this MCP server. Used to "
+            "construct the `resource` claim in the RFC 9728 protected-resource "
+            "metadata document. Example: 'https://mcp.holthome.net'. Required "
+            "in production (CF Access enabled); optional in dev."
+        ),
+    )
 
     # ── Cooklang ─────────────────────────────────────────────────────
     cooklang_base_url: str = Field(
@@ -127,6 +136,7 @@ class Settings(BaseSettings):
                 for name, value in (
                     ("HOMELAB_MCP_CF_ACCESS_TEAM", self.cf_access_team),
                     ("HOMELAB_MCP_CF_ACCESS_APP_ID", self.cf_access_app_id),
+                    ("HOMELAB_MCP_PUBLIC_BASE_URL", self.public_base_url),
                 )
                 if not value
             ]

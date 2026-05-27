@@ -35,6 +35,7 @@ def test_optional_cf_access_ok_without_team(monkeypatch: pytest.MonkeyPatch) -> 
 def test_required_cf_access_passes_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "bigheadltd")
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_APP_ID", "deadbeef" * 8)
+    monkeypatch.setenv("HOMELAB_MCP_PUBLIC_BASE_URL", "https://mcp.example.com")
     s = Settings()
     assert s.cf_access_team == "bigheadltd"
     assert s.cf_access_issuer == (
@@ -43,14 +44,26 @@ def test_required_cf_access_passes_when_set(monkeypatch: pytest.MonkeyPatch) -> 
     assert s.cf_access_jwks_url == s.cf_access_issuer + "/jwks"
     # Default audience == app_id
     assert s.cf_access_effective_audience == "deadbeef" * 8
+    assert s.public_base_url == "https://mcp.example.com"
 
 
 def test_audience_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "bigheadltd")
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_APP_ID", "deadbeef" * 8)
+    monkeypatch.setenv("HOMELAB_MCP_PUBLIC_BASE_URL", "https://mcp.example.com")
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_AUDIENCE", "custom-aud")
     s = Settings()
     assert s.cf_access_effective_audience == "custom-aud"
+
+
+def test_required_cf_access_fails_without_public_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "bigheadltd")
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_APP_ID", "deadbeef" * 8)
+    # PUBLIC_BASE_URL deliberately omitted
+    with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
+        Settings()
 
 
 def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

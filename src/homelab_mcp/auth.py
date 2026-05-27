@@ -72,7 +72,21 @@ class JWTAuthMiddleware:
     handlers can access the caller's identity (e.g. for per-user gating).
 
     On failure, returns 401 immediately without invoking the wrapped app.
+
+    Allowlisted paths (RFC 9728 protected-resource metadata, RFC 8414
+    authorization-server metadata aliases) are passed through unauthenticated
+    so MCP clients can discover the upstream authorization server before
+    they have a token. These docs contain no secrets.
     """
+
+    # Paths that must be reachable WITHOUT authentication so the OAuth
+    # discovery dance can complete. Keep this list minimal.
+    UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
+        {
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        }
+    )
 
     def __init__(
         self,
@@ -89,6 +103,10 @@ class JWTAuthMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if scope.get("path", "") in self.UNAUTHENTICATED_PATHS:
             await self.app(scope, receive, send)
             return
 
