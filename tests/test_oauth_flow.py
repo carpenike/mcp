@@ -179,6 +179,10 @@ async def _run_full_flow(
     assert upstream_params["client_id"] == ["mcp-client"]
     assert upstream_params["redirect_uri"] == ["https://mcp.example.com/oauth/callback"]
     assert upstream_params["scope"] == ["openid email profile"]
+    # PocketID enforces PKCE; we must send a code_challenge upstream
+    # and present the matching verifier on the upstream token exchange.
+    assert upstream_params["code_challenge_method"] == ["S256"]
+    assert "code_challenge" in upstream_params
 
     # ── 3. /oauth/callback ───────────────────────────────────────────
     # Stub PocketID's token + JWKS endpoints for the callback's S2S calls.

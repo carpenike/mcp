@@ -305,6 +305,14 @@ def build_routes(
         # callback can recover Claude's original context.
         state_token = secrets.token_urlsafe(32)
         nonce = secrets.token_urlsafe(16)
+        # PocketID enforces PKCE on its OIDC endpoint, so we run a
+        # second PKCE exchange between us and PocketID. The verifier
+        # is stored in `pending` so the callback can present it on the
+        # token exchange.
+        upstream_verifier = secrets.token_urlsafe(64)
+        upstream_challenge = _b64url_no_pad(
+            hashlib.sha256(upstream_verifier.encode("ascii")).digest()
+        )
 
         pending = PendingAuthorization(
             client_id=client_id,
@@ -313,7 +321,7 @@ def build_routes(
             code_challenge_method=code_challenge_method,
             claude_state=claude_state,
             scope=scope,
-            pocketid_code_verifier="",  # unused (we don't run PKCE upstream)
+            pocketid_code_verifier=upstream_verifier,
             pocketid_nonce=nonce,
             expires_at=time.time() + settings.oauth_code_lifetime_seconds,
         )
@@ -326,6 +334,8 @@ def build_routes(
             "scope": "openid email profile",
             "state": state_token,
             "nonce": nonce,
+            "code_challenge": upstream_challenge,
+            "code_challenge_method": "S256",
         }
         location = upstream.authorization_endpoint + "?" + urlencode(upstream_params)
         log.info(
@@ -368,6 +378,9 @@ def build_routes(
                     "redirect_uri": settings.pocketid_redirect_uri,
                     "client_id": settings.pocketid_client_id,
                     "client_secret": settings.pocketid_client_secret,
+                    # PocketID requires PKCE; the verifier matches the
+                    # challenge we sent on /authorize.
+                    "code_verifier": pending.pocketid_code_verifier,
                 },
                 headers={"Accept": "application/json"},
             )
