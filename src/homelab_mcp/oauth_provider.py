@@ -418,9 +418,7 @@ def build_routes(
             return _json_error(502, "upstream_error", "id_token issuer mismatch")
         # `aud` may be a string or a list per RFC 7519 §4.1.3.
         aud_claim = claims.get("aud")
-        aud_values: list[str] = (
-            [aud_claim] if isinstance(aud_claim, str) else list(aud_claim or [])
-        )
+        aud_values: list[str] = [aud_claim] if isinstance(aud_claim, str) else list(aud_claim or [])
         if settings.pocketid_client_id not in aud_values:
             log.warning(
                 "pocketid id_token audience mismatch: got=%r expected=%r",
@@ -564,6 +562,63 @@ def build_routes(
         Route("/oauth/callback", callback, methods=["GET"]),
         Route("/oauth/token", token, methods=["POST"]),
     ]
+
+
+def mint_tool_hop_token(
+    settings: Settings,
+    signing_key: SigningKey,
+    *,
+    sub: str,
+    email: str,
+    audience: str,
+    ttl_seconds: int = 60,
+    client_id: str = "homelab-mcp-internal",
+    scope: str = "",
+) -> str:
+    """Mint a short-TTL RS256 JWT addressed to a downstream resource server.
+
+    Used by tool modules that call other homelab APIs (e.g. RepLog's
+    `/api-mcp/*` route group per HOF-004) where the downstream wants to
+    authenticate the *original caller's identity*, not the proxy. The
+    caller's `sub` + `email` claims are carried verbatim from the JWT
+    that authenticated the inbound MCP request, but `aud` is rewritten
+    to point at the destination resource so the token cannot be replayed
+    elsewhere.
+
+    The same RSA signing key signs all minted tokens — downstream
+    resources fetch our JWKS once and verify offline. Bounded blast
+    radius on key compromise comes from per-resource `aud` enforcement
+    on the verification side, not from key separation (the "don't share
+    signing keys" rule in HOF-004's whiskey cross-reference refers to
+    NOT sharing private keys between independently-deployed services;
+    here a single AS legitimately mints for multiple resources, which
+    RFC 8414 + 9728 explicitly support).
+
+    The default `ttl_seconds=60` is intentionally short — tool-hop
+    tokens are consumed within milliseconds of being minted, and a tight
+    expiry caps replay risk if a token leaks via logs / proxy headers.
+    """
+    now = int(time.time())
+    token: str = (
+        JsonWebToken(["RS256"])
+        .encode(
+            header={"alg": "RS256", "kid": signing_key.kid, "typ": "JWT"},
+            payload={
+                "iss": settings.issuer,
+                "aud": audience,
+                "sub": sub,
+                "email": email,
+                "client_id": client_id,
+                "iat": now,
+                "nbf": now,
+                "exp": now + ttl_seconds,
+                "scope": scope,
+            },
+            key=signing_key.private_pem,
+        )
+        .decode("ascii")
+    )
+    return token
 
 
 def _extract_client_credentials(request: Request, form: Any) -> tuple[str, str]:

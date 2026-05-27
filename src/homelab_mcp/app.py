@@ -14,6 +14,7 @@ The CLI install (`pyproject.toml -> [project.scripts]`) points
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -53,7 +54,41 @@ def build_app(settings: Settings) -> Starlette:
     # naming stays "homelab-mcp" everywhere else (package, systemd
     # unit, user); this is purely the user-facing label.
     mcp = FastMCP("Holthome")
-    register_all(mcp, settings)
+
+    # Load the signing key BEFORE tool registration so tools that need
+    # to mint per-call JWTs for downstream resource calls (e.g. the
+    # replog.py module per HOF-004) get a working minter. When OAuth is
+    # disabled (local dev only), the minter is None and those tools
+    # log a warning + skip registration.
+    key: signing_key.SigningKey | None = None
+    mint_token: Any = None
+    if settings.oauth_required:
+        key = signing_key.load_or_create(settings)
+
+        # Closure capturing settings + key — keeps the tool modules from
+        # importing oauth_provider directly.
+        def mint_token(
+            *,
+            sub: str,
+            email: str,
+            audience: str,
+            ttl_seconds: int = 60,
+            client_id: str = "homelab-mcp-internal",
+            scope: str = "",
+        ) -> str:
+            assert key is not None  # narrowed for mypy — see oauth_required guard above
+            return oauth_provider.mint_tool_hop_token(
+                settings,
+                key,
+                sub=sub,
+                email=email,
+                audience=audience,
+                ttl_seconds=ttl_seconds,
+                client_id=client_id,
+                scope=scope,
+            )
+
+    register_all(mcp, settings, mint_token)
 
     # FastMCP exposes its Streamable HTTP transport as an ASGI app we can
     # mount middleware on. The route to call from clients is `/mcp`.
@@ -66,8 +101,7 @@ def build_app(settings: Settings) -> Starlette:
         )
         return app
 
-    # ── Load (or generate) the RSA signing key ──────────────────────
-    key = signing_key.load_or_create(settings)
+    assert key is not None  # narrowed: oauth_required is True here
 
     # ── Wire OAuth routes ───────────────────────────────────────────
     state = OAuthState()

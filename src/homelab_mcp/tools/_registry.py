@@ -1,20 +1,38 @@
 """Tool module auto-discovery.
 
 Convention: every file in this package (other than `_registry` and any
-file starting with `_`) that exports a top-level `register(mcp, settings)`
-function will have it called at app startup. This is what makes "one
-server, many namespaced tool categories" cheap to extend — new categories
-don't need to touch the central app.
+file starting with `_`) that exports a top-level `register()` function
+will have it called at app startup. This is what makes "one server,
+many namespaced tool categories" cheap to extend — new categories don't
+need to touch the central app.
+
+The `register()` callable may take either two or three positional
+arguments:
+
+    def register(mcp, settings) -> None: ...                 # most tools
+    def register(mcp, settings, mint_token) -> None: ...     # tools that
+                                                             # need to make
+                                                             # outbound calls
+                                                             # to OTHER MCP-
+                                                             # protected
+                                                             # resources
+
+The optional third arg (`mint_token`) is a callable that re-mints a
+short-TTL RS256 JWT addressed to a downstream resource (see HOF-004 /
+`oauth_provider.mint_tool_hop_token`). Tools that don't need it (cooklang,
+gatus, etc.) keep the two-arg signature and ignore the rest.
 
 See `AGENTS.md` for the naming conventions and security non-negotiables.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+from collections.abc import Callable
 from importlib import import_module
 from pkgutil import iter_modules
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -23,9 +41,24 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# A `mint_token` callable mirrors `oauth_provider.mint_tool_hop_token`'s
+# kwargs signature — kept as Any here to avoid pulling oauth_provider
+# into the registry (and to let tests substitute fakes).
+MintTokenFn = Callable[..., str]
 
-def register_all(mcp: FastMCP, settings: Settings) -> None:
-    """Walk this package, importing each non-underscore module and calling its register()."""
+
+def register_all(
+    mcp: FastMCP,
+    settings: Settings,
+    mint_token: MintTokenFn | None = None,
+) -> None:
+    """Walk this package, importing each non-underscore module and calling its register().
+
+    If `mint_token` is provided and a module's `register()` accepts a
+    third positional argument, the callable is passed through so the
+    module can mint per-call JWTs for outbound resource calls. Modules
+    with the legacy two-arg signature receive only `(mcp, settings)`.
+    """
     import homelab_mcp.tools as tools_pkg
 
     registered: list[str] = []
@@ -41,7 +74,28 @@ def register_all(mcp: FastMCP, settings: Settings) -> None:
             log.warning("tool module %s has no register() function — skipping", full)
             skipped.append(modname)
             continue
-        register_fn(mcp, settings)
+
+        # Dispatch by arity. inspect lets us support both signatures
+        # without making every tool take a parameter it doesn't use.
+        params = inspect.signature(register_fn).parameters
+        positional = [
+            p
+            for p in params.values()
+            if p.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        args: list[Any] = [mcp, settings]
+        if len(positional) >= 3:
+            if mint_token is None:
+                log.warning(
+                    "tool module %s declares a 3-arg register() but no mint_token was "
+                    "provided — skipping (likely a misconfiguration in app.py)",
+                    full,
+                )
+                skipped.append(modname)
+                continue
+            args.append(mint_token)
+        register_fn(*args)
         registered.append(modname)
 
     if not registered:
