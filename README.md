@@ -116,14 +116,14 @@ inputs.homelab-mcp = {
     package = inputs.homelab-mcp.packages.${pkgs.system}.default;
 
     settings = {
-      HOMELAB_MCP_CF_ACCESS_TEAM = "holthome";
+      HOMELAB_MCP_CF_ACCESS_TEAM = "bigheadltd";
       HOMELAB_MCP_COOKLANG_BASE_URL = "https://cook.holthome.net";
       HOMELAB_MCP_FEDERATION_BASE_URL = "https://fedcook.holthome.net";
       HOMELAB_MCP_GATUS_BASE_URL = "https://gatus.holthome.net";
     };
 
     environmentFile = config.sops.secrets."homelab-mcp/env".path;
-    # contains: HOMELAB_MCP_CF_ACCESS_AUD=<audience tag from CF Access SaaS app>
+    # contains: HOMELAB_MCP_CF_ACCESS_APP_ID=<OIDC Client ID from CF Access SaaS app>
   };
 }
 ```

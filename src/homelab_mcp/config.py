@@ -45,16 +45,26 @@ class Settings(BaseSettings):
         default="",
         description=(
             "Cloudflare Zero Trust team subdomain — the bit before "
-            "`.cloudflareaccess.com`. Example: 'holthome'."
+            "`.cloudflareaccess.com`. Example: 'bigheadltd'."
         ),
     )
-    cf_access_aud: str = Field(
+    cf_access_app_id: str = Field(
         default="",
         description=(
-            "Application Audience (AUD) tag from the Access SaaS app settings page. "
-            "This is what gets put into the `aud` claim of every JWT issued for "
-            "your MCP server. Pin it precisely or you'll accept tokens issued for "
-            "other apps in your team."
+            "OIDC Client ID of the Access for SaaS application — a 64-char "
+            "hex string visible on the app's Setup page in the Cloudflare "
+            "dashboard. This value is BOTH the OAuth client_id (used in "
+            "the per-app issuer/JWKS URL paths) AND the expected `aud` "
+            "claim of every access token. If your tokens carry a different "
+            "`aud` for some reason, override with `cf_access_audience`."
+        ),
+    )
+    cf_access_audience: str | None = Field(
+        default=None,
+        description=(
+            "Override the expected `aud` claim. Defaults to `cf_access_app_id` "
+            "which is correct for standard CF Access for SaaS deployments. "
+            "Set this only if upstream changes the token shape."
         ),
     )
 
@@ -84,13 +94,29 @@ class Settings(BaseSettings):
     # ── Derived ──────────────────────────────────────────────────────
     @property
     def cf_access_issuer(self) -> str:
-        """The `iss` claim every CF Access token will carry."""
-        return f"https://{self.cf_access_team}.cloudflareaccess.com"
+        """The `iss` claim every CF Access (for SaaS) access token will carry.
+
+        Per-app URL — Cloudflare scopes its OIDC issuer to each SaaS
+        application rather than to the team as a whole.
+        """
+        return (
+            f"https://{self.cf_access_team}.cloudflareaccess.com"
+            f"/cdn-cgi/access/sso/oidc/{self.cf_access_app_id}"
+        )
 
     @property
     def cf_access_jwks_url(self) -> str:
-        """JWKS endpoint the team's signing keys are published at."""
-        return f"https://{self.cf_access_team}.cloudflareaccess.com/cdn-cgi/access/certs"
+        """JWKS endpoint for the app's signing keys.
+
+        Also per-app, not team-wide. Cloudflare rotates these keys
+        periodically (so the JWKS cache TTL matters).
+        """
+        return f"{self.cf_access_issuer}/jwks"
+
+    @property
+    def cf_access_effective_audience(self) -> str:
+        """The audience value the middleware actually validates against."""
+        return self.cf_access_audience or self.cf_access_app_id
 
     # ── Cross-field validation ───────────────────────────────────────
     def model_post_init(self, __context: Any) -> None:
@@ -100,7 +126,7 @@ class Settings(BaseSettings):
                 name
                 for name, value in (
                     ("HOMELAB_MCP_CF_ACCESS_TEAM", self.cf_access_team),
-                    ("HOMELAB_MCP_CF_ACCESS_AUD", self.cf_access_aud),
+                    ("HOMELAB_MCP_CF_ACCESS_APP_ID", self.cf_access_app_id),
                 )
                 if not value
             ]

@@ -36,12 +36,12 @@ def build_app(settings: Settings) -> Starlette:
             JWTAuthMiddleware,
             jwks_cache=jwks,
             issuer=settings.cf_access_issuer,
-            audience=settings.cf_access_aud,
+            audience=settings.cf_access_effective_audience,
         )
         log.info(
             "CF Access JWT validation enabled (iss=%s aud=%s)",
             settings.cf_access_issuer,
-            settings.cf_access_aud,
+            settings.cf_access_effective_audience,
         )
     else:
         log.warning(

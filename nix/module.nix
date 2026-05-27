@@ -19,14 +19,14 @@
 #       package = inputs.homelab-mcp.packages.${pkgs.system}.default;
 #
 #       settings = {
-#         HOMELAB_MCP_CF_ACCESS_TEAM       = "holthome";
+#         HOMELAB_MCP_CF_ACCESS_TEAM       = "bigheadltd";
 #         HOMELAB_MCP_COOKLANG_BASE_URL    = "https://cook.holthome.net";
 #         HOMELAB_MCP_FEDERATION_BASE_URL  = "https://fedcook.holthome.net";
 #         HOMELAB_MCP_GATUS_BASE_URL       = "https://gatus.holthome.net";
 #       };
 #
 #       # File contents (sops-managed):
-#       #   HOMELAB_MCP_CF_ACCESS_AUD=<audience tag from CF Access SaaS app>
+#       #   HOMELAB_MCP_CF_ACCESS_APP_ID=<OIDC Client ID from CF Access SaaS app>
 #       environmentFile = config.sops.secrets."homelab-mcp/env".path;
 #     };
 #
@@ -96,7 +96,7 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          HOMELAB_MCP_CF_ACCESS_TEAM      = "holthome";
+          HOMELAB_MCP_CF_ACCESS_TEAM      = "bigheadltd";
           HOMELAB_MCP_COOKLANG_BASE_URL   = "https://cook.holthome.net";
           HOMELAB_MCP_FEDERATION_BASE_URL = "https://fedcook.holthome.net";
           HOMELAB_MCP_GATUS_BASE_URL      = "https://gatus.holthome.net";
@@ -105,7 +105,7 @@ in
       description = ''
         Declarative, NON-SECRET environment variables. Values appear in
         the Nix store world-readable — keep anything sensitive out.
-        Use `environmentFile` for HOMELAB_MCP_CF_ACCESS_AUD and any
+        Use `environmentFile` for HOMELAB_MCP_CF_ACCESS_APP_ID and any
         future secret values.
       '';
     };
@@ -118,7 +118,7 @@ in
         only (typical with sops-nix / agenix).
 
         Required keys:
-          HOMELAB_MCP_CF_ACCESS_AUD=<audience tag from CF Access SaaS app>
+          HOMELAB_MCP_CF_ACCESS_APP_ID=<OIDC Client ID from the CF Access SaaS app>
       '';
     };
 
