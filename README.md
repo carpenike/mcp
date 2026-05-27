@@ -41,7 +41,7 @@ An [MCP](https://modelcontextprotocol.io) server speaking the [Streamable HTTP t
 ┌─────────────────────┐
 │  Caddy on forge     │
 └──────────┬──────────┘
-           │ 127.0.0.1:9100
+           │ 127.0.0.1:9200
            ▼
 ┌─────────────────────┐    ┌────────────────────────────┐
 │  homelab-mcp.svc    ├───►│  JWTAuthMiddleware         │
@@ -77,7 +77,7 @@ Run the server locally (auth disabled for dev):
 ```bash
 HOMELAB_MCP_CF_ACCESS_REQUIRED=false \
 HOMELAB_MCP_BIND_ADDRESS=127.0.0.1 \
-HOMELAB_MCP_PORT=9100 \
+HOMELAB_MCP_PORT=9200 \
 homelab-mcp
 ```
 
@@ -85,7 +85,7 @@ Probe it:
 
 ```bash
 # health (no auth required, just hits the MCP transport)
-curl -s http://127.0.0.1:9100/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+curl -s http://127.0.0.1:9200/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 ## Tests

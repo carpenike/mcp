@@ -57,7 +57,7 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_REQUIRED", "false")
     s = Settings()
     assert s.bind_address == "127.0.0.1"
-    assert s.port == 9100
+    assert s.port == 9200
     assert s.cooklang_base_url == "https://cook.holthome.net"
     assert s.federation_base_url == "https://fedcook.holthome.net"
     assert s.gatus_base_url == "https://gatus.holthome.net"

@@ -55,8 +55,12 @@ in
 
     port = lib.mkOption {
       type = lib.types.port;
-      default = 9100;
-      description = "TCP port to bind on `host`.";
+      default = 9200;
+      description = ''
+        TCP port to bind on `host`. Defaults to 9200 — 9100 is the
+        well-known prometheus node-exporter port, which the homelab is
+        very likely to be using.
+      '';
     };
 
     host = lib.mkOption {

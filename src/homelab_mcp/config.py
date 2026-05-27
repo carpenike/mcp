@@ -33,7 +33,7 @@ class Settings(BaseSettings):
         default="127.0.0.1",
         description="Interface to bind. Keep on localhost — reverse proxy fronts this.",
     )
-    port: int = Field(default=9100, ge=1, le=65535)
+    port: int = Field(default=9200, ge=1, le=65535)
     log_level: str = Field(default="info", pattern="^(debug|info|warning|error|critical)$")
 
     # ── Cloudflare Access ────────────────────────────────────────────
