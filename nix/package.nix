@@ -9,6 +9,8 @@
 , starlette
 , uvicorn
 , httpx
+, authlib
+, itsdangerous
 , pyjwt
 , cryptography
 , pydantic
@@ -32,6 +34,8 @@ buildPythonApplication {
     starlette
     uvicorn
     httpx
+    authlib
+    itsdangerous
     pyjwt
     cryptography
     pydantic

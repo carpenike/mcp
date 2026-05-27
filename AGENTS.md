@@ -1,21 +1,28 @@
 # homelab-mcp — Agent Instructions
 
 > You're working on a small Model Context Protocol server that bridges
-> Claude (via Cloudflare Access) into homelab APIs. Single user, single
-> deployment target (forge), conservative scope. **One server, multiple
-> tool categories namespaced by prefix.**
+> Claude (over an embedded OAuth 2.1 provider) into homelab APIs. Single
+> user, single deployment target (forge), conservative scope. **One server,
+> multiple tool categories namespaced by prefix.**
 
 ## Quick orientation
 
-- **What it is:** A Python Streamable-HTTP MCP server. Validates Cloudflare
-  Access JWTs on every request. Exposes tools that wrap internal homelab
-  APIs (cooklang web server, federation search, gatus uptime, etc.).
-- **Stack:** Python 3.12+ · `mcp` SDK · Starlette/uvicorn · httpx · pyjwt
-- **Auth:** Cloudflare Access "Access for SaaS (OIDC)" mode is the OAuth
-  authorization server Claude talks to. Identity federates upstream to
-  PocketID (`id.holthome.net`) so passkey login flows through there. The
-  MCP server itself just validates bearer tokens against
-  `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`.
+- **What it is:** A Python Streamable-HTTP MCP server. Runs its own OAuth
+  2.1 Authorization Server (RFC 8414 + 7591 + 9728 + PKCE) that federates
+  the user login upstream to PocketID. Validates the RS256 JWTs *we mint*
+  on every MCP request.
+- **Stack:** Python 3.12+ · `mcp` SDK · Starlette/uvicorn · httpx · authlib
+  (JOSE + OAuth primitives) · pyjwt (verifier path) · cryptography.
+- **Auth (new in v0.2):** WE are the Authorization Server Claude talks to.
+  PocketID (`id.holthome.net`) is the upstream OIDC IdP we federate to for
+  passkey login. There is **no Cloudflare Access for SaaS dependency** —
+  it was removed because its OIDC discovery doc uses non-spec field names
+  Claude rejects.
+  - RSA-2048 signing key resident on the host (sops-managed PEM or
+    auto-generated/persisted to `/var/lib/homelab-mcp/signing-key.pem`).
+  - Public key served at `/oauth/jwks.json`.
+  - `JWTAuthMiddleware` verifies in-process against the public key — no
+    network calls per request.
 - **Deployment:** NixOS module in `nix/module.nix`, consumed by
   `carpenike/nix-config` as a flake input. Service runs as the
   `homelab-mcp` system user (extra group: `cooklang`, so it can write to

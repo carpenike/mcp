@@ -22,9 +22,18 @@ dependencies = [
     "mcp>=1.10",
     "starlette>=0.41",
     "uvicorn[standard]>=0.32",
-    # HTTP client for upstream APIs (cooklang, federation, gatus).
+    # HTTP client for upstream APIs (cooklang, federation, gatus) AND
+    # for the OAuth federation flow that talks to PocketID's token
+    # endpoint server-to-server.
     "httpx>=0.27",
-    # Cloudflare Access JWT validation.
+    # OAuth 2.1 authorization server. We use authlib's primitives
+    # (AuthorizationServer, AuthorizationCodeGrant) + its JOSE library
+    # for RS256 JWT issuance and verification.
+    "authlib>=1.6",
+    # Signed session cookies for the in-flight authorize state
+    # (correlates Claude's request with PocketID's callback).
+    "itsdangerous>=2.2",
+    # JWT validation library, kept for the verifier path.
     "pyjwt[crypto]>=2.10",
     "cryptography>=43",
     # Config / env handling.
@@ -76,6 +85,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "N802"]
+# S105 false-positives — these are OAuth-spec identifier strings, not credentials.
+"src/homelab_mcp/oauth_provider.py" = ["S105"]
+"src/homelab_mcp/oauth_state.py" = ["S105"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -88,6 +100,11 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 # The MCP SDK doesn't ship complete type stubs yet.
 module = ["mcp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Authlib doesn't ship type stubs.
+module = ["authlib.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

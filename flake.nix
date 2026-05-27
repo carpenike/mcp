@@ -64,6 +64,8 @@
               starlette
               uvicorn
               httpx
+              authlib
+              itsdangerous
               pyjwt
               cryptography
               pydantic

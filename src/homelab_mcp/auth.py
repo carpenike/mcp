@@ -1,90 +1,60 @@
-"""Cloudflare Access JWT validation.
+"""JWT authentication middleware for homelab-mcp.
 
-Cloudflare Access (in either reverse-proxy or "Access for SaaS (OIDC)"
-mode) signs every token with per-team RSA keys published at
-`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. We cache
-those keys for an hour and validate every incoming HTTP request before
-forwarding it to the MCP transport handler.
+We are our own OAuth 2.1 Authorization Server (see oauth_provider.py).
+Every access token we mint is an RS256 JWT signed by the local signing
+key. This middleware validates incoming tokens against the *public* side
+of that key, in-process, with no network calls.
 
-Tokens are accepted from either:
-  - `Authorization: Bearer <jwt>` (the MCP custom-connector path)
-  - `Cf-Access-Jwt-Assertion: <jwt>` (the reverse-proxy header path)
+Tokens are accepted from `Authorization: Bearer <jwt>`. Cloudflare's
+legacy `Cf-Access-Jwt-Assertion` header is no longer accepted — we
+removed the CF Access integration.
 
 Any request missing/expired/mis-signed/wrong-audience gets a 401 with a
-JSON error body. Non-HTTP scopes (lifespan, websocket) pass through
-untouched.
+JSON error body that follows the OAuth 2.0 Bearer Token spec (RFC 6750).
+Non-HTTP scopes (lifespan, websocket) pass through untouched.
+
+Allowlisted paths (RFC 9728 protected-resource metadata, RFC 8414
+authorization-server metadata, the OAuth endpoints themselves) are
+passed through unauthenticated so MCP clients can discover the AS and
+complete a login before they have a token.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import time
-from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from homelab_mcp.signing_key import SigningKey
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class JWKSCache:
-    """Cache of the team's JSON Web Key Set, refreshed every `ttl` seconds.
-
-    Thread-safety via asyncio.Lock — uvicorn runs one event loop so this
-    is sufficient.
-    """
-
-    jwks_url: str
-    ttl: float = 3600.0
-    _cache: dict[str, Any] = field(default_factory=dict)
-    _expires: float = 0.0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    async def get(self) -> dict[str, Any]:
-        """Return the current JWKS, refreshing from upstream if stale."""
-        async with self._lock:
-            now = time.monotonic()
-            if now < self._expires and self._cache:
-                return self._cache
-            log.debug("refreshing JWKS from %s", self.jwks_url)
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(self.jwks_url)
-                resp.raise_for_status()
-                self._cache = resp.json()
-                self._expires = now + self.ttl
-            log.info(
-                "JWKS refreshed: %d keys (kids=%s)",
-                len(self._cache.get("keys", [])),
-                ",".join(k.get("kid", "?") for k in self._cache.get("keys", [])),
-            )
-            return self._cache
-
-
 class JWTAuthMiddleware:
-    """ASGI middleware that requires a valid Cloudflare Access JWT on every HTTP request.
+    """ASGI middleware that requires a valid homelab-mcp-issued JWT on every HTTP request.
 
     On success, the decoded claims are stashed at `scope["user"]` so tool
     handlers can access the caller's identity (e.g. for per-user gating).
 
     On failure, returns 401 immediately without invoking the wrapped app.
-
-    Allowlisted paths (RFC 9728 protected-resource metadata, RFC 8414
-    authorization-server metadata aliases) are passed through unauthenticated
-    so MCP clients can discover the upstream authorization server before
-    they have a token. These docs contain no secrets.
     """
 
     # Paths that must be reachable WITHOUT authentication so the OAuth
-    # discovery dance can complete. Keep this list minimal.
+    # discovery + interactive flow can complete. Keep this list minimal.
     UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
         {
             "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-authorization-server",
+            "/oauth/jwks.json",
+            "/oauth/register",
+            "/oauth/authorize",
+            "/oauth/callback",
+            "/oauth/token",
         }
     )
 
@@ -92,14 +62,20 @@ class JWTAuthMiddleware:
         self,
         app: ASGIApp,
         *,
-        jwks_cache: JWKSCache,
+        signing_key: SigningKey,
         issuer: str,
         audience: str,
     ) -> None:
         self.app = app
-        self.jwks_cache = jwks_cache
         self.issuer = issuer
         self.audience = audience
+        # Derive the public key once. We need the cryptography object, not
+        # the JWK dict, because PyJWT takes the raw key.
+        private: RSAPrivateKey = serialization.load_pem_private_key(  # type: ignore[assignment]
+            signing_key.private_pem, password=None
+        )
+        self._public_key = private.public_key()
+        self._kid = signing_key.kid
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -112,11 +88,11 @@ class JWTAuthMiddleware:
 
         token = self._extract_token(scope)
         if not token:
-            await self._respond_401(send, "missing bearer token or CF Access header")
+            await self._respond_401(send, "missing bearer token")
             return
 
         try:
-            claims = await self._validate(token)
+            claims = self._validate(token)
         except jwt.InvalidTokenError as e:
             log.warning("JWT rejected: %s", e)
             await self._respond_401(send, f"invalid token: {e}")
@@ -132,42 +108,27 @@ class JWTAuthMiddleware:
 
     @staticmethod
     def _extract_token(scope: Scope) -> str | None:
-        """Pull the JWT from `Authorization: Bearer ...` or `Cf-Access-Jwt-Assertion`."""
+        """Pull the JWT from `Authorization: Bearer ...`."""
         headers: dict[bytes, bytes] = {k.lower(): v for k, v in scope.get("headers", [])}
-
         auth = headers.get(b"authorization", b"").decode("ascii", errors="ignore")
         if auth.lower().startswith("bearer "):
             return auth[7:].strip()
-
-        cf = headers.get(b"cf-access-jwt-assertion", b"").decode("ascii", errors="ignore")
-        if cf:
-            return cf.strip()
-
         return None
 
-    async def _validate(self, token: str) -> dict[str, Any]:
-        """Decode + verify the JWT against the team's JWKS. Raises on any failure."""
+    def _validate(self, token: str) -> dict[str, Any]:
+        """Decode + verify the JWT against the local public key. Raises on any failure."""
         unverified = jwt.get_unverified_header(token)
         kid = unverified.get("kid")
-        if not kid:
-            raise jwt.InvalidTokenError("JWT header missing 'kid'")
+        if kid != self._kid:
+            raise jwt.InvalidTokenError(f"unknown kid: {kid!r}")
 
-        jwks = await self.jwks_cache.get()
-        key_data = next(
-            (k for k in jwks.get("keys", []) if k.get("kid") == kid),
-            None,
-        )
-        if key_data is None:
-            raise jwt.InvalidTokenError(f"unknown kid: {kid}")
-
-        public_key = jwt.PyJWK(key_data).key
         decoded: dict[str, Any] = jwt.decode(
             token,
-            public_key,
-            algorithms=[unverified.get("alg", "RS256")],
+            self._public_key,
+            algorithms=["RS256"],
             issuer=self.issuer,
             audience=self.audience,
-            options={"require": ["exp", "iat", "iss", "aud"]},
+            options={"require": ["exp", "iat", "iss", "aud", "sub"]},
         )
         return decoded
 

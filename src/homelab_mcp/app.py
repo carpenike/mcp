@@ -1,6 +1,11 @@
 """homelab-mcp server entry point.
 
-Composes the MCP server with the JWT auth middleware and starts uvicorn.
+Composes:
+  - the FastMCP server (tool transport)
+  - the embedded OAuth 2.1 Authorization Server (oauth_provider)
+  - the JWT auth middleware (auth.JWTAuthMiddleware)
+  - the RFC 9728 protected-resource metadata route
+  - uvicorn as the ASGI runner
 
 The CLI install (`pyproject.toml -> [project.scripts]`) points
 `homelab-mcp` at `main` here.
@@ -17,8 +22,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from homelab_mcp.auth import JWKSCache, JWTAuthMiddleware
+from homelab_mcp import oauth_provider, signing_key
+from homelab_mcp.auth import JWTAuthMiddleware
 from homelab_mcp.config import Settings
+from homelab_mcp.oauth_state import OAuthState
 from homelab_mcp.tools import register_all
 
 log = logging.getLogger("homelab_mcp")
@@ -27,25 +34,20 @@ log = logging.getLogger("homelab_mcp")
 def _build_protected_resource_metadata(settings: Settings) -> dict[str, object]:
     """Construct the RFC 9728 protected-resource metadata document.
 
-    This is what Claude (and any MCP client) reads from
+    Read by Claude (and any compliant MCP client) from
     `/.well-known/oauth-protected-resource` to discover the authorization
-    server it needs to talk to. Without this, Claude's MCP custom-connector
-    flow falls back to assuming the AS is co-located with the MCP server at
-    `<base>/authorize` and `<base>/token`, which is wrong for our deployment
-    (the AS lives at Cloudflare Access, not on our origin).
+    server. We point at ourselves because we ARE the AS.
     """
     return {
-        "resource": settings.public_base_url,
-        "authorization_servers": [settings.cf_access_issuer],
-        # Bearer-token presentation methods accepted by our middleware.
+        "resource": settings.resource_url,
+        "authorization_servers": [settings.issuer],
         "bearer_methods_supported": ["header"],
-        # Informational — tells the client our middleware uses RS256.
         "resource_signing_alg_values_supported": ["RS256"],
     }
 
 
 def build_app(settings: Settings) -> Starlette:
-    """Construct the Starlette ASGI app with the MCP transport and JWT middleware."""
+    """Construct the Starlette ASGI app with the MCP transport + OAuth + JWT middleware."""
     mcp = FastMCP("homelab-mcp")
     register_all(mcp, settings)
 
@@ -53,47 +55,48 @@ def build_app(settings: Settings) -> Starlette:
     # mount middleware on. The route to call from clients is `/mcp`.
     app: Starlette = mcp.streamable_http_app()
 
-    # Add discovery routes. These must be reachable WITHOUT auth so OAuth
-    # clients can find the authorization server before they have a token.
-    # The JWTAuthMiddleware allowlists their paths (see auth.py).
-    if settings.cf_access_required:
-        prm = _build_protected_resource_metadata(settings)
-
-        async def oauth_protected_resource(_request: Request) -> JSONResponse:
-            return JSONResponse(prm)
-
-        app.router.routes.append(
-            Route(
-                "/.well-known/oauth-protected-resource",
-                oauth_protected_resource,
-                methods=["GET"],
-            )
-        )
-
-    if settings.cf_access_required:
-        jwks = JWKSCache(settings.cf_access_jwks_url)
-        app.add_middleware(
-            JWTAuthMiddleware,
-            jwks_cache=jwks,
-            issuer=settings.cf_access_issuer,
-            audience=settings.cf_access_effective_audience,
-        )
-        log.info(
-            "CF Access JWT validation enabled (iss=%s aud=%s)",
-            settings.cf_access_issuer,
-            settings.cf_access_effective_audience,
-        )
-        log.info(
-            "Protected-resource metadata served at /.well-known/oauth-protected-resource"
-            " (resource=%s)",
-            settings.public_base_url,
-        )
-    else:
+    if not settings.oauth_required:
         log.warning(
-            "CF Access JWT validation DISABLED — anyone who reaches this port "
-            "can call any tool. Use for local dev ONLY."
+            "OAuth DISABLED — anyone who reaches this port can call any tool. "
+            "Use for local dev ONLY."
         )
+        return app
 
+    # ── Load (or generate) the RSA signing key ──────────────────────
+    key = signing_key.load_or_create(settings)
+
+    # ── Wire OAuth routes ───────────────────────────────────────────
+    state = OAuthState()
+    for route in oauth_provider.build_routes(settings, key, state):
+        app.router.routes.append(route)
+
+    # ── Wire RFC 9728 protected-resource metadata ───────────────────
+    prm = _build_protected_resource_metadata(settings)
+
+    async def protected_resource(_request: Request) -> JSONResponse:
+        return JSONResponse(prm)
+
+    app.router.routes.append(
+        Route(
+            "/.well-known/oauth-protected-resource",
+            protected_resource,
+            methods=["GET"],
+        )
+    )
+
+    # ── Install JWT middleware ──────────────────────────────────────
+    app.add_middleware(
+        JWTAuthMiddleware,
+        signing_key=key,
+        issuer=settings.issuer,
+        audience=settings.resource_url,
+    )
+    log.info(
+        "OAuth enabled (issuer=%s audience=%s upstream=%s)",
+        settings.issuer,
+        settings.resource_url,
+        settings.pocketid_issuer,
+    )
     return app
 
 
@@ -105,10 +108,10 @@ def main() -> None:
     )
 
     log.info(
-        "homelab-mcp starting on %s:%d (cf_access=%s)",
+        "homelab-mcp starting on %s:%d (oauth=%s)",
         settings.bind_address,
         settings.port,
-        "on" if settings.cf_access_required else "OFF",
+        "on" if settings.oauth_required else "OFF",
     )
 
     app = build_app(settings)

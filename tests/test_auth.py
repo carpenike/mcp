@@ -7,41 +7,38 @@ change that file, these tests must still pass.
 
 from __future__ import annotations
 
-import base64
 import time
 from collections.abc import Awaitable
 from typing import Any
 
 import jwt
 import pytest
+from authlib.jose import JsonWebKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from homelab_mcp.auth import JWTAuthMiddleware
+from homelab_mcp.signing_key import SigningKey
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 
-def _b64url_uint(n: int) -> str:
-    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-
-
-def _make_jwks(pubkey: rsa.RSAPublicKey, kid: str = "test-kid") -> dict[str, Any]:
-    numbers = pubkey.public_numbers()
-    return {
-        "keys": [
-            {
-                "kty": "RSA",
-                "kid": kid,
-                "use": "sig",
-                "alg": "RS256",
-                "n": _b64url_uint(numbers.n),
-                "e": _b64url_uint(numbers.e),
-            }
-        ]
-    }
+def _signing_key_from(privkey: RSAPrivateKey, kid: str = "test-kid") -> SigningKey:
+    """Wrap a raw RSA private key in the SigningKey dataclass the middleware expects."""
+    pem = privkey.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = privkey.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_jwk = JsonWebKey.import_key(public_pem, {"kty": "RSA", "use": "sig", "alg": "RS256"})
+    public_dict: dict[str, Any] = dict(public_jwk.as_dict())
+    public_dict["kid"] = kid
+    return SigningKey(private_pem=pem, kid=kid, public_jwk=public_dict)
 
 
 def _make_token(
@@ -52,6 +49,7 @@ def _make_token(
     exp_offset: int = 300,
     kid: str = "test-kid",
     email: str = "test@example.com",
+    sub: str | None = None,
 ) -> str:
     pem = privkey.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -59,28 +57,16 @@ def _make_token(
         encryption_algorithm=serialization.NoEncryption(),
     )
     now = int(time.time())
-    return jwt.encode(
-        {
-            "iss": iss,
-            "aud": aud,
-            "exp": now + exp_offset,
-            "iat": now,
-            "email": email,
-        },
-        pem,
-        algorithm="RS256",
-        headers={"kid": kid},
-    )
-
-
-class StubJWKS:
-    """Stand-in for JWKSCache that returns a fixed dict."""
-
-    def __init__(self, jwks: dict[str, Any]) -> None:
-        self.jwks = jwks
-
-    async def get(self) -> dict[str, Any]:
-        return self.jwks
+    payload: dict[str, Any] = {
+        "iss": iss,
+        "aud": aud,
+        "exp": now + exp_offset,
+        "iat": now,
+        "nbf": now,
+        "sub": sub or email,
+        "email": email,
+    }
+    return jwt.encode(payload, pem, algorithm="RS256", headers={"kid": kid})
 
 
 # ── fixtures ─────────────────────────────────────────────────────────
@@ -92,18 +78,23 @@ def keypair() -> RSAPrivateKey:
 
 
 @pytest.fixture
-def jwks(keypair: RSAPrivateKey) -> dict[str, Any]:
-    return _make_jwks(keypair.public_key())
+def signing_key(keypair: RSAPrivateKey) -> SigningKey:
+    return _signing_key_from(keypair)
 
 
 @pytest.fixture
 def issuer() -> str:
-    return "https://test.cloudflareaccess.com"
+    return "https://mcp.example.com"
 
 
 @pytest.fixture
 def audience() -> str:
-    return "test-audience-tag"
+    return "https://mcp.example.com"
+
+
+@pytest.fixture
+def mw_kwargs(signing_key: SigningKey, issuer: str, audience: str) -> dict[str, Any]:
+    return {"signing_key": signing_key, "issuer": issuer, "audience": audience}
 
 
 # ── call harness ─────────────────────────────────────────────────────
@@ -113,8 +104,8 @@ async def _call(
     middleware_init_kwargs: dict[str, Any],
     *,
     token: str | None = None,
-    header_key: bytes = b"authorization",
     scope_type: str = "http",
+    path: str = "/mcp",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Drive the middleware with a synthetic ASGI scope and capture send() calls."""
     sent: list[dict[str, Any]] = []
@@ -133,19 +124,11 @@ async def _call(
 
     headers: list[tuple[bytes, bytes]] = []
     if token:
-        if header_key == b"authorization":
-            headers.append((b"authorization", f"Bearer {token}".encode()))
-        else:
-            headers.append((header_key, token.encode()))
+        headers.append((b"authorization", f"Bearer {token}".encode()))
 
     mw = JWTAuthMiddleware(inner_app, **middleware_init_kwargs)
-    await mw({"type": scope_type, "headers": headers}, receive, send)
+    await mw({"type": scope_type, "headers": headers, "path": path}, receive, send)
     return sent, inner_called
-
-
-@pytest.fixture
-def mw_kwargs(jwks: dict[str, Any], issuer: str, audience: str) -> dict[str, Any]:
-    return {"jwks_cache": StubJWKS(jwks), "issuer": issuer, "audience": audience}
 
 
 # ── tests ────────────────────────────────────────────────────────────
@@ -164,16 +147,41 @@ async def test_valid_bearer_token_passes(
     assert inner[0]["user"]["email"] == "test@example.com"
 
 
-async def test_valid_cf_access_header_passes(
+async def test_cf_access_header_no_longer_accepted(
     mw_kwargs: dict[str, Any],
     keypair: RSAPrivateKey,
     issuer: str,
     audience: str,
 ) -> None:
+    """We removed CF Access integration; only Authorization: Bearer is accepted."""
     token = _make_token(keypair, iss=issuer, aud=audience)
-    sent, inner = await _call(mw_kwargs, token=token, header_key=b"cf-access-jwt-assertion")
-    assert len(inner) == 1
-    assert sent[0]["status"] == 200
+    sent: list[dict[str, Any]] = []
+    inner_called: list[dict[str, Any]] = []
+
+    async def send(msg: dict[str, Any]) -> None:
+        sent.append(msg)
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def inner_app(scope: dict[str, Any], _r: Awaitable[Any], snd: Any) -> None:
+        inner_called.append(scope)
+
+    mw = JWTAuthMiddleware(
+        lambda *a, **k: inner_app(*a, **k),  # type: ignore[arg-type]
+        **mw_kwargs,
+    )
+    await mw(
+        {
+            "type": "http",
+            "path": "/mcp",
+            "headers": [(b"cf-access-jwt-assertion", token.encode())],
+        },
+        receive,
+        send,
+    )
+    assert len(inner_called) == 0
+    assert sent[0]["status"] == 401
 
 
 async def test_missing_token_returns_401(mw_kwargs: dict[str, Any]) -> None:
@@ -200,7 +208,7 @@ async def test_wrong_audience_returns_401(
     keypair: RSAPrivateKey,
     issuer: str,
 ) -> None:
-    token = _make_token(keypair, iss=issuer, aud="wrong-audience")
+    token = _make_token(keypair, iss=issuer, aud="https://wrong.example.com")
     sent, inner = await _call(mw_kwargs, token=token)
     assert len(inner) == 0
     assert sent[0]["status"] == 401
@@ -211,7 +219,7 @@ async def test_wrong_issuer_returns_401(
     keypair: RSAPrivateKey,
     audience: str,
 ) -> None:
-    token = _make_token(keypair, iss="https://other.cloudflareaccess.com", aud=audience)
+    token = _make_token(keypair, iss="https://other.example.com", aud=audience)
     sent, inner = await _call(mw_kwargs, token=token)
     assert len(inner) == 0
     assert sent[0]["status"] == 401
@@ -251,5 +259,22 @@ async def test_garbage_token_returns_401(mw_kwargs: dict[str, Any]) -> None:
 async def test_non_http_scope_passes_through(mw_kwargs: dict[str, Any]) -> None:
     """Lifespan / websocket scopes must NOT be challenged."""
     sent, inner = await _call(mw_kwargs, token=None, scope_type="lifespan")
-    # Inner app is invoked
     assert len(inner) == 1
+
+
+async def test_unauthenticated_paths_passthrough(
+    mw_kwargs: dict[str, Any],
+) -> None:
+    """Discovery + OAuth endpoints must not require auth."""
+    for path in (
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+        "/oauth/jwks.json",
+        "/oauth/register",
+        "/oauth/authorize",
+        "/oauth/callback",
+        "/oauth/token",
+    ):
+        sent, inner = await _call(mw_kwargs, token=None, path=path)
+        assert len(inner) == 1, f"path {path} should pass through without auth"
+        assert sent[0]["status"] == 200, f"path {path} got {sent[0]['status']}"
