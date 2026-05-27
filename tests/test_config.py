@@ -17,7 +17,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key, raising=False)
 
 
-def test_required_cf_access_fails_without_team_and_aud(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_required_cf_access_fails_without_team_and_app_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_REQUIRED", "true")
     with pytest.raises(ValueError, match="CF_ACCESS"):
         Settings()
@@ -31,12 +33,24 @@ def test_optional_cf_access_ok_without_team(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_required_cf_access_passes_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "holthome")
-    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_AUD", "deadbeef")
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "bigheadltd")
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_APP_ID", "deadbeef" * 8)
     s = Settings()
-    assert s.cf_access_team == "holthome"
-    assert s.cf_access_issuer == "https://holthome.cloudflareaccess.com"
-    assert s.cf_access_jwks_url == ("https://holthome.cloudflareaccess.com/cdn-cgi/access/certs")
+    assert s.cf_access_team == "bigheadltd"
+    assert s.cf_access_issuer == (
+        f"https://bigheadltd.cloudflareaccess.com/cdn-cgi/access/sso/oidc/{'deadbeef' * 8}"
+    )
+    assert s.cf_access_jwks_url == s.cf_access_issuer + "/jwks"
+    # Default audience == app_id
+    assert s.cf_access_effective_audience == "deadbeef" * 8
+
+
+def test_audience_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_TEAM", "bigheadltd")
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_APP_ID", "deadbeef" * 8)
+    monkeypatch.setenv("HOMELAB_MCP_CF_ACCESS_AUDIENCE", "custom-aud")
+    s = Settings()
+    assert s.cf_access_effective_audience == "custom-aud"
 
 
 def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
