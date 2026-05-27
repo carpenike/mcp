@@ -410,10 +410,30 @@ def build_routes(
             return _json_error(502, "upstream_error", f"invalid id_token from PocketID: {e}")
 
         if claims.get("iss") != upstream.issuer:
+            log.warning(
+                "pocketid id_token issuer mismatch: got=%r expected=%r",
+                claims.get("iss"),
+                upstream.issuer,
+            )
             return _json_error(502, "upstream_error", "id_token issuer mismatch")
-        if claims.get("aud") != settings.pocketid_client_id:
+        # `aud` may be a string or a list per RFC 7519 §4.1.3.
+        aud_claim = claims.get("aud")
+        aud_values: list[str] = (
+            [aud_claim] if isinstance(aud_claim, str) else list(aud_claim or [])
+        )
+        if settings.pocketid_client_id not in aud_values:
+            log.warning(
+                "pocketid id_token audience mismatch: got=%r expected=%r",
+                aud_claim,
+                settings.pocketid_client_id,
+            )
             return _json_error(502, "upstream_error", "id_token audience mismatch")
         if claims.get("nonce") != pending.pocketid_nonce:
+            log.warning(
+                "pocketid id_token nonce mismatch: got=%r expected=%r",
+                claims.get("nonce"),
+                pending.pocketid_nonce,
+            )
             return _json_error(502, "upstream_error", "id_token nonce mismatch")
 
         email = claims.get("email")
