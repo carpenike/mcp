@@ -48,7 +48,11 @@ def _build_protected_resource_metadata(settings: Settings) -> dict[str, object]:
 
 def build_app(settings: Settings) -> Starlette:
     """Construct the Starlette ASGI app with the MCP transport + OAuth + JWT middleware."""
-    mcp = FastMCP("homelab-mcp")
+    # The string passed here is what MCP clients display to the user
+    # (Claude shows it as the connector name on tool calls). Internal
+    # naming stays "homelab-mcp" everywhere else (package, systemd
+    # unit, user); this is purely the user-facing label.
+    mcp = FastMCP("Holthome")
     register_all(mcp, settings)
 
     # FastMCP exposes its Streamable HTTP transport as an ASGI app we can
