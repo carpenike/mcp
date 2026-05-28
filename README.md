@@ -61,6 +61,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 │  homelab-mcp  (mcp.holthome.net, via Cloudflare Tunnel)  │
 │                                                          │
 │   ├─ /.well-known/oauth-protected-resource (RFC 9728)    │
+│   ├─ /.well-known/oauth-protected-resource/mcp (RFC 9728 §3.3, VS Code) │
 │   ├─ /.well-known/oauth-authorization-server (RFC 8414)  │
 │   ├─ /oauth/jwks.json     (public verifier key)          │
 │   ├─ /oauth/register      (RFC 7591 DCR)                 │

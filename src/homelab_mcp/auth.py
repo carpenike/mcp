@@ -65,10 +65,23 @@ class JWTAuthMiddleware:
         signing_key: SigningKey,
         issuer: str,
         audience: str,
+        resource_metadata_url: str | None = None,
     ) -> None:
         self.app = app
         self.issuer = issuer
         self.audience = audience
+        # Absolute URL of the (path-suffixed) RFC 9728 protected-resource
+        # metadata doc. Emitted in the WWW-Authenticate header on every 401
+        # so spec-strict clients (VS Code) can discover the AS per §5.3.
+        self.resource_metadata_url = resource_metadata_url
+        # Allowlist the PRM path itself so the unauthenticated discovery
+        # fetch isn't challenged. The origin-root + AS-metadata + OAuth
+        # paths are static (UNAUTHENTICATED_PATHS); the path-suffixed PRM
+        # is derived from mcp_path so we add it per-instance.
+        self._unauthenticated_paths: frozenset[str] = self.UNAUTHENTICATED_PATHS
+        if resource_metadata_url is not None:
+            suffixed_path = resource_metadata_url[len(issuer) :]
+            self._unauthenticated_paths = self.UNAUTHENTICATED_PATHS | {suffixed_path}
         # Derive the public key once. We need the cryptography object, not
         # the JWK dict, because PyJWT takes the raw key.
         private: RSAPrivateKey = serialization.load_pem_private_key(  # type: ignore[assignment]
@@ -82,20 +95,28 @@ class JWTAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if scope.get("path", "") in self.UNAUTHENTICATED_PATHS:
+        if scope.get("path", "") in self._unauthenticated_paths:
             await self.app(scope, receive, send)
             return
 
         token = self._extract_token(scope)
         if not token:
-            await self._respond_401(send, "missing bearer token")
+            await self._respond_401(
+                send,
+                "missing bearer token",
+                www_authenticate=self._www_authenticate("missing bearer token"),
+            )
             return
 
         try:
             claims = self._validate(token)
         except jwt.InvalidTokenError as e:
             log.warning("JWT rejected: %s", e)
-            await self._respond_401(send, f"invalid token: {e}")
+            await self._respond_401(
+                send,
+                f"invalid token: {e}",
+                www_authenticate=self._www_authenticate(f"invalid token: {e}"),
+            )
             return
 
         # Stash claims so tool handlers can read scope["user"]["email"] etc.
@@ -105,6 +126,21 @@ class JWTAuthMiddleware:
         scope["user"] = scope_user
 
         await self.app(scope, receive, send)
+
+    def _www_authenticate(self, reason: str) -> bytes:
+        """Build the WWW-Authenticate header value (RFC 6750 + RFC 9728 §5.3).
+
+        Includes `resource_metadata` so spec-strict clients (VS Code)
+        discover the AS from the 401 rather than guessing well-known paths.
+        """
+        parts = [
+            'Bearer realm="homelab-mcp"',
+            'error="invalid_token"',
+            f'error_description="{reason}"',
+        ]
+        if self.resource_metadata_url is not None:
+            parts.append(f'resource_metadata="{self.resource_metadata_url}"')
+        return ", ".join(parts).encode("ascii")
 
     @staticmethod
     def _extract_token(scope: Scope) -> str | None:
@@ -133,7 +169,12 @@ class JWTAuthMiddleware:
         return decoded
 
     @staticmethod
-    async def _respond_401(send: Send, reason: str) -> None:
+    async def _respond_401(
+        send: Send,
+        reason: str,
+        *,
+        www_authenticate: bytes = b'Bearer realm="homelab-mcp"',
+    ) -> None:
         """Send a JSON 401 response and end the request."""
         body = json.dumps({"error": "unauthorized", "reason": reason}).encode()
         await send(
@@ -142,7 +183,7 @@ class JWTAuthMiddleware:
                 "status": 401,
                 "headers": [
                     (b"content-type", b"application/json"),
-                    (b"www-authenticate", b'Bearer realm="homelab-mcp"'),
+                    (b"www-authenticate", www_authenticate),
                     (b"content-length", str(len(body)).encode()),
                 ],
             }

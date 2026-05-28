@@ -82,6 +82,12 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.oauth_redirect_uri_allowlist == [
         "https://claude.ai/",
         "https://claude.com/",
+        "https://vscode.dev/redirect",
+        "https://insiders.vscode.dev/redirect",
+        "http://127.0.0.1:",
+        "http://127.0.0.1/",
+        "http://localhost:",
+        "http://localhost/",
     ]
 
 

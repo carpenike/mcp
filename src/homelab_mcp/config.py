@@ -58,6 +58,16 @@ class Settings(BaseSettings):
             "doc. Example: 'https://mcp.holthome.net'. REQUIRED in production."
         ),
     )
+    mcp_path: str = Field(
+        default="/mcp",
+        description=(
+            "Path component of the Streamable-HTTP MCP endpoint (leading slash). "
+            "MUST match FastMCP's streamable_http_path (default '/mcp'). Used to "
+            "build the spec-strict RFC 9728 §3.3 path-suffixed protected-resource "
+            "metadata document VS Code requires (served at "
+            "'/.well-known/oauth-protected-resource<mcp_path>')."
+        ),
+    )
 
     # ── OAuth provider ───────────────────────────────────────────────
     oauth_required: bool = Field(
@@ -104,12 +114,27 @@ class Settings(BaseSettings):
     # /authorize into an open redirector.
     oauth_redirect_uri_allowlist: list[str] = Field(
         default=[
+            # Claude (claude.ai web + Claude Desktop).
             "https://claude.ai/",
             "https://claude.com/",
+            # VS Code 1.108+ sends four redirect_uris in a single DCR
+            # request (see microsoft/vscode src/vs/base/common/oauth.ts
+            # fetchDynamicRegistration). We accept all four shapes. Every
+            # loopback prefix ends in ':' or '/' so a naive startswith()
+            # can't be bypassed by 'http://127.0.0.1.evil.com/'.
+            "https://vscode.dev/redirect",
+            "https://insiders.vscode.dev/redirect",
+            "http://127.0.0.1:",
+            "http://127.0.0.1/",
+            "http://localhost:",
+            "http://localhost/",
         ],
         description=(
             "Allowlist of redirect_uri prefixes accepted in DCR + /authorize. "
-            "Anything not matching is rejected with invalid_redirect_uri."
+            "DCR filters (not rejects) the submitted set against this list and "
+            "stores only matches; /authorize then enforces the stored set at "
+            "use time. Loopback prefixes MUST end in ':' or '/' to keep the "
+            "startswith() check safe."
         ),
     )
 
@@ -232,6 +257,27 @@ class Settings(BaseSettings):
         cannot be replayed against a different MCP server.
         """
         return self.public_base_url.rstrip("/")
+
+    @property
+    def mcp_resource_url(self) -> str:
+        """The canonical MCP endpoint URL (origin + mcp_path).
+
+        This is the value spec-strict clients (VS Code) expect to see in
+        the `resource` field of the path-suffixed RFC 9728 §3.3 PRM
+        document, because it equals the exact URL they used to reach the
+        MCP endpoint.
+        """
+        return self.public_base_url.rstrip("/") + "/" + self.mcp_path.strip("/")
+
+    @property
+    def prm_path_suffixed(self) -> str:
+        """Path of the RFC 9728 §3.3 path-suffixed PRM endpoint.
+
+        e.g. mcp_path='/mcp' -> '/.well-known/oauth-protected-resource/mcp'.
+        VS Code 1.108+ fetches this exact path; serving only the origin-root
+        variant makes VS Code reject the PRM and skip DCR entirely.
+        """
+        return "/.well-known/oauth-protected-resource/" + self.mcp_path.strip("/")
 
     # ── Cross-field validation ───────────────────────────────────────
     def model_post_init(self, __context: Any) -> None:

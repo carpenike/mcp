@@ -103,6 +103,114 @@ def test_register_endpoint_rejects_off_allowlist_redirect(settings: Settings) ->
     assert resp.json()["error"] == "invalid_redirect_uri"
 
 
+def test_register_endpoint_accepts_vscode_redirect_set(settings: Settings) -> None:
+    """VS Code 1.108+ submits four redirect_uris; all four shapes are allowlisted."""
+    app = build_app(settings)
+    vscode_uris = [
+        "https://vscode.dev/redirect",
+        "https://insiders.vscode.dev/redirect",
+        "http://127.0.0.1:33418/callback",
+        "http://localhost:33418/callback",
+    ]
+    with TestClient(app) as client:
+        resp = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Visual Studio Code",
+                "redirect_uris": vscode_uris,
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["client_id"]
+    # All four matched the allowlist, so all four are stored.
+    assert body["redirect_uris"] == vscode_uris
+
+
+def test_register_endpoint_filters_not_rejects_mixed_set(settings: Settings) -> None:
+    """Filter-don't-reject: drop off-allowlist URIs, accept if >=1 matches."""
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Mixed Client",
+                "redirect_uris": [
+                    "https://claude.ai/api/mcp/auth_callback",
+                    "https://evil.example.com/cb",
+                ],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    # Only the allowlisted URI is stored; the disallowed one is dropped.
+    assert resp.json()["redirect_uris"] == ["https://claude.ai/api/mcp/auth_callback"]
+
+
+def test_register_endpoint_rejects_loopback_subdomain_bypass(settings: Settings) -> None:
+    """`http://127.0.0.1.evil.com/` must NOT match the `http://127.0.0.1/` prefix."""
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Evil Client",
+                "redirect_uris": ["http://127.0.0.1.evil.com/cb"],
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
+def test_path_suffixed_prm_returns_mcp_endpoint_as_resource(settings: Settings) -> None:
+    """RFC 9728 §3.3: path-suffixed PRM `resource` must equal the MCP endpoint URL."""
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.get("/.well-known/oauth-protected-resource/mcp")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # VS Code requires the exact endpoint URL, not the origin.
+    assert body["resource"] == "https://mcp.example.com/mcp"
+    assert body["authorization_servers"] == ["https://mcp.example.com"]
+
+
+def test_origin_prm_still_uses_origin_as_resource(settings: Settings) -> None:
+    """Origin-root PRM keeps `resource`=origin for claude.ai compatibility."""
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.get("/.well-known/oauth-protected-resource")
+
+    assert resp.status_code == 200
+    assert resp.json()["resource"] == "https://mcp.example.com"
+
+
+def test_401_emits_resource_metadata_in_www_authenticate(settings: Settings) -> None:
+    """RFC 9728 §5.3: the 401 WWW-Authenticate points at the path-suffixed PRM."""
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+
+    assert resp.status_code == 401
+    www_auth = resp.headers["www-authenticate"]
+    assert 'Bearer realm="homelab-mcp"' in www_auth
+    assert (
+        'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"'
+        in www_auth
+    )
+
+
 def test_mcp_endpoint_still_requires_auth(settings: Settings) -> None:
     """The discovery allowlist must not leak through to /mcp."""
     app = build_app(settings)

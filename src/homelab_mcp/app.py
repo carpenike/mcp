@@ -32,15 +32,19 @@ from homelab_mcp.tools import register_all
 log = logging.getLogger("homelab_mcp")
 
 
-def _build_protected_resource_metadata(settings: Settings) -> dict[str, object]:
-    """Construct the RFC 9728 protected-resource metadata document.
+def _build_protected_resource_metadata(settings: Settings, *, resource: str) -> dict[str, object]:
+    """Construct an RFC 9728 protected-resource metadata document.
 
-    Read by Claude (and any compliant MCP client) from
-    `/.well-known/oauth-protected-resource` to discover the authorization
-    server. We point at ourselves because we ARE the AS.
+    Read by MCP clients to discover the authorization server. We point
+    at ourselves because we ARE the AS.
+
+    `resource` MUST equal the URL the client used to fetch the metadata's
+    subject endpoint (RFC 9728 §3.3). claude.ai accepts the origin; VS
+    Code 1.108+ requires the exact MCP endpoint URL via the path-suffixed
+    variant. Callers pass the appropriate value per endpoint.
     """
     return {
-        "resource": settings.resource_url,
+        "resource": resource,
         "authorization_servers": [settings.issuer],
         "bearer_methods_supported": ["header"],
         "resource_signing_alg_values_supported": ["RS256"],
@@ -109,15 +113,32 @@ def build_app(settings: Settings) -> Starlette:
         app.router.routes.append(route)
 
     # ── Wire RFC 9728 protected-resource metadata ───────────────────
-    prm = _build_protected_resource_metadata(settings)
+    # Two variants per RFC 9728 §3.3:
+    #   - origin-root  (/.well-known/oauth-protected-resource):
+    #       resource = origin. claude.ai accepts this.
+    #   - path-suffixed (/.well-known/oauth-protected-resource/<mcp_path>):
+    #       resource = the exact MCP endpoint URL. VS Code 1.108+ requires
+    #       this and rejects the PRM (skipping DCR) without it.
+    prm_origin = _build_protected_resource_metadata(settings, resource=settings.resource_url)
+    prm_mcp = _build_protected_resource_metadata(settings, resource=settings.mcp_resource_url)
 
-    async def protected_resource(_request: Request) -> JSONResponse:
-        return JSONResponse(prm)
+    async def protected_resource_origin(_request: Request) -> JSONResponse:
+        return JSONResponse(prm_origin)
+
+    async def protected_resource_mcp(_request: Request) -> JSONResponse:
+        return JSONResponse(prm_mcp)
 
     app.router.routes.append(
         Route(
             "/.well-known/oauth-protected-resource",
-            protected_resource,
+            protected_resource_origin,
+            methods=["GET"],
+        )
+    )
+    app.router.routes.append(
+        Route(
+            settings.prm_path_suffixed,
+            protected_resource_mcp,
             methods=["GET"],
         )
     )
@@ -128,6 +149,10 @@ def build_app(settings: Settings) -> Starlette:
         signing_key=key,
         issuer=settings.issuer,
         audience=settings.resource_url,
+        # RFC 9728 §5.3: the 401's WWW-Authenticate points spec-strict
+        # clients (VS Code) at the path-suffixed PRM so they can discover
+        # the AS without guessing well-known paths.
+        resource_metadata_url=settings.issuer + settings.prm_path_suffixed,
     )
     log.info(
         "OAuth enabled (issuer=%s audience=%s upstream=%s)",

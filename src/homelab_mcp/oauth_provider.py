@@ -203,18 +203,28 @@ def build_routes(
                 400, "invalid_redirect_uri", "redirect_uris must be a non-empty array"
             )
 
-        # All redirect URIs must match our allowlist. If even one is
-        # disallowed we reject the whole registration — there's no good
-        # reason a legitimate client would submit a mix.
-        bad = [
-            u for u in redirect_uris if not isinstance(u, str) or not _redirect_allowed(u, settings)
+        # Filter-don't-reject (VS Code compatibility): VS Code submits four
+        # redirect_uris in one DCR request (vscode.dev, insiders.vscode.dev,
+        # and two loopback shapes). Rejecting the whole registration on a
+        # single off-allowlist URI causes VS Code to 400-out DCR and surface
+        # a useless "User did not provide client details" error. Instead we
+        # drop the disallowed URIs (with a warn) and accept as long as ≥1
+        # matches. This is safe because /oauth/authorize enforces
+        # `redirect_uri in client.redirect_uris` at use time, so a URI we
+        # never stored can never be used.
+        allowed_uris = [
+            u for u in redirect_uris if isinstance(u, str) and _redirect_allowed(u, settings)
         ]
-        if bad:
+        dropped = [u for u in redirect_uris if u not in allowed_uris]
+        if dropped:
+            log.warning("DCR: dropping %d off-allowlist redirect_uri(s): %s", len(dropped), dropped)
+        if not allowed_uris:
             return _json_error(
                 400,
                 "invalid_redirect_uri",
-                f"redirect_uri not in allowlist: {bad[0]}",
+                "no submitted redirect_uri matched the allowlist",
             )
+        redirect_uris = allowed_uris
 
         client_name = body.get("client_name") or "unknown"
         token_endpoint_auth_method = body.get("token_endpoint_auth_method") or "client_secret_post"
