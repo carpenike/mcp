@@ -15,8 +15,9 @@ dist/
 venv/
 env/
 
-# uv
+# uv (this project builds with hatchling under Nix, not uv)
 .uv-cache/
+uv.lock
 
 # Test / coverage
 .pytest_cache/
