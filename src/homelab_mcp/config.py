@@ -2,7 +2,7 @@
 
 All configuration comes from environment variables with the `HOMELAB_MCP_`
 prefix. Mirrors the pattern used by the rest of the homelab services
-(whiskey-whiskey-whiskey, replog, etc.).
+(whiskey-whiskey-whiskey, cooklang, etc.).
 
 Architecture summary
 --------------------
@@ -199,42 +199,6 @@ class Settings(BaseSettings):
     federation_base_url: str = Field(default="https://fedcook.holthome.net")
     recipes_dir: str = Field(default="/data/cooklang/recipes")
     gatus_base_url: str = Field(default="https://gatus.holthome.net")
-
-    # ── RepLog (HOF-004 — tool-hop integration) ──────────────────────
-    # RepLog (replog.holthome.net) exposes a parallel /api-mcp/* route
-    # group that verifies short-TTL RS256 JWTs we mint with `aud` set to
-    # `replog_audience`. The replog.py tool module re-mints a per-call
-    # token carrying the original caller's sub+email and POSTs to
-    # `${replog_base_url}/api-mcp/...` over loopback when co-resident
-    # on the same forge host. See `oauth_provider.mint_tool_hop_token`.
-    replog_base_url: str = Field(
-        default="",
-        description=(
-            "Base URL of the RepLog backend, no trailing slash. e.g. "
-            "'http://127.0.0.1:5008' on forge (loopback to the co-resident "
-            "replog systemd service). Leave empty to disable the replog "
-            "tools entirely (the tool registration is a no-op when unset)."
-        ),
-    )
-    replog_audience: str = Field(
-        default="https://replog.holthome.net",
-        description=(
-            "The `aud` claim value RepLog's bearer middleware expects. "
-            "Defaults to the production deploy's public URL. Must match "
-            "RepLog's REPLOG_MCP_AUDIENCE setting."
-        ),
-    )
-    replog_tool_hop_ttl_seconds: int = Field(
-        default=60,
-        ge=10,
-        le=600,
-        description=(
-            "Lifetime of the per-call tool-hop JWT minted for RepLog "
-            "requests. Short by design — tokens are consumed within ms "
-            "of being minted; a tight expiry caps replay risk if a token "
-            "leaks via proxy logs or error traces."
-        ),
-    )
 
     # ── Derived ──────────────────────────────────────────────────────
     @property

@@ -60,10 +60,10 @@ def build_app(settings: Settings) -> Starlette:
     mcp = FastMCP("Holthome")
 
     # Load the signing key BEFORE tool registration so tools that need
-    # to mint per-call JWTs for downstream resource calls (e.g. the
-    # replog.py module per HOF-004) get a working minter. When OAuth is
-    # disabled (local dev only), the minter is None and those tools
-    # log a warning + skip registration.
+    # to mint per-call JWTs for downstream resource calls (the HOF-004
+    # tool-hop pattern) get a working minter. When OAuth is disabled
+    # (local dev only), the minter is None and those tools log a warning
+    # + skip registration.
     key: signing_key.SigningKey | None = None
     mint_token: Any = None
     if settings.oauth_required:
