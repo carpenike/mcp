@@ -41,11 +41,13 @@ upstream to PocketID. Claude never touches PocketID directly.
 
 | Category | Tool name | What it does |
 |----------|-----------|--------------|
-| Cooklang | `cooklang_search_recipes` | Search the federated recipe index (your repo + 61 community feeds) |
-| Cooklang | `cooklang_get_recipe` | Fetch a recipe's structured details (federation or your personal cookbook) |
-| Cooklang | `cooklang_list_my_recipes` | List recipes in your personal cookbook |
+| Cooklang | `cooklang_list_recipes` | List your canonical cookbook (cook.holthome.net) with optional course/cuisine/tag/text filters |
+| Cooklang | `cooklang_get_recipe` | Fetch one recipe's metadata + ingredients/cookware/steps, by slug or path |
+| Cooklang | `cooklang_search_recipes` | Search YOUR recipes by name/metadata (opt-in ingredient matching) |
+| Cooklang | `cooklang_create_recipe` | Author a NEW `.cook` (frontmatter + body); `derived_from` is first-class; fails on collision |
+| Cooklang | `cooklang_update_recipe` | Amend an existing recipe; parser-validated before it overwrites |
+| Cooklang | `cooklang_search_federation` | Search the federated index (your repo + ~60 community feeds) |
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
-| Cooklang | `cooklang_save_recipe` | Save a new `.cook` file to your personal cookbook (Resilio + git auto-sync carry it everywhere) |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |
 | Homelab | `homelab_get_endpoint_history` | Recent check history for one specific endpoint |
 
@@ -74,8 +76,7 @@ upstream to PocketID. Claude never touches PocketID directly.
            │          └─► PocketID (id.holthome.net) — passkey login
            │
            ├──► fedcook.holthome.net  (federation search)
-           ├──► cook.holthome.net     (CookCLI recipes/shopping list)
-           ├──► /data/cooklang/recipes/claude/  (save_recipe writes here)
+           ├──► cook.holthome.net     (CookLang recipes: read + author + shopping list)
            └──► gatus.holthome.net    (uptime monitoring)
 ```
 
@@ -129,7 +130,7 @@ pytest -v
 Coverage focuses on the security-critical bits:
   - `tests/test_auth.py` — JWT validation rejection paths (real RSA keypair).
   - `tests/test_oauth_flow.py` — end-to-end OAuth dance with PocketID mocked.
-  - `tests/test_tools_cooklang.py` — `save_recipe` path-traversal hardening (24 vectors).
+  - `tests/test_tools_cooklang.py` — recipe CRUD against a mocked CookLang wire + slug/path-traversal hardening.
   - `tests/test_app.py` — discovery + allowlist + middleware wiring.
 
 ## Deployment
