@@ -60,6 +60,12 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Grocy | `grocy_ensure_unit` | Idempotently create a quantity unit |
 | Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
 | Grocy | `grocy_health` | Connectivity + Grocy version check |
+| Grocy | `grocy_convert_units` | Convert an amount between units (product-specific → global → identity) |
+| Grocy | `grocy_product_card` | Enriched product detail: on-hand, min/below-min, price, shelf life, locations |
+| Grocy | `grocy_consumption_history` | Burn rate from the stock log (purchased/consumed/spoiled + rates) |
+| Grocy | `grocy_stock_value` | Total inventory value, optionally by location + top-N products |
+| Grocy | `grocy_restock_suggestions` | Quantity-driven below-minimum signal (vs. date-driven `grocy_expiring`) |
+| Grocy | `grocy_stock_by_location` | On-hand stock grouped by storage location |
 
 ## Architecture
 

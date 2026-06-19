@@ -33,6 +33,7 @@ Tool name convention: `grocy_<verb>_<object>`. See AGENTS.md.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
@@ -55,6 +56,10 @@ _TIMEOUT = 15
 _SEED_LOCATIONS = ["Chest Freezer", "Kitchen Fridge", "Garage Fridge", "Pantry"]
 _SEED_UNITS = ["count", "lb", "oz", "pack"]
 
+# Upper bound on stock-log rows pulled for a consumption-history window, so a
+# long-lived product can't fan a single read into an unbounded response.
+_MAX_LOG_ROWS = 2000
+
 
 class _GrocyError(Exception):
     """An internal failure carrying a stable error `code` for the client.
@@ -72,6 +77,30 @@ class _GrocyError(Exception):
 
     def payload(self) -> dict[str, Any]:
         return {"error": {"code": self.code, "message": self.message, "hint": self.hint}}
+
+
+class _Disambiguation(Exception):  # noqa: N818 - a control-flow signal, not an error
+    """A name matched products but not exactly one — surfaced for the assistant.
+
+    Carries the candidate list so the conversation can resolve it and re-call
+    with a concrete id. Mirrors the find-or-create contract of the write tools
+    so the read tools never guess which product was meant.
+    """
+
+    def __init__(self, name: str, candidates: list[dict[str, Any]]) -> None:
+        super().__init__(f"'{name}' is ambiguous")
+        self.name = name
+        self.candidates = candidates
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "error": {
+                "code": "needs_disambiguation",
+                "message": f"'{self.name}' matches multiple products; not guessing.",
+                "hint": "Re-call with product set to the intended product's id.",
+            },
+            "candidates": self.candidates,
+        }
 
 
 def _enc(segment: str) -> str:
@@ -233,6 +262,116 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         if new_id is None:
             raise _GrocyError("missing_fk", "Grocy did not return a new product id.", "")
         return {"id": int(new_id), "name": name.strip(), "created": True}
+
+    # ── read-enrichment helpers (resolution reuse; never create) ────
+    async def _resolve_product(value: str | int) -> dict[str, Any]:
+        """Resolve a product by id or name for READ tools (never creates).
+
+        Raises `_GrocyError("product_not_found")` or `_Disambiguation` so the
+        caller can surface the typed error / candidate list.
+        """
+        if isinstance(value, int) or str(value).strip().isdigit():
+            pid = int(value)
+            try:
+                found = await _call("GET", f"/objects/products/{pid}")
+            except _GrocyError as exc:
+                raise _GrocyError(
+                    "product_not_found", f"No product with id {pid}.", "Check the id."
+                ) from exc
+            if not isinstance(found, dict) or not found.get("id"):
+                raise _GrocyError(
+                    "product_not_found", f"No product with id {pid}.", "Check the id."
+                )
+            return {"id": int(found["id"]), "name": found.get("name")}
+        name = str(value).strip()
+        if not name:
+            raise _GrocyError("product_not_found", "No product given.", "Pass a name or id.")
+        candidates = await _search("products", name)
+        exact = [c for c in candidates if _norm(c.get("name")) == _norm(name)]
+        if len(exact) == 1:
+            return {"id": int(exact[0]["id"]), "name": exact[0].get("name")}
+        if len(exact) > 1 or candidates:
+            raise _Disambiguation(name, [await _enrich(c) for c in candidates[:10]])
+        raise _GrocyError(
+            "product_not_found",
+            f"No product named '{name}'.",
+            "Check the name or use grocy_find_products.",
+        )
+
+    async def _resolve_unit(value: str | int) -> tuple[int, str | None]:
+        """Resolve a quantity unit to (id, name); raise unit_not_found on a bad name."""
+        if isinstance(value, int) or str(value).strip().isdigit():
+            uid = int(value)
+            try:
+                rec = await _call("GET", f"/objects/quantity_units/{uid}")
+            except _GrocyError as exc:
+                raise _GrocyError(
+                    "unit_not_found", f"No quantity unit with id {uid}.", "Check the id."
+                ) from exc
+            return uid, (rec.get("name") if isinstance(rec, dict) else None)
+        s = str(value).strip()
+        exact = [i for i in await _search("quantity_units", s) if _norm(i.get("name")) == _norm(s)]
+        if len(exact) == 1:
+            return int(exact[0]["id"]), exact[0].get("name")
+        if len(exact) > 1:
+            raise _GrocyError("unit_not_found", f"Multiple units named '{s}'.", "Pass the id.")
+        raise _GrocyError(
+            "unit_not_found",
+            f"No quantity unit named '{s}'.",
+            "Create it with grocy_ensure_unit.",
+        )
+
+    async def _find_conversion(
+        product_id: int, from_id: int, to_id: int
+    ) -> tuple[float, str] | None:
+        """Resolve a QU conversion factor: product-specific → global → reverse.
+
+        Returns (factor, source) where amount_out = amount_in * factor, or None
+        when no direct conversion exists (we do NOT chain or assume 1:1).
+        """
+
+        def _pick(rows: list[dict[str, Any]]) -> tuple[float, str] | None:
+            specific = [r for r in rows if str(r.get("product_id") or "") == str(product_id)]
+            if specific:
+                return float(specific[0]["factor"]), "product_specific"
+            glob = [r for r in rows if not r.get("product_id")]
+            if glob:
+                return float(glob[0]["factor"]), "global"
+            return None
+
+        fwd = await _call(
+            "GET",
+            "/objects/quantity_unit_conversions",
+            params={"query[]": [f"from_qu_id={from_id}", f"to_qu_id={to_id}"]},
+        )
+        hit = _pick(fwd if isinstance(fwd, list) else [])
+        if hit:
+            return hit
+        rev = await _call(
+            "GET",
+            "/objects/quantity_unit_conversions",
+            params={"query[]": [f"from_qu_id={to_id}", f"to_qu_id={from_id}"]},
+        )
+        rhit = _pick(rev if isinstance(rev, list) else [])
+        if rhit and rhit[0]:
+            return 1.0 / rhit[0], rhit[1]
+        return None
+
+    async def _name_map(entity: str) -> dict[int, str | None]:
+        """id → name map for a whole /objects/{entity} collection."""
+        items = await _call("GET", f"/objects/{entity}")
+        rows = items if isinstance(items, list) else []
+        return {int(i["id"]): i.get("name") for i in rows if i.get("id") is not None}
+
+    async def _currency() -> str | None:
+        """Grocy's configured currency code, or None if unavailable."""
+        try:
+            cfg = await _call("GET", "/system/config")
+        except _GrocyError:
+            return None
+        if isinstance(cfg, dict):
+            return cfg.get("CURRENCY") or cfg.get("currency")
+        return None
 
     # ─────────────────────────────────────────────────────────────────
     # Diagnostics / bootstrap
@@ -655,4 +794,397 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "next_due_date": next_due,
             "stock_log": data,
             "notes": f"Opened {amount}.",
+        }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Enrichment reads (read-only; surface what Grocy's engine computes)
+    # ─────────────────────────────────────────────────────────────────
+    @mcp.tool(
+        name="grocy_convert_units",
+        description=(
+            "Convert an amount of a product between quantity units using Grocy's "
+            "conversion engine — the building block for netting recipe quantities "
+            "against on-hand stock ('recipe needs 2 lb' vs 'we have 1 pack'). "
+            "Resolution order: product-specific conversion → global conversion → "
+            "identity (same unit). `conversion_source` reports which was used. If "
+            "no conversion exists, returns `no_conversion_path` (never a silent "
+            "1:1). Read-only. Resolve the product by name (exact match) or id; a "
+            "near-but-inexact name returns needs_disambiguation."
+        ),
+    )
+    async def convert_units(
+        product: Annotated[str | int, Field(description="Product name or id.")],
+        amount: Annotated[float, Field(description="Amount in from_unit (> 0).")],
+        from_unit: Annotated[str | int, Field(description="Source unit name or id.")],
+        to_unit: Annotated[str | int, Field(description="Target unit name or id.")],
+    ) -> dict[str, Any]:
+        if amount is None or amount <= 0:
+            return _GrocyError("amount_invalid", "Amount must be greater than zero.", "").payload()
+        try:
+            prod = await _resolve_product(product)
+            from_id, from_name = await _resolve_unit(from_unit)
+            to_id, to_name = await _resolve_unit(to_unit)
+            if from_id == to_id:
+                factor, source = 1.0, "identity"
+            else:
+                conv = await _find_conversion(int(prod["id"]), from_id, to_id)
+                if conv is None:
+                    return _GrocyError(
+                        "no_conversion_path",
+                        f"No conversion from {from_name or from_unit} to "
+                        f"{to_name or to_unit} for {prod['name']}.",
+                        "Add a quantity-unit conversion in Grocy first.",
+                    ).payload()
+                factor, source = conv
+        except _Disambiguation as dis:
+            return dis.payload()
+        except _GrocyError as exc:
+            return exc.payload()
+        amount_out = round(amount * factor, 4)
+        fname, tname = from_name or str(from_unit), to_name or str(to_unit)
+        return {
+            "product": prod,
+            "amount_in": amount,
+            "from_unit": fname,
+            "amount_out": amount_out,
+            "to_unit": tname,
+            "conversion_source": source,
+            "factor": factor,
+            "notes": f"{amount} {fname} = {amount_out} {tname} ({source}).",
+        }
+
+    @mcp.tool(
+        name="grocy_product_card",
+        description=(
+            "The full enriched picture behind a product — what Grocy's product/"
+            "stock detail view shows: on-hand (and opened) amounts, minimum-stock "
+            "and a below_minimum flag, next due date, average shelf life, last/"
+            "average price, default location + product group, and a per-location "
+            "amount breakdown. Read-only. Resolve by name (exact) or id."
+        ),
+    )
+    async def product_card(
+        product: Annotated[str | int, Field(description="Product name or id.")],
+    ) -> dict[str, Any]:
+        try:
+            prod = await _resolve_product(product)
+            pid = int(prod["id"])
+            detail = await _stock_detail(pid)
+            master = await _call("GET", f"/objects/products/{pid}")
+            try:
+                locs = await _call("GET", f"/stock/products/{pid}/locations")
+            except _GrocyError:
+                locs = []
+        except _Disambiguation as dis:
+            return dis.payload()
+        except _GrocyError as exc:
+            return exc.payload()
+
+        detail = detail or {}
+        master = master if isinstance(master, dict) else {}
+        qu = detail.get("quantity_unit_stock") or {}
+        loc = detail.get("location") or detail.get("default_location") or {}
+        on_hand = detail.get("stock_amount")
+        min_stock = master.get("min_stock_amount")
+        below: bool | None = None
+        if on_hand is not None and min_stock not in (None, ""):
+            try:
+                below = float(str(on_hand)) < float(str(min_stock))
+            except (TypeError, ValueError):
+                below = None
+
+        group_name: str | None = None
+        gid = master.get("product_group_id")
+        if gid:
+            try:
+                grp = await _call("GET", f"/objects/product_groups/{gid}")
+                group_name = grp.get("name") if isinstance(grp, dict) else None
+            except _GrocyError:
+                group_name = None
+
+        locations = [
+            {"location": x.get("location_name"), "amount": x.get("amount")}
+            for x in (locs if isinstance(locs, list) else [])
+        ]
+        oh = "unknown" if on_hand is None else on_hand
+        return {
+            "id": pid,
+            "name": prod["name"],
+            "default_location": loc.get("name"),
+            "product_group": group_name,
+            "stock_unit": qu.get("name"),
+            "on_hand": on_hand,
+            "on_hand_opened": detail.get("stock_amount_opened"),
+            "min_stock_amount": min_stock,
+            "below_minimum": below,
+            "next_due_date": detail.get("next_due_date"),
+            "avg_shelf_life_days": detail.get("average_shelf_life_days"),
+            "last_purchased_date": detail.get("last_purchased"),
+            "last_price": detail.get("last_price"),
+            "avg_price": detail.get("avg_price"),
+            "locations": locations,
+            "notes": f"{prod['name']}: {oh} {qu.get('name') or ''} on hand"
+            + (" (below minimum)" if below else "")
+            + ".",
+        }
+
+    @mcp.tool(
+        name="grocy_consumption_history",
+        description=(
+            "Burn rate for a product — 'how fast do we go through X' — derived from "
+            "Grocy's stock transaction log over a lookback window. Returns "
+            "purchased/consumed/spoiled totals and per-week / per-month consume "
+            "rates so shopping can be predictive. Read-only; summarized, not raw "
+            "rows. Resolve by name (exact) or id."
+        ),
+    )
+    async def consumption_history(
+        product: Annotated[str | int, Field(description="Product name or id.")],
+        days: Annotated[int, Field(ge=1, le=730, description="Lookback window in days.")] = 90,
+    ) -> dict[str, Any]:
+        try:
+            prod = await _resolve_product(product)
+            pid = int(prod["id"])
+            rows = await _call(
+                "GET",
+                "/objects/stock_log",
+                params={
+                    "query[]": f"product_id={pid}",
+                    "order": "row_created_timestamp:desc",
+                    "limit": _MAX_LOG_ROWS,
+                },
+            )
+        except _Disambiguation as dis:
+            return dis.payload()
+        except _GrocyError as exc:
+            return exc.payload()
+
+        rows = rows if isinstance(rows, list) else []
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).date().isoformat()
+        purchased = consumed = spoiled = 0.0
+        last_purchased: str | None = None
+        last_consumed: str | None = None
+        count = 0
+        for r in rows:
+            if r.get("undone"):
+                continue
+            ts = str(r.get("row_created_timestamp") or "")[:10]
+            if ts and ts < cutoff:
+                continue
+            count += 1
+            amt = abs(float(r.get("amount") or 0))
+            ttype = r.get("transaction_type")
+            if ttype == "purchase":
+                purchased += amt
+                pd = r.get("purchased_date") or ts
+                if pd and (last_purchased is None or pd > last_purchased):
+                    last_purchased = pd
+            elif ttype == "consume":
+                if r.get("spoiled"):
+                    spoiled += amt
+                else:
+                    consumed += amt
+                ud = r.get("used_date") or ts
+                if ud and (last_consumed is None or ud > last_consumed):
+                    last_consumed = ud
+        per_week = round(consumed / (days / 7), 2) if days else 0.0
+        per_month = round(consumed / (days / 30), 2) if days else 0.0
+        return {
+            "product": prod,
+            "window_days": days,
+            "purchased_total": round(purchased, 2),
+            "consumed_total": round(consumed, 2),
+            "spoiled_total": round(spoiled, 2),
+            "consume_rate_per_week": per_week,
+            "consume_rate_per_month": per_month,
+            "last_purchased_date": last_purchased,
+            "last_consumed_date": last_consumed,
+            "transactions_count": count,
+            "notes": (
+                f"Over {days}d: consumed {round(consumed, 2)} ({per_week}/wk), "
+                f"{round(spoiled, 2)} spoiled."
+            ),
+        }
+
+    @mcp.tool(
+        name="grocy_stock_value",
+        description=(
+            "What the inventory is worth: total value of current stock in Grocy's "
+            "configured currency, optionally broken down by location, plus a top-N "
+            "by product. Use to put a dollar figure on the freezer or cost out a "
+            "shopping list. Read-only. Entries without a recorded price are noted "
+            "and excluded from the total."
+        ),
+    )
+    async def stock_value(
+        by_location: Annotated[
+            bool, Field(description="Include a per-location breakdown.")
+        ] = False,
+    ) -> dict[str, Any]:
+        try:
+            entries = await _call("GET", "/objects/stock")
+            currency = await _currency()
+            loc_names = await _name_map("locations")
+            prod_names = await _name_map("products")
+        except _GrocyError as exc:
+            return exc.payload()
+
+        entries = entries if isinstance(entries, list) else []
+        total = 0.0
+        by_loc: dict[int, float] = {}
+        by_prod: dict[int, float] = {}
+        unpriced = 0
+        for e in entries:
+            price = e.get("price")
+            if price in (None, ""):
+                unpriced += 1
+                continue
+            val = float(e.get("amount") or 0) * float(price)
+            total += val
+            lid = e.get("location_id")
+            if lid is not None:
+                by_loc[int(lid)] = by_loc.get(int(lid), 0.0) + val
+            pid = e.get("product_id")
+            if pid is not None:
+                by_prod[int(pid)] = by_prod.get(int(pid), 0.0) + val
+
+        out: dict[str, Any] = {"total_value": round(total, 2), "currency": currency}
+        if by_location:
+            out["by_location"] = [
+                {"location": loc_names.get(k, str(k)), "value": round(v, 2)}
+                for k, v in sorted(by_loc.items(), key=lambda kv: -kv[1])
+            ]
+        out["by_product_top"] = [
+            {"product": prod_names.get(k, str(k)), "value": round(v, 2)}
+            for k, v in sorted(by_prod.items(), key=lambda kv: -kv[1])[:10]
+        ]
+        note = f"Total stock value {round(total, 2)}" + (f" {currency}" if currency else "") + "."
+        if unpriced:
+            note += f" {unpriced} entr{'y' if unpriced == 1 else 'ies'} had no price."
+        out["notes"] = note
+        return out
+
+    @mcp.tool(
+        name="grocy_restock_suggestions",
+        description=(
+            "Quantity-driven restock signal: products currently below their "
+            "configured minimum stock, with the shortfall and default location, so "
+            "staples can be folded into a buy list. Distinct from `grocy_expiring` "
+            "(that's date-driven). Set `include_due_soon` to also surface items due "
+            "soon. Read-only."
+        ),
+    )
+    async def restock_suggestions(
+        include_due_soon: Annotated[
+            bool, Field(description="Also include items that are due soon.")
+        ] = False,
+    ) -> dict[str, Any]:
+        try:
+            vol = await _call("GET", "/stock/volatile")
+        except _GrocyError as exc:
+            return exc.payload()
+        vol = vol if isinstance(vol, dict) else {}
+
+        below: list[dict[str, Any]] = []
+        for m in vol.get("missing_products") or []:
+            pid = m.get("id")
+            on_hand: Any = None
+            min_stock: Any = None
+            location: str | None = None
+            if pid is not None:
+                try:
+                    master = await _call("GET", f"/objects/products/{pid}")
+                    if isinstance(master, dict):
+                        min_stock = master.get("min_stock_amount")
+                except _GrocyError:
+                    master = None
+                detail = await _stock_detail(int(pid))
+                if detail:
+                    on_hand = detail.get("stock_amount")
+                    loc = detail.get("location") or detail.get("default_location") or {}
+                    location = loc.get("name")
+            below.append(
+                {
+                    "product": m.get("name"),
+                    "on_hand": on_hand,
+                    "min_stock": min_stock,
+                    "shortfall": m.get("amount_missing"),
+                    "default_location": location,
+                }
+            )
+
+        out: dict[str, Any] = {"below_minimum": below}
+        if include_due_soon:
+            out["due_soon"] = [
+                {
+                    "product": (d.get("product") or {}).get("name") or d.get("name"),
+                    "next_due_date": d.get("best_before_date"),
+                }
+                for d in vol.get("due_products") or []
+            ]
+        out["notes"] = f"{len(below)} product(s) below minimum."
+        return out
+
+    @mcp.tool(
+        name="grocy_stock_by_location",
+        description=(
+            "On-hand stock grouped by storage location — 'what's in the chest "
+            "freezer'. Pass a `location` (name or id) to scope to one, or omit for "
+            "all. Each product shows amount, stock unit, and next due date. "
+            "Read-only."
+        ),
+    )
+    async def stock_by_location(
+        location: Annotated[
+            str | int | None,
+            Field(default=None, description="Location name or id; omit for all."),
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            loc_filter: int | None = None
+            if location is not None and str(location).strip() != "":
+                loc_filter = await _resolve_id("locations", location, "location_not_found")
+            entries = await _call("GET", "/objects/stock")
+            products = await _call("GET", "/objects/products")
+            unit_names = await _name_map("quantity_units")
+            loc_names = await _name_map("locations")
+        except _GrocyError as exc:
+            return exc.payload()
+
+        entries = entries if isinstance(entries, list) else []
+        pmaster = {
+            int(p["id"]): p
+            for p in (products if isinstance(products, list) else [])
+            if p.get("id") is not None
+        }
+        groups: dict[int, list[dict[str, Any]]] = {}
+        for e in entries:
+            lid = e.get("location_id")
+            if lid is None:
+                continue
+            lid = int(lid)
+            if loc_filter is not None and lid != loc_filter:
+                continue
+            pid = e.get("product_id")
+            prod = pmaster.get(int(pid)) if pid is not None else None
+            unit = None
+            if prod and prod.get("qu_id_stock") is not None:
+                unit = unit_names.get(int(prod["qu_id_stock"]))
+            groups.setdefault(lid, []).append(
+                {
+                    "name": prod.get("name") if prod else None,
+                    "amount": e.get("amount"),
+                    "stock_unit": unit,
+                    "next_due_date": e.get("best_before_date"),
+                }
+            )
+
+        locations = [
+            {"location": loc_names.get(k, str(k)), "products": v} for k, v in groups.items()
+        ]
+        n_items = sum(len(v) for v in groups.values())
+        return {
+            "locations": locations,
+            "notes": f"{n_items} stock entr{'y' if n_items == 1 else 'ies'} "
+            f"across {len(locations)} location(s).",
         }

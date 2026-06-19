@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -390,3 +391,306 @@ async def test_open_primitive_by_barcode_is_encoded(tools: dict[str, Any], fake:
     await tools["grocy_open_product"](barcode="../x", amount=1)
     path = urlsplit(str(fake.requests[-1].url)).path
     assert path == "/stock/products/by-barcode/..%2Fx/open"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Enrichment read tools — seeded instance (handoff #2 acceptance loop)
+# ─────────────────────────────────────────────────────────────────────────
+def _ago(days: int) -> str:
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class SeededGrocy:
+    """Read-only fake pre-seeded with the handoff #2 acceptance preconditions.
+
+    One in-stock, priced product ('Ribeye') with a product-specific conversion
+    (1 pack = 4 lb), a global conversion (1 lb = 16 oz), a below-minimum level,
+    and a small transaction log. Records every request so read-only-ness can be
+    asserted.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.collections: dict[str, list[dict[str, Any]]] = {
+            "products": [
+                {
+                    "id": 1,
+                    "name": "Ribeye",
+                    "location_id": 1,
+                    "qu_id_stock": 1,
+                    "qu_id_purchase": 1,
+                    "min_stock_amount": 5,
+                    "product_group_id": 1,
+                },
+                {"id": 2, "name": "Ribeye Tip", "location_id": 1, "qu_id_stock": 1},
+            ],
+            "quantity_units": [
+                {"id": 1, "name": "count"},
+                {"id": 2, "name": "pack"},
+                {"id": 3, "name": "lb"},
+                {"id": 4, "name": "oz"},
+            ],
+            "quantity_unit_conversions": [
+                {"id": 1, "product_id": 1, "from_qu_id": 2, "to_qu_id": 3, "factor": 4},
+                {"id": 2, "product_id": None, "from_qu_id": 3, "to_qu_id": 4, "factor": 16},
+            ],
+            "locations": [{"id": 1, "name": "Chest Freezer"}],
+            "product_groups": [{"id": 1, "name": "Meat"}],
+            "stock": [
+                {
+                    "id": 1,
+                    "product_id": 1,
+                    "amount": 2,
+                    "price": 10.0,
+                    "location_id": 1,
+                    "best_before_date": "2026-12-01",
+                }
+            ],
+            "stock_log": [
+                {
+                    "id": 1,
+                    "product_id": 1,
+                    "transaction_type": "purchase",
+                    "amount": 4,
+                    "purchased_date": _ago(40)[:10],
+                    "row_created_timestamp": _ago(40),
+                },
+                {
+                    "id": 2,
+                    "product_id": 1,
+                    "transaction_type": "consume",
+                    "amount": 1,
+                    "spoiled": False,
+                    "used_date": _ago(20)[:10],
+                    "row_created_timestamp": _ago(20),
+                },
+                {
+                    "id": 3,
+                    "product_id": 1,
+                    "transaction_type": "consume",
+                    "amount": 1,
+                    "spoiled": True,
+                    "row_created_timestamp": _ago(10),
+                },
+            ],
+        }
+
+    @staticmethod
+    def _cond(item: dict[str, Any], cond: str) -> bool:
+        if "~" in cond:
+            f, v = cond.split("~", 1)
+            return v.lower() in str(item.get(f) or "").lower()
+        if "=" in cond:
+            f, v = cond.split("=", 1)
+            cur = item.get(f)
+            return str(cur if cur is not None else "") == v
+        return True
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.headers.get("GROCY-API-KEY") != API_KEY:
+            return httpx.Response(400, json={"error_message": "Invalid API key"})
+
+        url = urlsplit(str(request.url))
+        path = url.path
+        conds = parse_qs(url.query).get("query[]", [])
+
+        if path == "/system/info":
+            return httpx.Response(200, json={"grocy_version": {"Version": "4.6.0"}})
+        if path == "/system/config":
+            return httpx.Response(200, json={"CURRENCY": "USD"})
+
+        if path == "/stock/volatile":
+            return httpx.Response(
+                200,
+                json={
+                    "due_products": [
+                        {"product": {"name": "Ribeye"}, "best_before_date": "2026-12-01"}
+                    ],
+                    "overdue_products": [],
+                    "expired_products": [],
+                    "missing_products": [
+                        {"id": 1, "name": "Ribeye", "amount_missing": 3, "is_partly_in_stock": 1}
+                    ],
+                },
+            )
+
+        m = re.match(r"^/stock/products/(\d+)/locations$", path)
+        if m:
+            return httpx.Response(
+                200,
+                json=[{"location_id": 1, "location_name": "Chest Freezer", "amount": 2}],
+            )
+
+        m = re.match(r"^/stock/products/(\d+)$", path)
+        if m:
+            prod = next(
+                (p for p in self.collections["products"] if p["id"] == int(m.group(1))), None
+            )
+            if prod is None:
+                return httpx.Response(400, json={"error_message": "Not existing product"})
+            return httpx.Response(
+                200,
+                json={
+                    "product": prod,
+                    "stock_amount": 2,
+                    "stock_amount_opened": 0,
+                    "quantity_unit_stock": {"name": "count"},
+                    "location": {"name": "Chest Freezer"},
+                    "default_location": {"name": "Chest Freezer"},
+                    "next_due_date": "2026-12-01",
+                    "average_shelf_life_days": 120,
+                    "last_purchased": "2026-05-01",
+                    "last_price": 10.0,
+                    "avg_price": 9.5,
+                },
+            )
+
+        m = re.match(r"^/objects/(\w+)/(\d+)$", path)
+        if m:
+            coll = self.collections.get(m.group(1), [])
+            rec = next((i for i in coll if i.get("id") == int(m.group(2))), None)
+            if rec is None:
+                return httpx.Response(404, json={"error_message": "Not found"})
+            return httpx.Response(200, json=rec)
+
+        m = re.match(r"^/objects/(\w+)$", path)
+        if m:
+            items = list(self.collections.get(m.group(1), []))
+            for c in conds:
+                items = [i for i in items if self._cond(i, c)]
+            return httpx.Response(200, json=items)
+
+        return httpx.Response(404, json={"error_message": f"unhandled {path}"})
+
+
+@pytest.fixture
+def seeded(httpx_mock: Any) -> SeededGrocy:
+    server = SeededGrocy()
+    httpx_mock.add_callback(server, is_reusable=True)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_convert_units_product_specific(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="pack", to_unit="lb"
+    )
+    assert res["amount_out"] == 4
+    assert res["conversion_source"] == "product_specific"
+
+
+@pytest.mark.asyncio
+async def test_convert_units_global(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_convert_units"](
+        product="ribeye", amount=2, from_unit="lb", to_unit="oz"
+    )
+    assert res["amount_out"] == 32
+    assert res["conversion_source"] == "global"
+
+
+@pytest.mark.asyncio
+async def test_convert_units_no_path(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="count", to_unit="lb"
+    )
+    assert res["error"]["code"] == "no_conversion_path"
+
+
+@pytest.mark.asyncio
+async def test_convert_units_identity(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_convert_units"](
+        product="ribeye", amount=3, from_unit="lb", to_unit="lb"
+    )
+    assert res["amount_out"] == 3
+    assert res["conversion_source"] == "identity"
+
+
+@pytest.mark.asyncio
+async def test_convert_units_disambiguation(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_convert_units"](
+        product="ribeye t", amount=1, from_unit="lb", to_unit="oz"
+    )
+    assert res["error"]["code"] == "needs_disambiguation"
+    assert res["candidates"]
+
+
+@pytest.mark.asyncio
+async def test_product_card(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    card = await tools["grocy_product_card"](product="ribeye")
+    assert card["on_hand"] == 2
+    assert card["last_price"] == 10.0
+    assert card["next_due_date"] == "2026-12-01"
+    assert card["default_location"] == "Chest Freezer"
+    assert card["product_group"] == "Meat"
+    assert card["below_minimum"] is True
+    assert card["locations"] == [{"location": "Chest Freezer", "amount": 2}]
+
+
+@pytest.mark.asyncio
+async def test_consumption_history(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_consumption_history"](product="ribeye", days=90)
+    assert res["purchased_total"] == 4
+    assert res["consumed_total"] == 1
+    assert res["spoiled_total"] == 1
+    assert res["transactions_count"] == 3
+    assert res["consume_rate_per_week"] > 0
+
+
+@pytest.mark.asyncio
+async def test_stock_value_by_location(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_stock_value"](by_location=True)
+    assert res["total_value"] == 20.0
+    assert res["currency"] == "USD"
+    assert res["by_location"] == [{"location": "Chest Freezer", "value": 20.0}]
+    assert res["by_product_top"][0] == {"product": "Ribeye", "value": 20.0}
+
+
+@pytest.mark.asyncio
+async def test_restock_suggestions(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_restock_suggestions"]()
+    assert res["below_minimum"] == [
+        {
+            "product": "Ribeye",
+            "on_hand": 2,
+            "min_stock": 5,
+            "shortfall": 3,
+            "default_location": "Chest Freezer",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stock_by_location_scoped(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_stock_by_location"](location="Chest Freezer")
+    assert res["locations"] == [
+        {
+            "location": "Chest Freezer",
+            "products": [
+                {
+                    "name": "Ribeye",
+                    "amount": 2,
+                    "stock_unit": "count",
+                    "next_due_date": "2026-12-01",
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_enrichment_reads_are_read_only(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    await tools["grocy_convert_units"](product="ribeye", amount=1, from_unit="pack", to_unit="lb")
+    await tools["grocy_product_card"](product="ribeye")
+    await tools["grocy_consumption_history"](product="ribeye")
+    await tools["grocy_stock_value"](by_location=True)
+    await tools["grocy_restock_suggestions"](include_due_soon=True)
+    await tools["grocy_stock_by_location"]()
+    assert seeded.requests  # sanity
+    assert all(r.method == "GET" for r in seeded.requests)
+
+
+@pytest.mark.asyncio
+async def test_product_card_unknown_product(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_product_card"](product="nonexistent")
+    assert res["error"]["code"] == "product_not_found"
