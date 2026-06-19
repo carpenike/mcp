@@ -50,22 +50,16 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |
 | Homelab | `homelab_get_endpoint_history` | Recent check history for one specific endpoint |
-| Grocy | `grocy_list_stock` | Products currently in stock with amount + next due date |
-| Grocy | `grocy_list_volatile_stock` | What needs attention: due soon / overdue / expired / missing |
-| Grocy | `grocy_get_product` | Full stock detail for one product (by id or barcode) |
-| Grocy | `grocy_add_product` | Add/purchase stock for a product (by id or barcode) |
-| Grocy | `grocy_consume_product` | Consume or spoil stock for a product (by id or barcode) |
-| Grocy | `grocy_open_product` | Mark an amount of a product as opened |
-| Grocy | `grocy_list_shopping_list` | List shopping-list items (optionally filtered to one list) |
-| Grocy | `grocy_add_shopping_list_product` | Add a product to a shopping list |
-| Grocy | `grocy_remove_shopping_list_product` | Remove an amount of a product from a shopping list |
-| Grocy | `grocy_add_missing_products` | Bulk-add products below min stock to a shopping list |
-| Grocy | `grocy_add_overdue_products` | Bulk-add overdue products to a shopping list |
-| Grocy | `grocy_list_chores` | All chores with next estimated execution time |
-| Grocy | `grocy_get_chore` | Details/history for one chore |
-| Grocy | `grocy_track_chore` | Track (or skip) a chore execution |
-| Grocy | `grocy_list_tasks` | Open tasks with due dates |
-| Grocy | `grocy_complete_task` | Mark a task completed |
+| Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then set/add/consume in one call |
+| Grocy | `grocy_find_products` | Find products by name across ALL master data ("do we have X?") |
+| Grocy | `grocy_list_stock` | Everything currently in stock with amount + next due date |
+| Grocy | `grocy_expiring` | Planning feed: due soon / overdue / expired / missing |
+| Grocy | `grocy_consume_product` | Consume/spoil primitive (by id or barcode) |
+| Grocy | `grocy_open_product` | Mark an amount of a product as opened (by id or barcode) |
+| Grocy | `grocy_ensure_location` | Idempotently create a storage location |
+| Grocy | `grocy_ensure_unit` | Idempotently create a quantity unit |
+| Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
+| Grocy | `grocy_health` | Connectivity + Grocy version check |
 
 ## Architecture
 
@@ -94,7 +88,7 @@ upstream to PocketID. Claude never touches PocketID directly.
            ├──► fedcook.holthome.net  (federation search)
            ├──► cook.holthome.net     (CookLang recipes: read + author + shopping list)
            ├──► gatus.holthome.net    (uptime monitoring)
-           └──► grocy.holthome.net    (stock, shopping list, chores, tasks)
+           └──► grocy.holthome.net    (food inventory: stock + master data)
 ```
 
 JWTs are RS256, signed by a 2048-bit RSA key resident on the host. The key comes from one of:
