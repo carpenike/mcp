@@ -391,6 +391,36 @@ async def test_add_with_total_price_creates_store(tools: dict[str, Any], fake: F
 
 
 @pytest.mark.asyncio
+async def test_create_within_priced_add_sets_price_unit(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    """Regression: a NEW product booked via a priced add (no store, no
+    best_before — the reported repro) must succeed, and the product-create body
+    must carry the price/consume quantity units. A priced add resolves
+    qu_id_price; without it Grocy rejects the add while a non-priced set works.
+    """
+    await tools["grocy_seed_defaults"]()
+    res = await tools["grocy_stock_item"](
+        name="newcut",
+        amount=2,
+        unit="lb",
+        location="Chest Freezer",
+        action="add",
+        total_price=45,
+    )
+    assert "error" not in res, res
+    assert res["product"]["created"] is True
+    assert res["resulting_amount_on_hand"] == 2.0
+    create = next(
+        json.loads(r.content)
+        for r in fake.requests
+        if r.method == "POST" and r.url.path == "/objects/products"
+    )
+    assert create["qu_id_price"] == create["qu_id_stock"]
+    assert create["qu_id_consume"] == create["qu_id_stock"]
+
+
+@pytest.mark.asyncio
 async def test_add_with_unit_price(tools: dict[str, Any], fake: FakeGrocy) -> None:
     await tools["grocy_seed_defaults"]()
     res = await tools["grocy_stock_item"](

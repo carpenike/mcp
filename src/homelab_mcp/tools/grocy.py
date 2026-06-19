@@ -255,16 +255,24 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return out
 
     async def _create_product(name: str, location_id: int, unit_id: int) -> dict[str, Any]:
-        """Create a master product with stock unit == purchase unit (factor 1).
+        """Create a master product with the SAME unit for stock/purchase/consume/price.
 
-        Minimal body confirmed against grocy/grocy master OpenAPI. See the
-        module-level NOTE if a deployed instance rejects these fields.
+        Grocy 4.x products carry four quantity-unit references. A priced `add`
+        resolves the product's PRICE (and consume) quantity unit, so a product
+        created with only `qu_id_stock`/`qu_id_purchase` set has a null
+        `qu_id_price` and a priced add fails on the missing relation — while a
+        non-priced inventory (`set`) succeeds. Setting all four to the same unit
+        (factor 1) is the standard "simple product" shape the Grocy UI creates
+        and keeps priced intake working. See the module-level NOTE if a deployed
+        instance rejects any of these fields.
         """
         body = {
             "name": name.strip(),
             "location_id": location_id,
             "qu_id_stock": unit_id,
             "qu_id_purchase": unit_id,
+            "qu_id_consume": unit_id,
+            "qu_id_price": unit_id,
             "min_stock_amount": 0,
         }
         res = await _call("POST", "/objects/products", json=body)
