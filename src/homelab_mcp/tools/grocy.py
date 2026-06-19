@@ -443,7 +443,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             if not version:
                 version = info.get("version") or info.get("release_version")
         log.info("grocy reachable; version=%s", version)
-        return {"ok": True, "grocy_version": version, "notes": f"Connected to Grocy {version}."}
+        result: dict[str, Any] = {
+            "ok": True,
+            "grocy_version": version,
+            "notes": f"Connected to Grocy {version}." if version else "Connected to Grocy.",
+        }
+        if version is None:
+            # Self-diagnostic: surface the raw payload so the exact version key
+            # is visible in the tool output (no server-log access needed). Also
+            # confirms THIS build is running — if you still see no raw_system_info
+            # on a null version, the process is on old code.
+            result["raw_system_info"] = info
+            result["notes"] += " Version key not recognized — see raw_system_info."
+        return result
 
     @mcp.tool(
         name="grocy_seed_defaults",

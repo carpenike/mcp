@@ -255,6 +255,18 @@ async def test_health_version_shapes(
 
 
 @pytest.mark.asyncio
+async def test_health_unknown_shape_echoes_raw(tools: dict[str, Any], httpx_mock: Any) -> None:
+    """An unrecognized /system/info shape must still report ok=true AND echo the
+    raw payload, so the actual version key is visible without server logs."""
+    payload = {"some_new_version_field": "4.6.0", "php_version": "8.3"}
+    httpx_mock.add_response(url=f"{BASE}/system/info", json=payload)
+    res = await tools["grocy_health"]()
+    assert res["ok"] is True
+    assert res["grocy_version"] is None
+    assert res["raw_system_info"] == payload
+
+
+@pytest.mark.asyncio
 async def test_seed_defaults_is_idempotent(tools: dict[str, Any], fake: FakeGrocy) -> None:
     first = await tools["grocy_seed_defaults"]()
     assert first["created_count"] == 8  # 4 locations + 4 units
