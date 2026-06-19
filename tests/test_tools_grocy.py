@@ -58,6 +58,7 @@ class FakeGrocy:
         self.locations: list[dict[str, Any]] = []
         self.units: list[dict[str, Any]] = []
         self.products: list[dict[str, Any]] = []
+        self.stores: list[dict[str, Any]] = []
         self.stock: dict[int, float] = {}  # product_id -> amount
         self.requests: list[httpx.Request] = []
 
@@ -75,6 +76,7 @@ class FakeGrocy:
             "locations": self.locations,
             "quantity_units": self.units,
             "products": self.products,
+            "shopping_locations": self.stores,
         }[entity]
 
     def _detail(self, pid: int) -> dict[str, Any] | None:
@@ -351,6 +353,106 @@ async def test_unknown_action(tools: dict[str, Any], fake: FakeGrocy) -> None:
         name="ribeye", amount=1, location="Chest Freezer", action="frobnicate"
     )
     assert res["error"]["code"] == "amount_invalid"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Price capture + store tracking (handoff #4)
+# ─────────────────────────────────────────────────────────────────────────
+def _last_add_body(fake: FakeGrocy) -> dict[str, Any] | None:
+    for r in reversed(fake.requests):
+        if r.url.path.endswith("/add"):
+            return json.loads(r.content)  # type: ignore[no-any-return]
+    return None
+
+
+@pytest.mark.asyncio
+async def test_add_with_total_price_creates_store(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    await tools["grocy_seed_defaults"]()
+    res = await tools["grocy_stock_item"](
+        name="brisket",
+        amount=14.2,
+        unit="lb",
+        location="Chest Freezer",
+        action="add",
+        total_price=45,
+        store="Costco",
+        best_before="2026-12-19",
+    )
+    assert res["resulting_amount_on_hand"] == 14.2
+    assert round(res["unit_price"], 2) == 3.17
+    assert res["total_price"] == 45.0
+    assert res["store"] == "Costco"
+    assert any(s["name"] == "Costco" for s in fake.stores)  # auto-created
+    body = _last_add_body(fake)
+    assert body is not None
+    assert round(body["price"], 2) == 3.17
+    assert body["shopping_location_id"] == fake.stores[0]["id"]
+    assert "purchased_date" not in body  # not passed in this call
+
+
+@pytest.mark.asyncio
+async def test_add_with_unit_price(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    await tools["grocy_seed_defaults"]()
+    res = await tools["grocy_stock_item"](
+        name="ribeye",
+        amount=2,
+        unit="count",
+        location="Chest Freezer",
+        action="add",
+        unit_price=3.5,
+    )
+    assert res["unit_price"] == 3.5
+    assert res["total_price"] == 7.0
+    assert round(_last_add_body(fake)["price"], 2) == 3.5  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_price_ambiguous(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_stock_item"](
+        name="x", amount=1, location="Chest Freezer", action="add", total_price=10, unit_price=3
+    )
+    assert res["error"]["code"] == "price_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_price_invalid_negative(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_stock_item"](
+        name="x", amount=1, location="Chest Freezer", action="add", total_price=-5
+    )
+    assert res["error"]["code"] == "price_invalid"
+
+
+@pytest.mark.asyncio
+async def test_price_rejected_on_non_add(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_stock_item"](
+        name="x", amount=1, location="Chest Freezer", action="set", total_price=5
+    )
+    assert res["error"]["code"] == "price_invalid"
+
+
+@pytest.mark.asyncio
+async def test_add_without_price_is_backward_compatible(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    await tools["grocy_seed_defaults"]()
+    res = await tools["grocy_stock_item"](
+        name="eggs", amount=12, unit="count", location="Kitchen Fridge", action="add"
+    )
+    assert res["unit_price"] is None
+    assert res["store"] is None
+    body = _last_add_body(fake)
+    assert body is not None
+    assert "price" not in body  # None values are dropped — no price recorded
+    assert "shopping_location_id" not in body
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_idempotent(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    a = await tools["grocy_ensure_store"](name="Costco")
+    assert a["created"] is True
+    b = await tools["grocy_ensure_store"](name="costco")  # case-insensitive
+    assert b["created"] is False
+    assert b["id"] == a["id"]
 
 
 @pytest.mark.asyncio

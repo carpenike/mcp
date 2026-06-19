@@ -478,6 +478,24 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         except _GrocyError as exc:
             return exc.payload()
 
+    @mcp.tool(
+        name="grocy_ensure_store",
+        description=(
+            "Idempotently ensure a store (shopping location) exists, e.g. 'Costco'. "
+            "Matches case-insensitively by exact name; creates only if absent. "
+            "Returns {id, name, created}. Tagging purchases with a store builds "
+            "price-by-store history. `grocy_stock_item` auto-creates a store on a "
+            "purchase, so calling this first is optional."
+        ),
+    )
+    async def ensure_store(
+        name: Annotated[str, Field(min_length=1, description="Store name, e.g. 'Costco'.")],
+    ) -> dict[str, Any]:
+        try:
+            return await _ensure("shopping_locations", name.strip(), {"name": name.strip()})
+        except _GrocyError as exc:
+            return exc.payload()
+
     # ─────────────────────────────────────────────────────────────────
     # Reads
     # ─────────────────────────────────────────────────────────────────
@@ -572,7 +590,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Creating a product requires `location` and `unit` to already exist — "
             "if they don't, you get location_not_found / unit_not_found naming the "
             "missing one (run the ensure_* tool first; this tool never invents "
-            "master scaffolding). For meat, always pass a real `best_before` date."
+            "master scaffolding). For meat, always pass a real `best_before` date.\n\n"
+            "PRICE (action='add' only): pass `total_price` (for the whole `amount`) "
+            "OR `unit_price` (per stock unit) — not both (price_ambiguous). Grocy "
+            "stores price per stock unit, so for variable-weight items stock by "
+            "weight (unit='lb') and pass total_price so $/lb is real. Tag the "
+            "purchase with `store` (e.g. 'Costco', auto-created) and an optional "
+            "`purchased_date`. These light up grocy_stock_value and product_card "
+            "price history. Price <= 0 → price_invalid; price on set/consume is "
+            "rejected."
         ),
     )
     async def stock_item(
@@ -598,6 +624,24 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         product_id: Annotated[
             int | None, Field(default=None, ge=1, description="Bypass name resolution if known.")
         ] = None,
+        total_price: Annotated[
+            float | None,
+            Field(default=None, description="action='add' only: price for the WHOLE amount."),
+        ] = None,
+        unit_price: Annotated[
+            float | None,
+            Field(default=None, description="action='add' only: price per ONE stock unit."),
+        ] = None,
+        store: Annotated[
+            str | None,
+            Field(
+                default=None, description="action='add' only: shopping location (e.g. 'Costco')."
+            ),
+        ] = None,
+        purchased_date: Annotated[
+            str | None,
+            Field(default=None, description="action='add' only: YYYY-MM-DD; default today."),
+        ] = None,
     ) -> dict[str, Any]:
         if action not in ("set", "add", "consume"):
             return _GrocyError(
@@ -609,6 +653,35 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             return _GrocyError(
                 "product_not_found", "No product name or id given.", "Pass name or product_id."
             ).payload()
+
+        # Price contract (action='add' only). Grocy stores price PER STOCK UNIT.
+        eff_unit_price: float | None = None
+        if total_price is not None or unit_price is not None:
+            if action != "add":
+                return _GrocyError(
+                    "price_invalid",
+                    "Price applies only to action='add' (a purchase).",
+                    "Use action='add' to record a price.",
+                ).payload()
+            if total_price is not None and unit_price is not None:
+                return _GrocyError(
+                    "price_ambiguous",
+                    "Pass only one of total_price or unit_price.",
+                    "total_price is for the whole amount; unit_price is per stock unit.",
+                ).payload()
+            if unit_price is not None:
+                if unit_price <= 0:
+                    return _GrocyError(
+                        "price_invalid", "unit_price must be greater than zero.", ""
+                    ).payload()
+                eff_unit_price = unit_price
+            else:
+                assert total_price is not None
+                if total_price <= 0:
+                    return _GrocyError(
+                        "price_invalid", "total_price must be greater than zero.", ""
+                    ).payload()
+                eff_unit_price = total_price / amount
 
         try:
             # Location is needed for the action regardless of create path.
@@ -675,6 +748,21 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
             pid = int(product["id"])
 
+            # Store (shopping location) tags a purchase. Low-cardinality and
+            # append-only, so create-on-miss is OK here (unlike products).
+            store_id: int | None = None
+            store_name: str | None = None
+            store_created = False
+            if action == "add" and store is not None and str(store).strip() != "":
+                store_info = await _ensure(
+                    "shopping_locations", str(store).strip(), {"name": str(store).strip()}
+                )
+                if store_info.get("id") is None:
+                    raise _GrocyError("store_not_found", f"Could not resolve store '{store}'.", "")
+                store_id = int(store_info["id"])
+                store_name = store_info.get("name")
+                store_created = bool(store_info.get("created"))
+
             # ── apply the action ─────────────────────────────────────
             if action == "set":
                 body = _compact(
@@ -692,6 +780,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                         "transaction_type": "purchase",
                         "best_before_date": best_before,
                         "location_id": location_id,
+                        "price": eff_unit_price,
+                        "purchased_date": purchased_date,
+                        "shopping_location_id": store_id,
                     }
                 )
                 await _call("POST", f"/stock/products/{pid}/add", json=body)
@@ -715,11 +806,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             verb = f"set {pname} at {location} to {amount}"
         elif action == "add":
             verb = f"added {amount} {pname} at {location}"
+            if eff_unit_price is not None:
+                verb += f" @ {round(eff_unit_price, 4)}/unit"
+            if store_name:
+                verb += f" from {store_name}" + (" (new store)" if store_created else "")
         else:
             verb = f"consumed {amount} {pname}" + (" (spoiled)" if spoiled else "")
         on_hand = "unknown" if resulting is None else resulting
         prefix = "Created and " if created else ""
-        return {
+        result: dict[str, Any] = {
             "action_taken": action,
             "product": {"id": pid, "name": pname, "created": created},
             "location": location,
@@ -728,6 +823,14 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "resulting_amount_on_hand": resulting,
             "notes": f"{prefix}{verb}; {on_hand} on hand.",
         }
+        if action == "add":
+            result["unit_price"] = round(eff_unit_price, 4) if eff_unit_price is not None else None
+            result["total_price"] = (
+                round(eff_unit_price * amount, 2) if eff_unit_price is not None else None
+            )
+            result["store"] = store_name
+            result["purchased_date"] = purchased_date
+        return result
 
     # ─────────────────────────────────────────────────────────────────
     # Primitives (retained for direct use)

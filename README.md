@@ -50,7 +50,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |
 | Homelab | `homelab_get_endpoint_history` | Recent check history for one specific endpoint |
-| Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then set/add/consume in one call |
+| Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then set/add/consume in one call; price + store on `add` |
 | Grocy | `grocy_find_products` | Find products by name across ALL master data ("do we have X?") |
 | Grocy | `grocy_list_stock` | Everything currently in stock with amount + next due date |
 | Grocy | `grocy_expiring` | Planning feed: due soon / overdue / expired / missing |
@@ -58,6 +58,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Grocy | `grocy_open_product` | Mark an amount of a product as opened (by id or barcode) |
 | Grocy | `grocy_ensure_location` | Idempotently create a storage location |
 | Grocy | `grocy_ensure_unit` | Idempotently create a quantity unit |
+| Grocy | `grocy_ensure_store` | Idempotently create a store (shopping location) for price-by-store history |
 | Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
 | Grocy | `grocy_health` | Connectivity + Grocy version check |
 | Grocy | `grocy_convert_units` | Convert an amount between units (product-specific → global → identity) |
