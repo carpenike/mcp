@@ -170,6 +170,15 @@ class FakeGrocy:
                 return httpx.Response(404, json={"error_message": "Not existing product"})
             return httpx.Response(200, json=prod)
 
+        m = re.match(r"^/objects/(\w+)/(\d+)$", path)
+        if m and method == "PUT":
+            coll = self._coll(m.group(1))
+            rec = next((i for i in coll if i.get("id") == int(m.group(2))), None)
+            if rec is None:
+                return httpx.Response(400, json={"error_message": "Not found"})
+            rec.update(body)
+            return httpx.Response(204)
+
         m = re.match(r"^/userfields/(\w+)/(\d+)$", path)
         if m:
             key = (m.group(1), int(m.group(2)))
@@ -656,6 +665,36 @@ async def test_ensure_store_updates_changed_address(tools: dict[str, Any], fake:
     # Same address again → no update.
     again = await tools["grocy_ensure_store"](name="Shop", address="new")
     assert again["updated"] is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_description_separate_from_address(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    res = await tools["grocy_ensure_store"](
+        name="Co-op", address="500 Elm St", description="Members-only, cash preferred"
+    )
+    assert res["created"] is True
+    assert res["address"] == "500 Elm St"
+    assert res["description"] == "Members-only, cash preferred"
+    # description in the store column; address in the userfield — kept apart.
+    store = next(s for s in fake.stores if s["name"] == "Co-op")
+    assert store["description"] == "Members-only, cash preferred"
+    assert fake.userfield_values[("shopping_locations", store["id"])]["address"] == "500 Elm St"
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_description_backfill_no_clobber(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    await tools["grocy_ensure_store"](name="Bodega")  # no description
+    r1 = await tools["grocy_ensure_store"](name="Bodega", description="Open late")
+    assert r1["updated"] is True
+    assert r1["description"] == "Open late"
+    # Re-run with no description must not wipe it.
+    r2 = await tools["grocy_ensure_store"](name="Bodega")
+    assert r2["updated"] is False
+    assert r2["description"] == "Open late"
 
 
 @pytest.mark.asyncio

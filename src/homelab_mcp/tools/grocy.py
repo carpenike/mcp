@@ -635,52 +635,75 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Idempotently ensure a store (shopping location) exists, e.g. 'Costco'. "
             "Matches case-insensitively by exact name; creates only if absent. "
             "Optionally record an `address` (free text — e.g. a farm's street "
-            "address for provenance). The address is stored in a DEDICATED Grocy "
-            "userfield ('address' on shopping_locations, auto-defined on first "
-            "use) — NOT the `description` column, which stays free for other "
-            "notes. Upsert: on an existing store a provided `address` "
-            "backfills/updates it (updated=true); a null `address` never clobbers "
-            "an existing one. Returns {id, name, address, created, updated}. "
-            "`grocy_stock_item` auto-creates a store on a purchase, so calling "
-            "this first is optional — use it to add or correct an address."
+            "address for provenance), stored in a DEDICATED Grocy userfield "
+            "('address' on shopping_locations, auto-defined on first use), and a "
+            "`description` (general notes about the store), stored in the store's "
+            "own description column — the two are kept separate. Upsert: on an "
+            "existing store a provided `address`/`description` backfills/updates it "
+            "(updated=true); a null value never clobbers an existing one. Returns "
+            "{id, name, address, description, created, updated}. `grocy_stock_item` "
+            "auto-creates a store on a purchase, so calling this first is optional "
+            "— use it to add or correct an address or note."
         ),
     )
     async def ensure_store(
         name: Annotated[str, Field(min_length=1, description="Store name, e.g. 'Costco'.")],
         address: Annotated[
             str | None,
-            Field(default=None, description="Free-text address; stored in the 'address' userfield."),
+            Field(
+                default=None, description="Free-text address; stored in the 'address' userfield."
+            ),
+        ] = None,
+        description: Annotated[
+            str | None,
+            Field(default=None, description="General notes; stored in the store's description."),
         ] = None,
     ) -> dict[str, Any]:
         name_s = name.strip()
         addr = address.strip() if address and address.strip() else None
+        desc = description.strip() if description and description.strip() else None
         try:
             rows = await _list_all(_SHOPPING_LOCATIONS)
             existing = next((r for r in rows if _norm(r.get("name")) == _norm(name_s)), None)
             store_name: str | None
+            current_desc: Any
             if existing is None:
-                res = await _call("POST", f"/objects/{_SHOPPING_LOCATIONS}", json={"name": name_s})
+                body: dict[str, Any] = {"name": name_s}
+                if desc is not None:
+                    body["description"] = desc
+                res = await _call("POST", f"/objects/{_SHOPPING_LOCATIONS}", json=body)
                 new_id = res.get("created_object_id") if isinstance(res, dict) else None
                 if new_id is None:
                     raise _GrocyError("missing_fk", "Grocy did not return a new store id.", "")
                 sid, store_name, created = int(new_id), name_s, True
+                current_desc = desc
             else:
                 sid, store_name, created = int(existing["id"]), existing.get("name"), False
+                current_desc = existing.get("description")
 
-            current = (
-                await _userfield_values(_SHOPPING_LOCATIONS, sid)
-            ).get(_STORE_ADDRESS_FIELD) or None
             updated = False
-            if addr is not None and addr != (current or ""):
-                # Define the userfield once, then set the value.
+            # Description lives in the store's own column; update on an existing
+            # store only when given and changed (null never clobbers).
+            if existing is not None and desc is not None and desc != (current_desc or ""):
+                await _call(
+                    "PUT", f"/objects/{_SHOPPING_LOCATIONS}/{sid}", json={"description": desc}
+                )
+                current_desc, updated = desc, True
+
+            # Address lives in a dedicated userfield.
+            current_addr = (await _userfield_values(_SHOPPING_LOCATIONS, sid)).get(
+                _STORE_ADDRESS_FIELD
+            ) or None
+            if addr is not None and addr != (current_addr or ""):
                 await _ensure_userfield(_SHOPPING_LOCATIONS, _STORE_ADDRESS_FIELD, "Address")
                 await _set_userfield(_SHOPPING_LOCATIONS, sid, _STORE_ADDRESS_FIELD, addr)
-                current, updated = addr, True
+                current_addr, updated = addr, True
 
             return {
                 "id": sid,
                 "name": store_name,
-                "address": current,
+                "address": current_addr,
+                "description": current_desc or None,
                 "created": created,
                 "updated": updated,
             }
