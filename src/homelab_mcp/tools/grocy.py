@@ -196,14 +196,28 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         data = await _call("GET", f"/objects/{entity}", params={"query[]": f"name~{name}"})
         return data if isinstance(data, list) else []
 
+    async def _list_all(entity: str) -> list[dict[str, Any]]:
+        """Fetch a whole /objects/{entity} collection (no server-side filter)."""
+        data = await _call("GET", f"/objects/{entity}")
+        return data if isinstance(data, list) else []
+
     async def _resolve_id(entity: str, value: str | int, not_found_code: str) -> int:
-        """Resolve a name-or-id to an existing id; raise if a name has no exact match."""
+        """Resolve a name-or-id to an existing id; raise if a name has no exact match.
+
+        Exact resolution does NOT use the server-side `~` LIKE filter: we fetch
+        the (small) master-data collection unfiltered and match client-side.
+        Relying on `~` here was fragile — it could return a set that omitted the
+        exact row for some inputs, raising a spurious `*_not_found` for an object
+        that demonstrably exists. Master-data collections (locations, units,
+        stores) are tiny, so the unfiltered read is cheap and deterministic.
+        """
         if isinstance(value, int):
             return value
         s = str(value).strip()
         if s.isdigit():
             return int(s)
-        exact = [i for i in await _search(entity, s) if _norm(i.get("name")) == _norm(s)]
+        rows = await _list_all(entity)
+        exact = [i for i in rows if _norm(i.get("name")) == _norm(s)]
         singular = entity.rstrip("s").replace("_", " ")
         if len(exact) == 1:
             return int(exact[0]["id"])
@@ -211,6 +225,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             raise _GrocyError(
                 not_found_code, f"Multiple {entity} named '{s}'.", "Pass the numeric id instead."
             )
+        log.warning(
+            "grocy: no %s exactly named %r among %d rows: %s",
+            entity,
+            s,
+            len(rows),
+            [r.get("name") for r in rows][:20],
+        )
         raise _GrocyError(
             not_found_code,
             f"No {singular} named '{s}'.",
@@ -218,8 +239,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         )
 
     async def _ensure(entity: str, name: str, create_body: dict[str, Any]) -> dict[str, Any]:
-        """Idempotent lookup-or-create on an /objects/{entity} collection."""
-        exact = [i for i in await _search(entity, name) if _norm(i.get("name")) == _norm(name)]
+        """Idempotent lookup-or-create on an /objects/{entity} collection.
+
+        Uses an unfiltered exact-match lookup (see `_resolve_id`) so a `~`-filter
+        miss can't cause a duplicate row to be created for an existing object.
+        """
+        exact = [i for i in await _list_all(entity) if _norm(i.get("name")) == _norm(name)]
         if exact:
             return {"id": int(exact[0]["id"]), "name": exact[0].get("name"), "created": False}
         res = await _call("POST", f"/objects/{entity}", json=create_body)

@@ -61,6 +61,10 @@ class FakeGrocy:
         self.stores: list[dict[str, Any]] = []
         self.stock: dict[int, float] = {}  # product_id -> amount
         self.requests: list[httpx.Request] = []
+        # When True, the server-side `query[]` (`~` LIKE) filter returns nothing
+        # — simulating the live Grocy path where the filter failed to return an
+        # existing row. Exact master-data resolution must not depend on it.
+        self.filter_blind = False
 
     # -- helpers ---------------------------------------------------------
     @staticmethod
@@ -144,6 +148,8 @@ class FakeGrocy:
                 like = self._like(qs.get("query[]", [None])[0])
                 items = self._coll(entity)
                 if like is not None:
+                    if self.filter_blind:
+                        return httpx.Response(200, json=[])
                     items = [i for i in items if like.lower() in str(i["name"]).lower()]
                 return httpx.Response(200, json=items)
             if method == "POST":
@@ -388,6 +394,32 @@ async def test_add_with_total_price_creates_store(tools: dict[str, Any], fake: F
     assert round(body["price"], 2) == 3.17
     assert body["shopping_location_id"] == fake.stores[0]["id"]
     assert "purchased_date" not in body  # not passed in this call
+
+
+@pytest.mark.asyncio
+async def test_priced_add_new_product_resolves_location_when_filter_blind(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    """Regression for the live bug: a NEW product booked via a priced add failed
+    with location_not_found even though the location existed. Root cause was
+    exact resolution depending on the server-side `~` filter; here that filter
+    returns nothing, yet location/unit must still resolve (unfiltered) and the
+    product must be created + booked in one call.
+    """
+    fake.filter_blind = True
+    await tools["grocy_seed_defaults"]()
+    res = await tools["grocy_stock_item"](
+        name="ground beef",
+        amount=5,
+        unit="lb",
+        location="Chest Freezer",
+        action="add",
+        total_price=25,
+    )
+    assert "error" not in res, res
+    assert res["product"]["created"] is True
+    assert res["resulting_amount_on_hand"] == 5.0
+    assert round(res["unit_price"], 2) == 5.0
 
 
 @pytest.mark.asyncio
