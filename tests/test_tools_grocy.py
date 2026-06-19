@@ -234,6 +234,26 @@ async def test_health_reports_version(tools: dict[str, Any], fake: FakeGrocy) ->
     assert res["grocy_version"] == "4.0.0"
 
 
+@pytest.mark.parametrize(
+    "info",
+    [
+        {"grocy_version": {"Version": "4.6.0"}},
+        {"grocy_version": {"version": "4.6.0"}},
+        {"grocy_version": "4.6.0"},
+        {"version": "4.6.0"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_health_version_shapes(
+    tools: dict[str, Any], httpx_mock: Any, info: dict[str, Any]
+) -> None:
+    """The /system/info version shape has varied across Grocy releases; read it
+    robustly so grocy_health never reports 'None' against a reachable instance."""
+    httpx_mock.add_response(url=f"{BASE}/system/info", json=info)
+    res = await tools["grocy_health"]()
+    assert res["grocy_version"] == "4.6.0"
+
+
 @pytest.mark.asyncio
 async def test_seed_defaults_is_idempotent(tools: dict[str, Any], fake: FakeGrocy) -> None:
     first = await tools["grocy_seed_defaults"]()

@@ -432,9 +432,16 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             info = await _call("GET", "/system/info")
         except _GrocyError as exc:
             return exc.payload()
-        version = None
+        version: str | None = None
         if isinstance(info, dict):
-            version = (info.get("grocy_version") or {}).get("Version")
+            gv = info.get("grocy_version")
+            if isinstance(gv, dict):
+                # Grocy has shipped both "Version" and "version" keys here.
+                version = gv.get("Version") or gv.get("version")
+            elif isinstance(gv, str):
+                version = gv
+            if not version:
+                version = info.get("version") or info.get("release_version")
         log.info("grocy reachable; version=%s", version)
         return {"ok": True, "grocy_version": version, "notes": f"Connected to Grocy {version}."}
 
