@@ -60,6 +60,16 @@ _SEED_UNITS = ["count", "lb", "oz", "pack"]
 # long-lived product can't fan a single read into an unbounded response.
 _MAX_LOG_ROWS = 2000
 
+# Single source of truth for the quantity-unit-conversion row shape, shared by
+# the reader (`_find_conversion`) and the writer (`grocy_set_unit_conversion`)
+# so the two can never drift. Verified against Grocy 4.6.0. If a future version
+# renames these columns, change them HERE and both sides follow.
+_CONV_ENTITY = "quantity_unit_conversions"
+_CONV_FROM = "from_qu_id"
+_CONV_TO = "to_qu_id"
+_CONV_FACTOR = "factor"
+_CONV_PRODUCT = "product_id"
+
 
 class _GrocyError(Exception):
     """An internal failure carrying a stable error `code` for the client.
@@ -321,38 +331,38 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Create it with grocy_ensure_unit.",
         )
 
+    async def _query_conversions(from_id: int, to_id: int) -> list[dict[str, Any]]:
+        """All conversion rows for a (from_unit, to_unit) pair — global + product."""
+        rows = await _call(
+            "GET",
+            f"/objects/{_CONV_ENTITY}",
+            params={"query[]": [f"{_CONV_FROM}={from_id}", f"{_CONV_TO}={to_id}"]},
+        )
+        return rows if isinstance(rows, list) else []
+
     async def _find_conversion(
         product_id: int, from_id: int, to_id: int
     ) -> tuple[float, str] | None:
         """Resolve a QU conversion factor: product-specific → global → reverse.
 
         Returns (factor, source) where amount_out = amount_in * factor, or None
-        when no direct conversion exists (we do NOT chain or assume 1:1).
+        when no direct conversion exists (we do NOT chain or assume 1:1). Reads
+        the shared `_CONV_*` row shape that `grocy_set_unit_conversion` writes.
         """
 
         def _pick(rows: list[dict[str, Any]]) -> tuple[float, str] | None:
-            specific = [r for r in rows if str(r.get("product_id") or "") == str(product_id)]
+            specific = [r for r in rows if str(r.get(_CONV_PRODUCT) or "") == str(product_id)]
             if specific:
-                return float(specific[0]["factor"]), "product_specific"
-            glob = [r for r in rows if not r.get("product_id")]
+                return float(specific[0][_CONV_FACTOR]), "product_specific"
+            glob = [r for r in rows if not r.get(_CONV_PRODUCT)]
             if glob:
-                return float(glob[0]["factor"]), "global"
+                return float(glob[0][_CONV_FACTOR]), "global"
             return None
 
-        fwd = await _call(
-            "GET",
-            "/objects/quantity_unit_conversions",
-            params={"query[]": [f"from_qu_id={from_id}", f"to_qu_id={to_id}"]},
-        )
-        hit = _pick(fwd if isinstance(fwd, list) else [])
+        hit = _pick(await _query_conversions(from_id, to_id))
         if hit:
             return hit
-        rev = await _call(
-            "GET",
-            "/objects/quantity_unit_conversions",
-            params={"query[]": [f"from_qu_id={to_id}", f"to_qu_id={from_id}"]},
-        )
-        rhit = _pick(rev if isinstance(rev, list) else [])
+        rhit = _pick(await _query_conversions(to_id, from_id))
         if rhit and rhit[0]:
             return 1.0 / rhit[0], rhit[1]
         return None
@@ -1188,3 +1198,135 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "notes": f"{n_items} stock entr{'y' if n_items == 1 else 'ies'} "
             f"across {len(locations)} location(s).",
         }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Unit-conversion authoring (the only master-data write beyond product
+    # create — upsert only, no delete)
+    # ─────────────────────────────────────────────────────────────────
+    @mcp.tool(
+        name="grocy_set_unit_conversion",
+        description=(
+            "Add or update a quantity-unit conversion so `grocy_convert_units` can "
+            "use it — e.g. teach Grocy 'a pack of ribeye is 4 lb' during a "
+            "walkthrough. `factor` is the amount of `to_unit` per 1 `from_unit` "
+            "(pack→lb factor 4 means 1 pack = 4 lb). Pass `product` for a "
+            "product-specific conversion, or omit it for a GLOBAL one (e.g. "
+            "1 lb = 16 oz everywhere).\n\n"
+            "Write ONE direction only — `grocy_convert_units` inverts "
+            "automatically, so setting pack→lb=4 makes lb→pack=0.25 resolve on its "
+            "own. Do not also write the reverse.\n\n"
+            "Idempotent upsert: an existing row for the same (product, from, to) is "
+            "updated in place (result='updated'); otherwise a new row is created "
+            "(result='created'). Never makes a duplicate. Units and product must "
+            "already exist (unit_not_found / product_not_found); a near-but-inexact "
+            "product name returns needs_disambiguation."
+        ),
+    )
+    async def set_unit_conversion(
+        from_unit: Annotated[str | int, Field(description="Source unit name or id.")],
+        to_unit: Annotated[str | int, Field(description="Target unit name or id.")],
+        factor: Annotated[float, Field(description="Amount of to_unit per 1 from_unit (> 0).")],
+        product: Annotated[
+            str | int | None,
+            Field(
+                default=None,
+                description="Product name/id for a specific conversion; omit for global.",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        if factor is None or factor <= 0:
+            return _GrocyError("factor_invalid", "Factor must be greater than zero.", "").payload()
+        try:
+            from_id, from_name = await _resolve_unit(from_unit)
+            to_id, to_name = await _resolve_unit(to_unit)
+            prod: dict[str, Any] | None = None
+            if product is not None and str(product).strip() != "":
+                prod = await _resolve_product(product)
+            pid = int(prod["id"]) if prod else None
+
+            rows = await _query_conversions(from_id, to_id)
+            if pid is None:
+                match = next((r for r in rows if not r.get(_CONV_PRODUCT)), None)
+            else:
+                match = next((r for r in rows if str(r.get(_CONV_PRODUCT) or "") == str(pid)), None)
+
+            body: dict[str, Any] = {_CONV_FROM: from_id, _CONV_TO: to_id, _CONV_FACTOR: factor}
+            if pid is not None:
+                body[_CONV_PRODUCT] = pid
+
+            if match is not None:
+                cid: int | None = int(match["id"])
+                await _call("PUT", f"/objects/{_CONV_ENTITY}/{cid}", json=body)
+                result = "updated"
+            else:
+                res = await _call("POST", f"/objects/{_CONV_ENTITY}", json=body)
+                cid = res.get("created_object_id") if isinstance(res, dict) else None
+                result = "created"
+        except _Disambiguation as dis:
+            return dis.payload()
+        except _GrocyError as exc:
+            return exc.payload()
+
+        fname, tname = from_name or str(from_unit), to_name or str(to_unit)
+        scope = prod["name"] if prod else "global"
+        return {
+            "product": prod,
+            "from_unit": fname,
+            "to_unit": tname,
+            "factor": factor,
+            "result": result,
+            "conversion_id": cid,
+            "notes": (
+                f"{result.capitalize()} {scope} conversion: 1 {fname} = {factor} {tname} "
+                "(reverse resolves automatically)."
+            ),
+        }
+
+    @mcp.tool(
+        name="grocy_list_unit_conversions",
+        description=(
+            "List defined quantity-unit conversions for inspection/debugging. Pass "
+            "a `product` to see that product's specific conversions, or omit it for "
+            "all (global + product-specific). Read-only."
+        ),
+    )
+    async def list_unit_conversions(
+        product: Annotated[
+            str | int | None,
+            Field(default=None, description="Product name or id; omit for all."),
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            pid: int | None = None
+            pname: str | None = None
+            if product is not None and str(product).strip() != "":
+                prod = await _resolve_product(product)
+                pid, pname = int(prod["id"]), prod["name"]
+            rows = await _call("GET", f"/objects/{_CONV_ENTITY}")
+            unit_names = await _name_map("quantity_units")
+            prod_names = await _name_map("products")
+        except _Disambiguation as dis:
+            return dis.payload()
+        except _GrocyError as exc:
+            return exc.payload()
+
+        rows = rows if isinstance(rows, list) else []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            raw_pid = r.get(_CONV_PRODUCT)
+            rpid = int(raw_pid) if raw_pid not in (None, "") else None
+            if pid is not None and rpid != pid:
+                continue
+            fid = r.get(_CONV_FROM)
+            tid = r.get(_CONV_TO)
+            out.append(
+                {
+                    "conversion_id": r.get("id"),
+                    "product": {"id": rpid, "name": prod_names.get(rpid)} if rpid else None,
+                    "from_unit": unit_names.get(int(fid)) if fid is not None else None,
+                    "to_unit": unit_names.get(int(tid)) if tid is not None else None,
+                    "factor": r.get(_CONV_FACTOR),
+                }
+            )
+        scope = f"for {pname}" if pname else "(all)"
+        return {"conversions": out, "notes": f"{len(out)} conversion(s) {scope}."}

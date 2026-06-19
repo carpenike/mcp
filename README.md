@@ -66,6 +66,8 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Grocy | `grocy_stock_value` | Total inventory value, optionally by location + top-N products |
 | Grocy | `grocy_restock_suggestions` | Quantity-driven below-minimum signal (vs. date-driven `grocy_expiring`) |
 | Grocy | `grocy_stock_by_location` | On-hand stock grouped by storage location |
+| Grocy | `grocy_set_unit_conversion` | Upsert a unit conversion (product-specific or global); write one direction |
+| Grocy | `grocy_list_unit_conversions` | Inspect defined conversions (global and/or per product) |
 
 ## Architecture
 

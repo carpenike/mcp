@@ -548,15 +548,26 @@ class SeededGrocy:
 
         m = re.match(r"^/objects/(\w+)/(\d+)$", path)
         if m:
-            coll = self.collections.get(m.group(1), [])
+            coll = self.collections.setdefault(m.group(1), [])
             rec = next((i for i in coll if i.get("id") == int(m.group(2))), None)
+            if request.method == "PUT":
+                if rec is None:
+                    return httpx.Response(400, json={"error_message": "Not found"})
+                rec.update(json.loads(request.content) if request.content else {})
+                return httpx.Response(204)
             if rec is None:
                 return httpx.Response(404, json={"error_message": "Not found"})
             return httpx.Response(200, json=rec)
 
         m = re.match(r"^/objects/(\w+)$", path)
         if m:
-            items = list(self.collections.get(m.group(1), []))
+            coll = self.collections.setdefault(m.group(1), [])
+            if request.method == "POST":
+                body = json.loads(request.content) if request.content else {}
+                new_id = max((i["id"] for i in coll), default=0) + 1
+                coll.append({**body, "id": new_id})
+                return httpx.Response(200, json={"created_object_id": new_id})
+            items = list(coll)
             for c in conds:
                 items = [i for i in items if self._cond(i, c)]
             return httpx.Response(200, json=items)
@@ -694,3 +705,99 @@ async def test_enrichment_reads_are_read_only(tools: dict[str, Any], seeded: See
 async def test_product_card_unknown_product(tools: dict[str, Any], seeded: SeededGrocy) -> None:
     res = await tools["grocy_product_card"](product="nonexistent")
     assert res["error"]["code"] == "product_not_found"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Unit-conversion authoring (handoff #3)
+# ─────────────────────────────────────────────────────────────────────────
+def _convs(seeded: SeededGrocy) -> list[dict[str, Any]]:
+    return seeded.collections["quantity_unit_conversions"]
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_updates_existing_no_duplicate(
+    tools: dict[str, Any], seeded: SeededGrocy
+) -> None:
+    before = len(_convs(seeded))  # seeded has pack→lb (id 1) + global lb→oz (id 2)
+    res = await tools["grocy_set_unit_conversion"](
+        product="ribeye", from_unit="pack", to_unit="lb", factor=3.5
+    )
+    assert res["result"] == "updated"
+    assert res["conversion_id"] == 1
+    assert len(_convs(seeded)) == before  # no duplicate row
+    # round-trips through the reader
+    conv = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="pack", to_unit="lb"
+    )
+    assert conv["amount_out"] == 3.5
+    assert conv["conversion_source"] == "product_specific"
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_creates_product_specific(
+    tools: dict[str, Any], seeded: SeededGrocy
+) -> None:
+    res = await tools["grocy_set_unit_conversion"](
+        product="ribeye", from_unit="count", to_unit="oz", factor=8
+    )
+    assert res["result"] == "created"
+    assert res["product"]["name"] == "Ribeye"
+    conv = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="count", to_unit="oz"
+    )
+    assert conv["amount_out"] == 8
+    assert conv["conversion_source"] == "product_specific"
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_global(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_set_unit_conversion"](from_unit="count", to_unit="pack", factor=12)
+    assert res["result"] == "created"
+    assert res["product"] is None
+    conv = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="count", to_unit="pack"
+    )
+    assert conv["amount_out"] == 12
+    assert conv["conversion_source"] == "global"
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_inverse_resolves_without_second_row(
+    tools: dict[str, Any], seeded: SeededGrocy
+) -> None:
+    # seeded pack→lb = 4; lb→pack must resolve to 0.25 with no extra row written.
+    before = len(_convs(seeded))
+    conv = await tools["grocy_convert_units"](
+        product="ribeye", amount=2, from_unit="lb", to_unit="pack"
+    )
+    assert conv["amount_out"] == 0.5
+    assert len(_convs(seeded)) == before
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_factor_invalid(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_set_unit_conversion"](
+        product="ribeye", from_unit="pack", to_unit="lb", factor=0
+    )
+    assert res["error"]["code"] == "factor_invalid"
+
+
+@pytest.mark.asyncio
+async def test_set_conversion_unit_not_found(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_set_unit_conversion"](
+        product="ribeye", from_unit="pack", to_unit="furlong", factor=2
+    )
+    assert res["error"]["code"] == "unit_not_found"
+
+
+@pytest.mark.asyncio
+async def test_list_unit_conversions_for_product(
+    tools: dict[str, Any], seeded: SeededGrocy
+) -> None:
+    res = await tools["grocy_list_unit_conversions"](product="ribeye")
+    assert len(res["conversions"]) == 1
+    row = res["conversions"][0]
+    assert row["from_unit"] == "pack"
+    assert row["to_unit"] == "lb"
+    assert row["factor"] == 4
+    assert row["product"]["name"] == "Ribeye"
