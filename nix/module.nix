@@ -26,10 +26,12 @@
 #         HOMELAB_MCP_COOKLANG_BASE_URL     = "https://cook.holthome.net";
 #         HOMELAB_MCP_FEDERATION_BASE_URL   = "https://fedcook.holthome.net";
 #         HOMELAB_MCP_GATUS_BASE_URL        = "https://gatus.holthome.net";
+#         HOMELAB_MCP_GROCY_BASE_URL        = "https://grocy.holthome.net";
 #       };
 #
 #       # sops-managed file containing:
 #       #   HOMELAB_MCP_POCKETID_CLIENT_SECRET=<from PocketID admin UI>
+#       #   HOMELAB_MCP_GROCY_API_KEY=<from Grocy: Settings -> Manage API keys>
 #       # and optionally:
 #       #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, escaped newlines>
 #       #   HOMELAB_MCP_OAUTH_SESSION_SECRET=<random 32+ bytes hex/base64>
@@ -122,6 +124,7 @@ in
           HOMELAB_MCP_COOKLANG_BASE_URL   = "https://cook.holthome.net";
           HOMELAB_MCP_FEDERATION_BASE_URL = "https://fedcook.holthome.net";
           HOMELAB_MCP_GATUS_BASE_URL      = "https://gatus.holthome.net";
+          HOMELAB_MCP_GROCY_BASE_URL      = "https://grocy.holthome.net";
         }
       '';
       description = ''
@@ -144,6 +147,10 @@ in
           HOMELAB_MCP_POCKETID_CLIENT_SECRET=<from PocketID admin UI>
 
         Optional keys:
+          HOMELAB_MCP_GROCY_API_KEY=<from Grocy: Settings -> Manage API keys>
+            Required only if the grocy_* tools are used; without it those
+            tools return a configuration error. Kept here (not in
+            `settings`) because it is a secret.
           HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA private PEM, PKCS#8, escaped \n>
             If absent, the service generates and persists a fresh 2048-bit
             RSA key at /var/lib/homelab-mcp/signing-key.pem (mode 0600).

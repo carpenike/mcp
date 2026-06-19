@@ -200,6 +200,23 @@ class Settings(BaseSettings):
     recipes_dir: str = Field(default="/data/cooklang/recipes")
     gatus_base_url: str = Field(default="https://gatus.holthome.net")
 
+    # ── Grocy ────────────────────────────────────────────────────────
+    grocy_base_url: str = Field(
+        default="https://grocy.holthome.net",
+        description="Base URL of the Grocy instance (no trailing slash needed).",
+    )
+    grocy_api_key: str = Field(
+        default="",
+        description=(
+            "API key sent in the `GROCY-API-KEY` header on every Grocy request. "
+            "SECRET — supply via the sops-managed EnvironmentFile "
+            "(HOMELAB_MCP_GROCY_API_KEY), never via the world-readable Nix "
+            "`settings`. Generate one in Grocy under Settings → Manage API keys. "
+            "If empty, the grocy_* tools return a configuration error instead of "
+            "calling out."
+        ),
+    )
+
     # ── Derived ──────────────────────────────────────────────────────
     @property
     def pocketid_redirect_uri(self) -> str:
