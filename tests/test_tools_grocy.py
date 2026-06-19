@@ -59,6 +59,8 @@ class FakeGrocy:
         self.units: list[dict[str, Any]] = []
         self.products: list[dict[str, Any]] = []
         self.stores: list[dict[str, Any]] = []
+        self.userfield_defs: list[dict[str, Any]] = []
+        self.userfield_values: dict[tuple[str, int], dict[str, Any]] = {}
         self.stock: dict[int, float] = {}  # product_id -> amount
         self.requests: list[httpx.Request] = []
         # When True, the server-side `query[]` (`~` LIKE) filter returns nothing
@@ -81,6 +83,7 @@ class FakeGrocy:
             "quantity_units": self.units,
             "products": self.products,
             "shopping_locations": self.stores,
+            "userfields": self.userfield_defs,
         }[entity]
 
     def _detail(self, pid: int) -> dict[str, Any] | None:
@@ -166,6 +169,15 @@ class FakeGrocy:
             if prod is None:
                 return httpx.Response(404, json={"error_message": "Not existing product"})
             return httpx.Response(200, json=prod)
+
+        m = re.match(r"^/userfields/(\w+)/(\d+)$", path)
+        if m:
+            key = (m.group(1), int(m.group(2)))
+            if method == "GET":
+                return httpx.Response(200, json=self.userfield_values.get(key, {}))
+            if method == "PUT":
+                self.userfield_values.setdefault(key, {}).update(body)
+                return httpx.Response(204)
 
         m = re.match(r"^/stock/products/(\d+)$", path)
         if m and method == "GET":
@@ -594,9 +606,56 @@ async def test_add_without_price_is_backward_compatible(
 async def test_ensure_store_idempotent(tools: dict[str, Any], fake: FakeGrocy) -> None:
     a = await tools["grocy_ensure_store"](name="Costco")
     assert a["created"] is True
+    assert a["address"] is None
+    assert a["updated"] is False
     b = await tools["grocy_ensure_store"](name="costco")  # case-insensitive
     assert b["created"] is False
     assert b["id"] == a["id"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_address_on_create(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    addr = "6316 Mount Phillip Road, Frederick, MD 21703"
+    res = await tools["grocy_ensure_store"](name="Stone Pillar Farm", address=addr)
+    assert res["created"] is True
+    assert res["address"] == addr
+    # The address lives in a userfield, NOT the store's description column.
+    store = next(s for s in fake.stores if s["name"] == "Stone Pillar Farm")
+    assert "description" not in store
+    assert fake.userfield_values[("shopping_locations", store["id"])]["address"] == addr
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_address_not_clobbered(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    addr = "123 Farm Rd"
+    await tools["grocy_ensure_store"](name="Farm", address=addr)
+    # Re-run with no address: must not wipe the existing one.
+    res = await tools["grocy_ensure_store"](name="farm")
+    assert res["created"] is False
+    assert res["updated"] is False
+    assert res["address"] == addr
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_backfills_existing(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    first = await tools["grocy_ensure_store"](name="Market")  # no address
+    assert first["created"] is True
+    assert first["address"] is None
+    res = await tools["grocy_ensure_store"](name="Market", address="1 Main St")
+    assert res["created"] is False
+    assert res["updated"] is True
+    assert res["address"] == "1 Main St"
+
+
+@pytest.mark.asyncio
+async def test_ensure_store_updates_changed_address(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    await tools["grocy_ensure_store"](name="Shop", address="old")
+    res = await tools["grocy_ensure_store"](name="Shop", address="new")
+    assert res["updated"] is True
+    assert res["address"] == "new"
+    # Same address again → no update.
+    again = await tools["grocy_ensure_store"](name="Shop", address="new")
+    assert again["updated"] is False
 
 
 @pytest.mark.asyncio

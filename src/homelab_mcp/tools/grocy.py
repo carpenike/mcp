@@ -70,6 +70,13 @@ _CONV_TO = "to_qu_id"
 _CONV_FACTOR = "factor"
 _CONV_PRODUCT = "product_id"
 
+# A store's address is kept in a DEDICATED Grocy userfield rather than
+# overloading the free-text `description` column — so `description` stays
+# available for other notes. The userfield definition is auto-created on first
+# use (a one-time schema addition on the shopping_locations entity).
+_SHOPPING_LOCATIONS = "shopping_locations"
+_STORE_ADDRESS_FIELD = "address"
+
 
 class _GrocyError(Exception):
     """An internal failure carrying a stable error `code` for the client.
@@ -298,6 +305,31 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         res = await _call("POST", f"/objects/{entity}", json=create_body)
         new_id = res.get("created_object_id") if isinstance(res, dict) else None
         return {"id": new_id, "name": name, "created": True}
+
+    # ── userfields (Grocy's custom-field mechanism) ─────────────────
+    async def _userfield_values(entity: str, object_id: int) -> dict[str, Any]:
+        """Current userfield values for one object, or {} (tolerant of none)."""
+        try:
+            data = await _call("GET", f"/userfields/{entity}/{object_id}")
+        except _GrocyError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _ensure_userfield(
+        entity: str, name: str, caption: str, ftype: str = "text-single-line"
+    ) -> None:
+        """Idempotently define a userfield on an entity (one-time schema addition)."""
+        defs = await _list_all("userfields")
+        if any(d.get("entity") == entity and _norm(d.get("name")) == _norm(name) for d in defs):
+            return
+        await _call(
+            "POST",
+            "/objects/userfields",
+            json={"entity": entity, "name": name, "caption": caption, "type": ftype},
+        )
+
+    async def _set_userfield(entity: str, object_id: int, name: str, value: str) -> None:
+        await _call("PUT", f"/userfields/{entity}/{object_id}", json={name: value})
 
     async def _stock_detail(product_id: int) -> dict[str, Any] | None:
         try:
@@ -602,16 +634,56 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         description=(
             "Idempotently ensure a store (shopping location) exists, e.g. 'Costco'. "
             "Matches case-insensitively by exact name; creates only if absent. "
-            "Returns {id, name, created}. Tagging purchases with a store builds "
-            "price-by-store history. `grocy_stock_item` auto-creates a store on a "
-            "purchase, so calling this first is optional."
+            "Optionally record an `address` (free text — e.g. a farm's street "
+            "address for provenance). The address is stored in a DEDICATED Grocy "
+            "userfield ('address' on shopping_locations, auto-defined on first "
+            "use) — NOT the `description` column, which stays free for other "
+            "notes. Upsert: on an existing store a provided `address` "
+            "backfills/updates it (updated=true); a null `address` never clobbers "
+            "an existing one. Returns {id, name, address, created, updated}. "
+            "`grocy_stock_item` auto-creates a store on a purchase, so calling "
+            "this first is optional — use it to add or correct an address."
         ),
     )
     async def ensure_store(
         name: Annotated[str, Field(min_length=1, description="Store name, e.g. 'Costco'.")],
+        address: Annotated[
+            str | None,
+            Field(default=None, description="Free-text address; stored in the 'address' userfield."),
+        ] = None,
     ) -> dict[str, Any]:
+        name_s = name.strip()
+        addr = address.strip() if address and address.strip() else None
         try:
-            return await _ensure("shopping_locations", name.strip(), {"name": name.strip()})
+            rows = await _list_all(_SHOPPING_LOCATIONS)
+            existing = next((r for r in rows if _norm(r.get("name")) == _norm(name_s)), None)
+            store_name: str | None
+            if existing is None:
+                res = await _call("POST", f"/objects/{_SHOPPING_LOCATIONS}", json={"name": name_s})
+                new_id = res.get("created_object_id") if isinstance(res, dict) else None
+                if new_id is None:
+                    raise _GrocyError("missing_fk", "Grocy did not return a new store id.", "")
+                sid, store_name, created = int(new_id), name_s, True
+            else:
+                sid, store_name, created = int(existing["id"]), existing.get("name"), False
+
+            current = (
+                await _userfield_values(_SHOPPING_LOCATIONS, sid)
+            ).get(_STORE_ADDRESS_FIELD) or None
+            updated = False
+            if addr is not None and addr != (current or ""):
+                # Define the userfield once, then set the value.
+                await _ensure_userfield(_SHOPPING_LOCATIONS, _STORE_ADDRESS_FIELD, "Address")
+                await _set_userfield(_SHOPPING_LOCATIONS, sid, _STORE_ADDRESS_FIELD, addr)
+                current, updated = addr, True
+
+            return {
+                "id": sid,
+                "name": store_name,
+                "address": current,
+                "created": created,
+                "updated": updated,
+            }
         except _GrocyError as exc:
             return exc.payload()
 

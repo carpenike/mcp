@@ -58,7 +58,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Grocy | `grocy_open_product` | Mark an amount of a product as opened (by id or barcode) |
 | Grocy | `grocy_ensure_location` | Idempotently create a storage location |
 | Grocy | `grocy_ensure_unit` | Idempotently create a quantity unit |
-| Grocy | `grocy_ensure_store` | Idempotently create a store (shopping location) for price-by-store history |
+| Grocy | `grocy_ensure_store` | Idempotently create/update a store (shopping location); optional `address` in a dedicated userfield |
 | Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
 | Grocy | `grocy_health` | Connectivity + Grocy version check |
 | Grocy | `grocy_convert_units` | Convert an amount between units (product-specific → global → identity) |
