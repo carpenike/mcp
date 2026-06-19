@@ -257,13 +257,27 @@ async def test_health_version_shapes(
 @pytest.mark.asyncio
 async def test_health_unknown_shape_echoes_raw(tools: dict[str, Any], httpx_mock: Any) -> None:
     """An unrecognized /system/info shape must still report ok=true AND echo the
-    raw payload, so the actual version key is visible without server logs."""
+    raw status + body, so the actual version field is visible without logs."""
     payload = {"some_new_version_field": "4.6.0", "php_version": "8.3"}
     httpx_mock.add_response(url=f"{BASE}/system/info", json=payload)
     res = await tools["grocy_health"]()
     assert res["ok"] is True
     assert res["grocy_version"] is None
-    assert res["raw_system_info"] == payload
+    assert res["raw_system_info"]["status"] == 200
+    assert res["raw_system_info"]["json"] == payload
+
+
+@pytest.mark.asyncio
+async def test_health_empty_body_reports_raw_status(tools: dict[str, Any], httpx_mock: Any) -> None:
+    """The live failure mode: /system/info returns a 2xx with NO body, so there
+    is nothing to match. health must still be ok and surface the raw status."""
+    httpx_mock.add_response(url=f"{BASE}/system/info", status_code=200, content=b"")
+    res = await tools["grocy_health"]()
+    assert res["ok"] is True
+    assert res["grocy_version"] is None
+    assert res["raw_system_info"]["status"] == 200
+    assert res["raw_system_info"]["json"] is None
+    assert res["raw_system_info"]["body_excerpt"] == ""
 
 
 @pytest.mark.asyncio

@@ -128,6 +128,27 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _extract_grocy_version(info: Any) -> str | None:
+    """Pull a version string out of a /system/info payload across known shapes.
+
+    Grocy has shipped the version as ``grocy_version.Version`` (capital),
+    ``grocy_version.version``, a bare ``grocy_version`` string, or a top-level
+    ``version`` / ``release_version``. Returns None if none are present (or the
+    payload isn't a dict).
+    """
+    if not isinstance(info, dict):
+        return None
+    gv = info.get("grocy_version")
+    if isinstance(gv, dict):
+        v = gv.get("Version") or gv.get("version")
+        if v:
+            return str(v)
+    elif isinstance(gv, str) and gv:
+        return gv
+    top = info.get("version") or info.get("release_version")
+    return str(top) if top else None
+
+
 def register(mcp: FastMCP, settings: Settings) -> None:
     """Register grocy_* stock/inventory tools on the given MCP server."""
     base = settings.grocy_base_url.rstrip("/")
@@ -189,6 +210,33 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             raise _GrocyError(
                 f"grocy_http_{resp.status_code}", "Grocy returned a non-JSON response.", ""
             ) from exc
+
+    async def _probe(path: str) -> dict[str, Any]:
+        """Raw GET for diagnostics — returns status/headers/body WITHOUT raising
+        or nulling an empty body (unlike `_call`). Used by `grocy_health` so a
+        misbehaving endpoint reports its actual HTTP status + body, not just a
+        swallowed None.
+        """
+        if not api_key:
+            return {"connect_error": "no_api_key"}
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, headers={"GROCY-API-KEY": api_key}
+            ) as client:
+                resp = await client.get(f"{base}{path}")
+        except httpx.HTTPError as exc:
+            return {"connect_error": exc.__class__.__name__}
+        body = resp.text or ""
+        out: dict[str, Any] = {
+            "status": resp.status_code,
+            "content_type": resp.headers.get("content-type"),
+            "body_excerpt": body[:500],
+        }
+        try:
+            out["json"] = resp.json() if body else None
+        except ValueError:
+            out["json"] = None
+        return out
 
     # ── master-data helpers ─────────────────────────────────────────
     async def _search(entity: str, name: str) -> list[dict[str, Any]]:
@@ -428,33 +476,37 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ),
     )
     async def health() -> dict[str, Any]:
-        try:
-            info = await _call("GET", "/system/info")
-        except _GrocyError as exc:
-            return exc.payload()
-        version: str | None = None
-        if isinstance(info, dict):
-            gv = info.get("grocy_version")
-            if isinstance(gv, dict):
-                # Grocy has shipped both "Version" and "version" keys here.
-                version = gv.get("Version") or gv.get("version")
-            elif isinstance(gv, str):
-                version = gv
-            if not version:
-                version = info.get("version") or info.get("release_version")
-        log.info("grocy reachable; version=%s", version)
+        probe = await _probe("/system/info")
+        if "connect_error" in probe:
+            return _GrocyError(
+                "grocy_unreachable",
+                f"Could not reach Grocy ({probe['connect_error']}).",
+                "Check HOMELAB_MCP_GROCY_BASE_URL and that the instance is up.",
+            ).payload()
+        version = _extract_grocy_version(probe.get("json"))
+        log.info("grocy reachable; /system/info status=%s version=%s", probe.get("status"), version)
         result: dict[str, Any] = {
             "ok": True,
             "grocy_version": version,
             "notes": f"Connected to Grocy {version}." if version else "Connected to Grocy.",
         }
         if version is None:
-            # Self-diagnostic: surface the raw payload so the exact version key
-            # is visible in the tool output (no server-log access needed). Also
-            # confirms THIS build is running — if you still see no raw_system_info
-            # on a null version, the process is on old code.
-            result["raw_system_info"] = info
-            result["notes"] += " Version key not recognized — see raw_system_info."
+            # Surface the RAW status + body so a misbehaving /system/info
+            # (empty body, non-JSON, wrong status, unknown shape) is visible in
+            # the tool output — the fetch layer, not just the key shape.
+            log.warning(
+                "grocy /system/info gave no version: status=%s content_type=%s body=%r",
+                probe.get("status"),
+                probe.get("content_type"),
+                probe.get("body_excerpt"),
+            )
+            result["raw_system_info"] = {
+                k: probe.get(k) for k in ("status", "content_type", "body_excerpt", "json")
+            }
+            result["notes"] += (
+                " Could not read a version from /system/info — see raw_system_info "
+                "(HTTP status + body)."
+            )
         return result
 
     @mcp.tool(
