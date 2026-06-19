@@ -476,36 +476,51 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ),
     )
     async def health() -> dict[str, Any]:
-        probe = await _probe("/system/info")
+        # The API route is /api/system/info. Hitting the bare /system/info web
+        # route returns a 302→login (HTML) for an unauthenticated browser —
+        # which is why this read came back empty while every /api-based tool
+        # worked. Try the API route first; fall back to the legacy path only if
+        # the API route looks wrong for this deployment (redirect / not-found),
+        # so we're robust whether or not the base URL already includes /api.
+        probe = await _probe("/api/system/info")
         if "connect_error" in probe:
             return _GrocyError(
                 "grocy_unreachable",
                 f"Could not reach Grocy ({probe['connect_error']}).",
                 "Check HOMELAB_MCP_GROCY_BASE_URL and that the instance is up.",
             ).payload()
+        used_path = "/api/system/info"
         version = _extract_grocy_version(probe.get("json"))
-        log.info("grocy reachable; /system/info status=%s version=%s", probe.get("status"), version)
+        if version is None and probe.get("status") in (301, 302, 307, 308, 404):
+            legacy = await _probe("/system/info")
+            if "connect_error" not in legacy:
+                probe, used_path = legacy, "/system/info"
+                version = _extract_grocy_version(legacy.get("json"))
+
+        log.info("grocy health %s -> status=%s version=%s", used_path, probe.get("status"), version)
         result: dict[str, Any] = {
             "ok": True,
             "grocy_version": version,
             "notes": f"Connected to Grocy {version}." if version else "Connected to Grocy.",
         }
         if version is None:
-            # Surface the RAW status + body so a misbehaving /system/info
-            # (empty body, non-JSON, wrong status, unknown shape) is visible in
+            # Surface the RAW path + status + body so a misbehaving system-info
+            # route (redirect, empty body, non-JSON, unknown shape) is visible in
             # the tool output — the fetch layer, not just the key shape.
             log.warning(
-                "grocy /system/info gave no version: status=%s content_type=%s body=%r",
+                "grocy health: no version from %s (status=%s content_type=%s body=%r)",
+                used_path,
                 probe.get("status"),
                 probe.get("content_type"),
                 probe.get("body_excerpt"),
             )
             result["raw_system_info"] = {
-                k: probe.get(k) for k in ("status", "content_type", "body_excerpt", "json")
+                "path": used_path,
+                **{k: probe.get(k) for k in ("status", "content_type", "body_excerpt", "json")},
             }
             result["notes"] += (
-                " Could not read a version from /system/info — see raw_system_info "
-                "(HTTP status + body)."
+                " Could not read a version from system-info — see raw_system_info "
+                "(path + HTTP status + body)."
             )
         return result
 

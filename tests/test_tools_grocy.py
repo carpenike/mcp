@@ -247,34 +247,70 @@ async def test_health_reports_version(tools: dict[str, Any], fake: FakeGrocy) ->
 async def test_health_version_shapes(
     tools: dict[str, Any], httpx_mock: Any, info: dict[str, Any]
 ) -> None:
-    """The /system/info version shape has varied across Grocy releases; read it
-    robustly so grocy_health never reports 'None' against a reachable instance."""
-    httpx_mock.add_response(url=f"{BASE}/system/info", json=info)
+    """The version shape has varied across Grocy releases; read it robustly so
+    grocy_health never reports 'None' against a reachable instance."""
+    httpx_mock.add_response(url=f"{BASE}/api/system/info", json=info)
+    res = await tools["grocy_health"]()
+    assert res["grocy_version"] == "4.6.0"
+
+
+@pytest.mark.asyncio
+async def test_health_uses_api_route_then_falls_back(
+    tools: dict[str, Any], httpx_mock: Any
+) -> None:
+    """If /api/system/info is wrong for the deployment (404/redirect), fall back
+    to the legacy /system/info path rather than reporting null."""
+    httpx_mock.add_response(url=f"{BASE}/api/system/info", status_code=404, json={})
+    httpx_mock.add_response(url=f"{BASE}/system/info", json={"grocy_version": {"Version": "4.6.0"}})
     res = await tools["grocy_health"]()
     assert res["grocy_version"] == "4.6.0"
 
 
 @pytest.mark.asyncio
 async def test_health_unknown_shape_echoes_raw(tools: dict[str, Any], httpx_mock: Any) -> None:
-    """An unrecognized /system/info shape must still report ok=true AND echo the
+    """An unrecognized system-info shape must still report ok=true AND echo the
     raw status + body, so the actual version field is visible without logs."""
     payload = {"some_new_version_field": "4.6.0", "php_version": "8.3"}
-    httpx_mock.add_response(url=f"{BASE}/system/info", json=payload)
+    httpx_mock.add_response(url=f"{BASE}/api/system/info", json=payload)
     res = await tools["grocy_health"]()
     assert res["ok"] is True
     assert res["grocy_version"] is None
+    assert res["raw_system_info"]["path"] == "/api/system/info"
     assert res["raw_system_info"]["status"] == 200
     assert res["raw_system_info"]["json"] == payload
 
 
 @pytest.mark.asyncio
-async def test_health_empty_body_reports_raw_status(tools: dict[str, Any], httpx_mock: Any) -> None:
-    """The live failure mode: /system/info returns a 2xx with NO body, so there
-    is nothing to match. health must still be ok and surface the raw status."""
-    httpx_mock.add_response(url=f"{BASE}/system/info", status_code=200, content=b"")
+async def test_health_redirect_surfaces_raw(tools: dict[str, Any], httpx_mock: Any) -> None:
+    """The actual live failure: the web route 302→login (HTML, no body). With the
+    API route also unavailable here, health stays ok and surfaces the redirect."""
+    httpx_mock.add_response(
+        url=f"{BASE}/api/system/info",
+        status_code=302,
+        headers={"content-type": "text/html"},
+        content=b"",
+    )
+    httpx_mock.add_response(
+        url=f"{BASE}/system/info",
+        status_code=302,
+        headers={"content-type": "text/html"},
+        content=b"",
+    )
     res = await tools["grocy_health"]()
     assert res["ok"] is True
     assert res["grocy_version"] is None
+    assert res["raw_system_info"]["status"] == 302
+    assert res["raw_system_info"]["content_type"] == "text/html"
+
+
+@pytest.mark.asyncio
+async def test_health_empty_body_reports_raw_status(tools: dict[str, Any], httpx_mock: Any) -> None:
+    """A 2xx with NO body still reports ok and surfaces the raw status/path."""
+    httpx_mock.add_response(url=f"{BASE}/api/system/info", status_code=200, content=b"")
+    res = await tools["grocy_health"]()
+    assert res["ok"] is True
+    assert res["grocy_version"] is None
+    assert res["raw_system_info"]["path"] == "/api/system/info"
     assert res["raw_system_info"]["status"] == 200
     assert res["raw_system_info"]["json"] is None
     assert res["raw_system_info"]["body_excerpt"] == ""
