@@ -657,9 +657,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "names in braces); metadata is "
             "merged over the recipe's current frontmatter (pass `metadata`, "
             "`title`, `derived_from`, or `derived_via` to change those keys). The "
-            "recipe must already exist — this never creates one. The amended "
+            "recipe must already exist — this never creates one. "
+            "To RELOCATE or RENAME the recipe at the same time, pass `new_folder` "
+            "(move to a different category folder) and/or `new_slug` (rename the "
+            "file + frontmatter id); the recipe is written at the new path and the "
+            "old file is removed only AFTER the new one is verified. The amended "
             "document is round-trip validated through the CookLang parser on a "
-            "throwaway path BEFORE the real recipe is overwritten, so a malformed "
+            "throwaway path BEFORE the real recipe is written, so a malformed "
             "edit can never break the existing recipe."
         ),
     )
@@ -687,9 +691,28 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         derived_via: Annotated[
             str | None, Field(description="Set/replace the derived_via note")
         ] = None,
+        new_folder: Annotated[
+            str | None,
+            Field(description="Relocate the recipe into this category folder (move)"),
+        ] = None,
+        new_slug: Annotated[
+            str | None,
+            Field(description="Rename the recipe's file + frontmatter id to this kebab-case slug"),
+        ] = None,
+        overwrite: Annotated[
+            bool,
+            Field(description="Allow a move/rename to overwrite an existing recipe at the target"),
+        ] = False,
     ) -> dict[str, Any]:
         if not body.strip():
             return {"error": "empty body"}
+        if new_slug is not None and not NAME_RE.match(new_slug):
+            return {"error": "invalid slug", "slug": new_slug}
+        dest_folder: str | None = None
+        if new_folder is not None:
+            dest_folder = _sanitize_relpath(new_folder)
+            if dest_folder is None:
+                return {"error": "invalid folder", "folder": new_folder}
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -711,10 +734,29 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     merged["derived_from"] = derived_from
                 if derived_via is not None:
                     merged["derived_via"] = derived_via
+                if new_slug is not None:
+                    merged["id"] = new_slug
+
+                # Resolve the destination: keep the source folder/filename
+                # unless a move (new_folder) or rename (new_slug) was asked for.
+                src_folder, _, src_name = relpath.rpartition("/")
+                final_folder = dest_folder if dest_folder is not None else src_folder
+                final_name = new_slug if new_slug is not None else src_name
+                dest_relpath = f"{final_folder}/{final_name}" if final_folder else final_name
+                is_move = dest_relpath != relpath
 
                 content = _build_cook_document(merged, body)
                 if len(content.encode("utf-8")) > _CONTENT_MAX_BYTES:
                     return {"error": "recipe too large", "limit_bytes": _CONTENT_MAX_BYTES}
+
+                if is_move and not overwrite:
+                    collision = await _fetch_recipe(client, dest_relpath)
+                    if collision.status_code == 200:
+                        return {
+                            "error": "destination already exists",
+                            "path": dest_relpath,
+                            "hint": "pass overwrite=true to replace it",
+                        }
 
                 ok, _ = await _validate_via_temp(client, content)
                 if not ok:
@@ -723,20 +765,43 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                         "hint": "check @ingredient{}, #cookware{}, ~timer{} and frontmatter syntax",
                     }
 
-                put = await _put_recipe(client, relpath, content)
+                put = await _put_recipe(client, dest_relpath, content)
                 if put.status_code != 200:
-                    return {"error": "write failed", "status": put.status_code, "path": relpath}
+                    return {
+                        "error": "write failed",
+                        "status": put.status_code,
+                        "path": dest_relpath,
+                    }
 
-                verify = await _fetch_recipe(client, relpath)
+                verify = await _fetch_recipe(client, dest_relpath)
                 verified = verify.status_code == 200 and _parsed_ok(verify.json())
+
+                # Remove the old file ONLY after the relocated copy verifies,
+                # so a failed move never loses the original.
+                if verified and is_move:
+                    deleted = await _delete_recipe(client, relpath)
+                    if deleted.status_code not in (200, 204):
+                        return {
+                            "error": "moved but failed to remove original",
+                            "path": dest_relpath,
+                            "old_path": relpath,
+                            "status": deleted.status_code,
+                        }
         except httpx.HTTPError as exc:
             return {"error": "update failed", "reason": str(exc)}
 
         if not verified:
-            return {"error": "post-write verification failed", "path": relpath}
+            return {"error": "post-write verification failed", "path": dest_relpath}
 
-        log.info("updated recipe: %s", relpath)
-        return {"ok": True, "slug": merged.get("id"), "path": relpath}
+        log.info(
+            "updated recipe: %s%s",
+            dest_relpath,
+            f" (moved from {relpath})" if is_move else "",
+        )
+        result: dict[str, Any] = {"ok": True, "slug": merged.get("id"), "path": dest_relpath}
+        if is_move:
+            result["moved_from"] = relpath
+        return result
 
     # ── delete ──────────────────────────────────────────────────────
     @mcp.tool(

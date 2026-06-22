@@ -502,6 +502,67 @@ async def test_update_recipe_merges_metadata(tools: dict[str, Any], fake: FakeCo
     assert "2%L" in stored  # body replaced
 
 
+async def test_update_recipe_moves_to_new_folder(tools: dict[str, Any], fake: FakeCook) -> None:
+    fake.store["claude/relocate-me"] = (
+        '---\ntitle: "Relocate Me"\nid: "relocate-me"\n---\n\nBoil @water{1%L}.\n'
+    )
+    res = await tools["cooklang_update_recipe"](
+        slug="relocate-me", body="Boil @water{1%L}.", new_folder="Smoker"
+    )
+    assert res["ok"] is True
+    assert res["path"] == "Smoker/relocate-me"
+    assert res["moved_from"] == "claude/relocate-me"
+    # Old gone, new present.
+    assert "claude/relocate-me" not in fake.store
+    assert "Smoker/relocate-me" in fake.store
+
+
+async def test_update_recipe_renames_slug(tools: dict[str, Any], fake: FakeCook) -> None:
+    fake.store["claude/old-name"] = (
+        '---\ntitle: "Old Name"\nid: "old-name"\n---\n\nBoil @water{1%L}.\n'
+    )
+    res = await tools["cooklang_update_recipe"](
+        slug="old-name", body="Boil @water{1%L}.", new_slug="new-name"
+    )
+    assert res["ok"] is True
+    assert res["path"] == "claude/new-name"
+    assert res["slug"] == "new-name"
+    assert "claude/old-name" not in fake.store
+    assert 'id: "new-name"' in fake.store["claude/new-name"]
+
+
+async def test_update_recipe_move_collision_guarded(tools: dict[str, Any], fake: FakeCook) -> None:
+    fake.store["claude/mover"] = '---\ntitle: "Mover"\nid: "mover"\n---\n\nBoil @water{1%L}.\n'
+    fake.store["Smoker/mover"] = '---\ntitle: "Existing"\nid: "mover"\n---\n\nGrill @beef{1%lb}.\n'
+    blocked = await tools["cooklang_update_recipe"](
+        slug="claude/mover", body="Boil @water{1%L}.", new_folder="Smoker"
+    )
+    assert blocked["error"] == "destination already exists"
+    assert "claude/mover" in fake.store  # original untouched
+    # With overwrite it succeeds and removes the original.
+    ok = await tools["cooklang_update_recipe"](
+        slug="claude/mover", body="Boil @water{1%L}.", new_folder="Smoker", overwrite=True
+    )
+    assert ok["ok"] is True
+    assert "claude/mover" not in fake.store
+
+
+async def test_update_recipe_rejects_bad_move_targets(
+    tools: dict[str, Any], fake: FakeCook
+) -> None:
+    fake.store["claude/safe"] = '---\ntitle: "Safe"\nid: "safe"\n---\n\nBoil @water{1%L}.\n'
+    bad_folder = await tools["cooklang_update_recipe"](
+        slug="safe", body="Boil @water{1%L}.", new_folder="../../etc"
+    )
+    assert bad_folder["error"] == "invalid folder"
+    bad_slug = await tools["cooklang_update_recipe"](
+        slug="safe", body="Boil @water{1%L}.", new_slug="../escape"
+    )
+    assert bad_slug["error"] == "invalid slug"
+    # Nothing escaped the recipe tree.
+    assert not any(".." in k for k in fake.store)
+
+
 async def test_delete_recipe_requires_confirmation(tools: dict[str, Any], fake: FakeCook) -> None:
     # Without confirm=true the tool previews but must NOT delete.
     res = await tools["cooklang_delete_recipe"](slug="calvados-glazed-pork-belly-bites")
