@@ -60,6 +60,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setenv("HOMELAB_MCP_POCKETID_CLIENT_ID", "mcp-client")
     monkeypatch.setenv("HOMELAB_MCP_POCKETID_CLIENT_SECRET", "shh")
     monkeypatch.setenv("HOMELAB_MCP_OAUTH_SIGNING_KEY_PATH", str(tmp_path / "signing-key.pem"))
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_STATE_DB_PATH", str(tmp_path / "state.db"))
     return Settings()
 
 
@@ -225,6 +226,8 @@ async def _run_full_flow(
     access_token = tokens["access_token"]
     assert tokens["token_type"] == "Bearer"
     assert tokens["expires_in"] == 86400
+    assert tokens["refresh_token"]
+    refresh_token = tokens["refresh_token"]
 
     # JWT shape — verify with pyjwt against our published JWKS.
     jwks_resp = client.get("/oauth/jwks.json")
@@ -256,6 +259,48 @@ async def _run_full_flow(
     # MCP layer is fine. What we want to confirm is that the AUTH layer
     # didn't reject the token. Anything other than 401 is success.
     assert mcp_resp.status_code != 401, f"JWT was rejected by auth middleware: {mcp_resp.text}"
+
+    # ── 6. refresh_token grant: silent renewal (no re-login) ─────────
+    refresh_resp = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    refreshed = refresh_resp.json()
+    assert refreshed["access_token"]
+    assert refreshed["expires_in"] == 86400
+    # Refresh tokens rotate: a fresh one is returned and the old one dies.
+    new_refresh = refreshed["refresh_token"]
+    assert new_refresh and new_refresh != refresh_token
+
+    # The renewed access token carries the same identity and verifies.
+    decoded_refreshed = jwt.decode(
+        refreshed["access_token"],
+        public_key,
+        algorithms=["RS256"],
+        issuer="https://mcp.example.com",
+        audience="https://mcp.example.com",
+    )
+    assert decoded_refreshed["sub"] == "user@example.com"
+    assert decoded_refreshed["client_id"] == client_id
+
+    # The consumed (old) refresh token is now invalid.
+    reuse_resp = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    assert reuse_resp.status_code == 400, reuse_resp.text
+    assert reuse_resp.json()["error"] == "invalid_grant"
 
 
 async def test_code_is_single_use(

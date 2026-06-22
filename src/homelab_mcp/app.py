@@ -108,7 +108,15 @@ def build_app(settings: Settings) -> Starlette:
     assert key is not None  # narrowed: oauth_required is True here
 
     # ── Wire OAuth routes ───────────────────────────────────────────
-    state = OAuthState()
+    state = OAuthState.open(
+        settings.oauth_state_db_path,
+        client_retention_seconds=settings.oauth_client_retention_seconds,
+    )
+    # One-shot boot cleanup: drop expired refresh tokens and abandoned
+    # DCR clients so the persisted table doesn't grow without bound.
+    pruned = state.run_startup_maintenance()
+    if pruned:
+        log.info("OAuth startup maintenance: pruned %d abandoned client(s)", pruned)
     for route in oauth_provider.build_routes(settings, key, state):
         app.router.routes.append(route)
 

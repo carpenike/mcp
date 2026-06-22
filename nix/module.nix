@@ -219,6 +219,11 @@ in
         # The OAuth signing key persists here when not supplied via env.
         # The PEM file is created mode 0600 on first start.
         HOMELAB_MCP_OAUTH_SIGNING_KEY_PATH = "/var/lib/homelab-mcp/signing-key.pem";
+        # SQLite store for registered clients (DCR) + refresh tokens, so
+        # Claude survives a service restart without re-authenticating.
+        # Created on first start; WAL mode adds -wal/-shm sidecars. Lives
+        # in the same StateDirectory (implicitly in ReadWritePaths).
+        HOMELAB_MCP_OAUTH_STATE_DB_PATH = "/var/lib/homelab-mcp/state.db";
       } // lib.mapAttrs (_n: v: toString v) cfg.settings;
 
       serviceConfig = {

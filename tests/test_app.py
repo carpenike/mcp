@@ -17,6 +17,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setenv("HOMELAB_MCP_POCKETID_CLIENT_SECRET", "shh")
     # Put the auto-generated signing key in a tmpdir, not /var/lib.
     monkeypatch.setenv("HOMELAB_MCP_OAUTH_SIGNING_KEY_PATH", str(tmp_path / "signing-key.pem"))
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_STATE_DB_PATH", str(tmp_path / "state.db"))
     return Settings()
 
 
@@ -49,9 +50,34 @@ def test_as_metadata_returns_spec_clean_fields(settings: Settings) -> None:
     assert body["jwks_uri"] == "https://mcp.example.com/oauth/jwks.json"
     # Spec-clean field names; this was the bug that drove the rewrite.
     assert body["response_types_supported"] == ["code"]
-    assert body["grant_types_supported"] == ["authorization_code"]
+    assert body["grant_types_supported"] == ["authorization_code", "refresh_token"]
     assert body["code_challenge_methods_supported"] == ["S256"]
     assert "token_endpoint_auth_methods_supported" in body
+
+
+def test_register_rate_limit_returns_429(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """The unauthenticated DCR endpoint must cap registrations per IP."""
+    monkeypatch.setenv("HOMELAB_MCP_PUBLIC_BASE_URL", "https://mcp.example.com")
+    monkeypatch.setenv("HOMELAB_MCP_POCKETID_ISSUER", "https://id.example.com")
+    monkeypatch.setenv("HOMELAB_MCP_POCKETID_CLIENT_ID", "mcp-client")
+    monkeypatch.setenv("HOMELAB_MCP_POCKETID_CLIENT_SECRET", "shh")
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_SIGNING_KEY_PATH", str(tmp_path / "signing-key.pem"))
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_STATE_DB_PATH", str(tmp_path / "state.db"))
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_REGISTER_RATE_LIMIT_MAX", "3")
+
+    app = build_app(Settings())
+    body = {
+        "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+        "client_name": "Claude",
+        "token_endpoint_auth_method": "client_secret_post",
+    }
+    with TestClient(app) as client:
+        # First 3 within the window succeed (201); the 4th is capped (429).
+        for _ in range(3):
+            assert client.post("/oauth/register", json=body).status_code == 201
+        limited = client.post("/oauth/register", json=body)
+    assert limited.status_code == 429
+    assert limited.json()["error"] == "temporarily_unavailable"
 
 
 def test_jwks_endpoint_returns_keys(settings: Settings) -> None:

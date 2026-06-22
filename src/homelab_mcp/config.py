@@ -101,11 +101,64 @@ class Settings(BaseSettings):
     oauth_access_token_lifetime_seconds: int = Field(
         default=86400, ge=60, le=7 * 86400, description="Lifetime of issued bearer tokens."
     )
+    oauth_refresh_token_lifetime_seconds: int = Field(
+        default=30 * 86400,
+        ge=86400,
+        le=400 * 86400,
+        description=(
+            "Lifetime of issued refresh tokens. Refresh tokens are rotated on "
+            "every use (the old one is invalidated and a new one returned), so "
+            "this is the maximum idle window before a client must re-authenticate "
+            "interactively. Without refresh tokens a client would have to re-run "
+            "the full login flow every time the access token expires."
+        ),
+    )
     oauth_code_lifetime_seconds: int = Field(
         default=120,
         ge=30,
         le=600,
         description="Lifetime of authorization codes (one-shot, short-lived).",
+    )
+
+    oauth_state_db_path: str = Field(
+        default="/var/lib/homelab-mcp/state.db",
+        description=(
+            "Path to the SQLite database that persists registered clients (DCR) "
+            "and refresh tokens across restarts. Lives in the same StateDirectory "
+            "as the signing key. Refresh tokens are stored as SHA-256 hashes, "
+            "never in plaintext. Set to ':memory:' (or empty) to keep all OAuth "
+            "state in-process — clients re-register and users re-authenticate on "
+            "every restart. Short-lived state (in-flight PocketID round-trips and "
+            "one-shot authorization codes) is always kept in memory regardless."
+        ),
+    )
+    oauth_client_retention_seconds: int = Field(
+        default=90 * 86400,
+        ge=86400,
+        description=(
+            "How long a persisted DCR client with no live refresh token is kept "
+            "before it's pruned. Because an in-use client always holds a "
+            "non-expired refresh token, this only reaps abandoned registrations "
+            "(e.g. from connector re-adds or reinstalls), bounding growth of the "
+            "unauthenticated /oauth/register endpoint. Pruning runs at startup "
+            "and opportunistically on each registration."
+        ),
+    )
+    oauth_register_rate_limit_max: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Maximum /oauth/register calls allowed per source IP within "
+            "`oauth_register_rate_window_seconds`. A safety cap on the "
+            "unauthenticated DCR endpoint; the single legitimate user registers "
+            "rarely, so a modest limit never bites. Counters are in-memory "
+            "(reset on restart)."
+        ),
+    )
+    oauth_register_rate_window_seconds: int = Field(
+        default=3600,
+        ge=1,
+        description="Sliding-window length for the /oauth/register rate limit.",
     )
 
     # Allowlist of redirect_uri prefixes accepted in DCR. Anything that

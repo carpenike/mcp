@@ -50,6 +50,7 @@ from starlette.routing import Route
 from homelab_mcp.config import Settings
 from homelab_mcp.oauth_state import (
     IssuedAuthorizationCode,
+    IssuedRefreshToken,
     OAuthState,
     PendingAuthorization,
 )
@@ -151,6 +152,23 @@ def build_routes(
 ) -> list[Route]:
     """Return the Starlette routes that implement the OAuth AS."""
 
+    # In-memory fixed-window rate limiter for the unauthenticated DCR
+    # endpoint, keyed by source IP. Bounds abuse of /oauth/register (which
+    # writes a persisted client row per call). Process-local; resets on
+    # restart. Maps ip -> (window_start_epoch, count_in_window).
+    register_hits: dict[str, tuple[float, int]] = {}
+
+    def _register_rate_limited(request: Request) -> bool:
+        """Record a registration hit for the caller's IP; True if over the cap."""
+        ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        window_start, count = register_hits.get(ip, (now, 0))
+        if now - window_start >= settings.oauth_register_rate_window_seconds:
+            window_start, count = now, 0
+        count += 1
+        register_hits[ip] = (window_start, count)
+        return count > settings.oauth_register_rate_limit_max
+
     # ── /.well-known/oauth-authorization-server ──────────────────────
     async def authorization_server_metadata(_request: Request) -> JSONResponse:
         """RFC 8414 metadata. Critical: every field name matches the spec
@@ -166,7 +184,7 @@ def build_routes(
                 "registration_endpoint": f"{settings.issuer}/oauth/register",
                 "jwks_uri": f"{settings.issuer}/oauth/jwks.json",
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": [
                     "client_secret_basic",
@@ -189,6 +207,17 @@ def build_routes(
 
     # ── /oauth/register (RFC 7591 DCR) ───────────────────────────────
     async def register(request: Request) -> JSONResponse:
+        if _register_rate_limited(request):
+            log.warning(
+                "DCR: rate limit hit for %s",
+                request.client.host if request.client else "unknown",
+            )
+            return _json_error(
+                429,
+                "temporarily_unavailable",
+                "registration rate limit exceeded; try again later",
+            )
+
         try:
             body = await request.json()
         except Exception:
@@ -482,19 +511,75 @@ def build_routes(
         return RedirectResponse(location, status_code=302)
 
     # ── /oauth/token ─────────────────────────────────────────────────
+    async def _issue_token_response(
+        *, user_email: str, scope: str | None, client_id: str
+    ) -> JSONResponse:
+        """Mint an access-token JWT plus a rotating refresh token.
+
+        Shared by the authorization_code and refresh_token grants so both
+        always hand the client a fresh refresh token. Without a refresh
+        token the client would have to re-run the interactive PocketID
+        login every time the (short-lived) access token expires.
+        """
+        now = int(time.time())
+        access_token = (
+            JsonWebToken(["RS256"])
+            .encode(
+                header={"alg": "RS256", "kid": signing_key.kid, "typ": "JWT"},
+                payload={
+                    "iss": settings.issuer,
+                    "aud": settings.resource_url,
+                    "sub": user_email,
+                    "email": user_email,
+                    "client_id": client_id,
+                    "iat": now,
+                    "nbf": now,
+                    "exp": now + settings.oauth_access_token_lifetime_seconds,
+                    "scope": scope or "",
+                },
+                key=signing_key.private_pem,
+            )
+            .decode("ascii")
+        )
+
+        refresh_token = secrets.token_urlsafe(48)
+        await state.store_refresh(
+            refresh_token,
+            IssuedRefreshToken(
+                client_id=client_id,
+                user_email=user_email,
+                scope=scope,
+                expires_at=time.time() + settings.oauth_refresh_token_lifetime_seconds,
+            ),
+        )
+
+        log.info(
+            "oauth.token: issued JWT+refresh for user=%s client=%s expires_in=%d",
+            user_email,
+            client_id,
+            settings.oauth_access_token_lifetime_seconds,
+        )
+        return JSONResponse(
+            {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": settings.oauth_access_token_lifetime_seconds,
+                "refresh_token": refresh_token,
+                "scope": scope or "",
+            }
+        )
+
     async def token(request: Request) -> JSONResponse:
-        """Exchange a code for a JWT access token."""
+        """Exchange an authorization code or refresh token for a JWT access token."""
         form = await request.form()
 
         grant_type = str(form.get("grant_type", ""))
-        if grant_type != "authorization_code":
+        if grant_type not in ("authorization_code", "refresh_token"):
             return _json_error(
-                400, "unsupported_grant_type", "only authorization_code is supported"
+                400,
+                "unsupported_grant_type",
+                "only authorization_code and refresh_token are supported",
             )
-
-        code = str(form.get("code", ""))
-        redirect_uri = str(form.get("redirect_uri", ""))
-        code_verifier = str(form.get("code_verifier", ""))
 
         # ── Client authentication: HTTP Basic OR form params OR public/PKCE-only ──
         client_id, client_secret = _extract_client_credentials(request, form)
@@ -510,7 +595,33 @@ def build_routes(
         ):
             return _json_error(401, "invalid_client", "client_secret mismatch")
 
-        # ── Validate the code ────────────────────────────────────────
+        # ── refresh_token grant: rotate + re-issue ───────────────────
+        if grant_type == "refresh_token":
+            presented = str(form.get("refresh_token", ""))
+            if not presented:
+                return _json_error(400, "invalid_request", "refresh_token is required")
+            stored = await state.consume_refresh(presented)
+            if stored is None:
+                return _json_error(400, "invalid_grant", "refresh_token unknown or already used")
+            if time.time() >= stored.expires_at:
+                return _json_error(400, "invalid_grant", "refresh_token expired")
+            if stored.client_id != client_id:
+                return _json_error(
+                    400, "invalid_grant", "refresh_token was issued to a different client"
+                )
+            # RFC 6749 §6: a narrowed scope may be requested; we keep the
+            # original scope (single-user homelab — no scope downscoping).
+            return await _issue_token_response(
+                user_email=stored.user_email,
+                scope=stored.scope,
+                client_id=client_id,
+            )
+
+        # ── authorization_code grant ─────────────────────────────────
+        code = str(form.get("code", ""))
+        redirect_uri = str(form.get("redirect_uri", ""))
+        code_verifier = str(form.get("code_verifier", ""))
+
         issued = await state.consume_code(code)
         if issued is None:
             return _json_error(400, "invalid_grant", "code unknown or already used")
@@ -523,41 +634,10 @@ def build_routes(
         if not _check_pkce(code_verifier, issued.code_challenge, issued.code_challenge_method):
             return _json_error(400, "invalid_grant", "PKCE verification failed")
 
-        # ── Mint the JWT ─────────────────────────────────────────────
-        now = int(time.time())
-        access_token = (
-            JsonWebToken(["RS256"])
-            .encode(
-                header={"alg": "RS256", "kid": signing_key.kid, "typ": "JWT"},
-                payload={
-                    "iss": settings.issuer,
-                    "aud": settings.resource_url,
-                    "sub": issued.user_email,
-                    "email": issued.user_email,
-                    "client_id": client_id,
-                    "iat": now,
-                    "nbf": now,
-                    "exp": now + settings.oauth_access_token_lifetime_seconds,
-                    "scope": issued.scope or "",
-                },
-                key=signing_key.private_pem,
-            )
-            .decode("ascii")
-        )
-
-        log.info(
-            "oauth.token: issued JWT for user=%s client=%s expires_in=%d",
-            issued.user_email,
-            client_id,
-            settings.oauth_access_token_lifetime_seconds,
-        )
-        return JSONResponse(
-            {
-                "access_token": access_token,
-                "token_type": "Bearer",
-                "expires_in": settings.oauth_access_token_lifetime_seconds,
-                "scope": issued.scope or "",
-            }
+        return await _issue_token_response(
+            user_email=issued.user_email,
+            scope=issued.scope,
+            client_id=client_id,
         )
 
     return [

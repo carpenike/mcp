@@ -25,6 +25,21 @@ to advertise an authorization server that supports:
 
   - **Dynamic Client Registration (DCR)** — Claude registers itself without operator action.
   - **PKCE-protected authorization-code grant** — standard OAuth 2.1.
+  - **Refresh tokens** — the token endpoint also supports the `refresh_token` grant and hands
+    out a (rotating) refresh token with every access token, so clients renew expired access
+    tokens silently instead of re-running the interactive login. Access tokens default to a
+    24h lifetime (`HOMELAB_MCP_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS`); refresh tokens default
+    to 30 days (`HOMELAB_MCP_OAUTH_REFRESH_TOKEN_LIFETIME_SECONDS`).
+  - **Restart-survivable sessions** — registered clients and refresh tokens are persisted to a
+    small SQLite store (`HOMELAB_MCP_OAUTH_STATE_DB_PATH`, default `/var/lib/homelab-mcp/state.db`),
+    so a service restart or redeploy doesn't force a re-login. Refresh tokens are stored as
+    SHA-256 hashes (never plaintext) and are revocable by deleting their row. Set the path to
+    `:memory:` to opt out (clients re-register and users re-authenticate on every restart).
+  - **Bounded DCR growth** — abandoned clients (no live refresh token, older than
+    `HOMELAB_MCP_OAUTH_CLIENT_RETENTION_SECONDS`, default 90d) are pruned at startup and on each
+    registration, and the unauthenticated `/oauth/register` endpoint is rate-limited per source IP
+    (`HOMELAB_MCP_OAUTH_REGISTER_RATE_LIMIT_MAX` per `…_RATE_WINDOW_SECONDS`, default 30/hour) so
+    the persisted client table can't grow without bound.
   - **Spec-compliant metadata** — field names like `grant_types_supported = ["authorization_code"]`,
     not Cloudflare's `["authorization_code_with_pkce"]`.
 
