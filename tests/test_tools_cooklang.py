@@ -502,6 +502,33 @@ async def test_update_recipe_merges_metadata(tools: dict[str, Any], fake: FakeCo
     assert "2%L" in stored  # body replaced
 
 
+async def test_delete_recipe_requires_confirmation(tools: dict[str, Any], fake: FakeCook) -> None:
+    # Without confirm=true the tool previews but must NOT delete.
+    res = await tools["cooklang_delete_recipe"](slug="calvados-glazed-pork-belly-bites")
+    assert res["ok"] is False
+    assert res["requires_confirmation"] is True
+    assert res["path"] == "Smoker/Calvados-Glazed Pork Belly Bites"
+    assert res["title"] == "Calvados-Glazed Pork Belly Bites"
+    # Still present.
+    assert "Smoker/Calvados-Glazed Pork Belly Bites" in fake.store
+
+
+async def test_delete_recipe_confirmed(tools: dict[str, Any], fake: FakeCook) -> None:
+    fake.store["claude/kill-me"] = (
+        '---\ntitle: "Kill Me"\nid: "kill-me"\n---\n\nBoil @water{1%L}.\n'
+    )
+    res = await tools["cooklang_delete_recipe"](slug="kill-me", confirm=True)
+    assert res["ok"] is True
+    assert res["deleted"] == "claude/kill-me"
+    assert res["slug"] == "kill-me"
+    assert "claude/kill-me" not in fake.store
+
+
+async def test_delete_recipe_not_found(tools: dict[str, Any], fake: FakeCook) -> None:
+    res = await tools["cooklang_delete_recipe"](slug="ghost", confirm=True)
+    assert res["error"] == "recipe not found"
+
+
 async def test_create_recipe_validation_failure_no_write(
     tools: dict[str, Any], fake: FakeCook, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -89,8 +89,10 @@ gets added next:
    `JWTAuthMiddleware` is added to the Starlette app in `app.py`; any
    path past it has been auth'd.
 2. **No tool writes recipes outside the CookLang server's recipe tree.**
-   The recipe writers (`cooklang_create_recipe`, `cooklang_update_recipe`)
-   go through cook.holthome.net's `PUT /api/recipes/<relpath>` API — they
+   The recipe writers (`cooklang_create_recipe`, `cooklang_update_recipe`,
+   `cooklang_delete_recipe`)
+   go through cook.holthome.net's `PUT`/`DELETE /api/recipes/<relpath>`
+   API — they
    never touch the filesystem directly. Slugs are constrained by
    `NAME_RE = [a-zA-Z0-9_-]+`; folder/path segments are sanitised by
    `_sanitize_relpath` (no `..`, no `\`, no NUL, no absolute paths) before
@@ -98,6 +100,8 @@ gets added next:
    subfolder. Every write is round-trip validated through the CookLang
    parser on a throwaway path BEFORE the real target is written, and
    `create` refuses to clobber an existing recipe unless `overwrite=True`.
+   `delete` is destructive, so it refuses to act unless `confirm=True` —
+   without it, it returns a non-destructive preview of the resolved target.
 3. **No tool shells out without explicit input sanitisation.** Today no
    tool shells out at all. If a future tool does, it MUST use `subprocess`
    with `shell=False` and a fully validated argv list.

@@ -61,6 +61,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 | Cooklang | `cooklang_search_recipes` | Search YOUR recipes by name/metadata (opt-in ingredient matching) |
 | Cooklang | `cooklang_create_recipe` | Author a NEW `.cook` (frontmatter + body); `derived_from` is first-class; fails on collision |
 | Cooklang | `cooklang_update_recipe` | Amend an existing recipe; parser-validated before it overwrites |
+| Cooklang | `cooklang_delete_recipe` | Permanently delete a recipe; previews the target unless `confirm=true` |
 | Cooklang | `cooklang_search_federation` | Search the federated index (your repo + ~60 community feeds) |
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |

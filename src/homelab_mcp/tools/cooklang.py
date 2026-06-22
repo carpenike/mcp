@@ -738,6 +738,82 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         log.info("updated recipe: %s", relpath)
         return {"ok": True, "slug": merged.get("id"), "path": relpath}
 
+    # ── delete ──────────────────────────────────────────────────────
+    @mcp.tool(
+        name="cooklang_delete_recipe",
+        description=(
+            "Delete an EXISTING recipe from cook.holthome.net, identified by slug "
+            "(or relative path). This is DESTRUCTIVE and permanent. As a guard, "
+            "it does nothing unless you pass `confirm=true`: called without it, "
+            "the tool resolves the identifier and returns a preview of exactly "
+            "which recipe (title + path) WOULD be deleted, so you can show the "
+            "user and get explicit approval before calling again with "
+            "confirm=true. Downstream services (Marginalia, Whiskey's Mess Hall) "
+            "store only slugs and defer to this server, so deleting here removes "
+            "the source of truth for that recipe."
+        ),
+    )
+    async def delete_recipe(
+        slug: Annotated[
+            str,
+            Field(description="Slug (frontmatter id) or relative path of the recipe to delete"),
+        ],
+        confirm: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Must be true to actually delete. When false (default), the "
+                    "tool returns a non-destructive preview of what would be "
+                    "deleted instead of deleting it."
+                )
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                relpath = await _resolve_to_path(client, slug)
+                if relpath is None:
+                    return {"error": "recipe not found", "identifier": slug}
+
+                # Read the title for a human-meaningful preview/confirmation.
+                current = await _fetch_recipe(client, relpath)
+                if current.status_code != 200:
+                    return {"error": "recipe not found", "identifier": slug, "path": relpath}
+                meta = _normalize_metadata(current.json().get("recipe", {}).get("metadata"))
+                title = meta.get("title")
+
+                if not confirm:
+                    return {
+                        "ok": False,
+                        "requires_confirmation": True,
+                        "path": relpath,
+                        "slug": meta.get("id"),
+                        "title": title,
+                        "hint": "re-call with confirm=true to permanently delete this recipe",
+                    }
+
+                deleted = await _delete_recipe(client, relpath)
+                if deleted.status_code not in (200, 204):
+                    return {
+                        "error": "delete failed",
+                        "status": deleted.status_code,
+                        "path": relpath,
+                    }
+
+                # Confirm it's gone: a follow-up GET must now 404.
+                verify = await _fetch_recipe(client, relpath)
+                if verify.status_code != 404:
+                    return {
+                        "error": "post-delete verification failed",
+                        "path": relpath,
+                        "status": verify.status_code,
+                    }
+        except httpx.HTTPError as exc:
+            return {"error": "delete failed", "reason": str(exc)}
+
+        log.info("deleted recipe: %s", relpath)
+        return {"ok": True, "deleted": relpath, "slug": meta.get("id"), "title": title}
+
     # ── federation search (distinct: ~60 community feeds) ───────────
     @mcp.tool(
         name="cooklang_search_federation",
