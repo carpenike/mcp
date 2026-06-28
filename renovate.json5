@@ -1,0 +1,54 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended"],
+
+  // Scope: this repo's Renovate config exists to auto-track ONE thing — the
+  // pocketid-mcp-as contract pin in contract/PINNED.json. We restrict Renovate
+  // to the custom regex manager so it does NOT also start opening PRs for the
+  // Python deps, GitHub Actions, or Nix inputs (that's deliberately out of
+  // scope here). To broaden later, drop or extend `enabledManagers`.
+  enabledManagers: ["custom.regex"],
+
+  customManagers: [
+    {
+      customType: "regex",
+      description: "Track the pocketid-mcp-as contract pin (contract/PINNED.json .ref)",
+      // Real path of the pin file in this repo. `managerFilePatterns` is the
+      // current (Renovate v40+) replacement for the deprecated `fileMatch`; a
+      // value wrapped in `/.../` is treated as a regex.
+      managerFilePatterns: ["/^contract/PINNED\\.json$/"],
+      // PINNED.json is plain JSON (no inline comments), so match the `ref`
+      // field explicitly. The capture group wraps the v-prefixed tag value.
+      matchStrings: ['"ref"\\s*:\\s*"(?<currentValue>v[^"]+)"'],
+      datasourceTemplate: "github-tags",
+      depNameTemplate: "carpenike/mcp-as-contract",
+      versioningTemplate: "semver",
+    },
+  ],
+
+  packageRules: [
+    {
+      // The contract bump PR is an early-warning signal, not a routine dep
+      // update: it runs the unpatched conformance harness at the new ref +
+      // the upstream-aware drift guard. Green = backward-compatible (merge by
+      // hand); red = the new contract version added a requirement we don't
+      // meet, and check.sh / the drift guard names what broke. Never
+      // auto-merge — a human reviews the CI result.
+      matchManagers: ["custom.regex"],
+      matchDepNames: ["carpenike/mcp-as-contract"],
+      automerge: false,
+      addLabels: ["contract-pin"],
+      commitMessageTopic: "pocketid-mcp-as contract",
+    },
+  ],
+
+  // Appended to the contract-bump PR body (only the custom manager is enabled,
+  // so these notes only ever appear on contract-pin PRs). They capture the
+  // human reconciliation steps Renovate intentionally does NOT automate.
+  prBodyNotes: [
+    "**On accepting this bump, also (human-maintained):**",
+    "- Reconcile `nix/package.nix` `contractSrc` (`rev` + `hash`) with the new ref — e.g. `nix-prefetch-url --unpack https://github.com/carpenike/mcp-as-contract/archive/refs/tags/<ref>.tar.gz | xargs nix hash to-sri --type sha256`.",
+    "- Update the `Conforms to pocketid-mcp-as vX.Y …` declaration in `README.md` and `AGENTS.md` if this is a minor/major bump.",
+    "- Verify locally with `make conformance-ci` (clones the harness at the new ref, runs `check.sh … --mcp-path /mcp`, and asserts `served == upstream@<ref>`).",
+  ],
+}
