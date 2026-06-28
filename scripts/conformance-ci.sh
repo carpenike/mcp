@@ -16,7 +16,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${PORT:-9277}"
 ORIGIN="http://127.0.0.1:${PORT}"
-RUNNER="${RUNNER:-uv run}"
+# Use `-` (not `:-`) so an explicitly-empty RUNNER stays empty. CI sets
+# RUNNER="" to run the installed `homelab-mcp` console script directly (no uv);
+# local dev leaves RUNNER unset and gets the `uv run` default.
+RUNNER="${RUNNER-uv run}"
 MCP_PATH="${MCP_PATH:-/mcp}"
 REPO_URL="https://github.com/carpenike/mcp-as-contract"
 REF="$(jq -r '.ref' "${ROOT}/contract/PINNED.json")"
