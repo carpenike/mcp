@@ -1,0 +1,6 @@
+{
+  "contract": "pocketid-mcp-as",
+  "ref": "v1.1.0",
+  "upstream_repo": "https://github.com/carpenike/mcp-as-contract",
+  "note": "Pin (ref only). The contract content (contract.json + CONTRACT.md) is NOT committed to this source tree: GitHub is the single source of truth. It is fetched from upstream@ref at wheel-build time (hatch_build.py) and by the scripts/Makefile. Bump the ref deliberately with `make contract-pull REF=<tag>`."
+}

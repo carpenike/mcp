@@ -66,6 +66,7 @@ class JWTAuthMiddleware:
         issuer: str,
         audience: str,
         resource_metadata_url: str | None = None,
+        extra_unauthenticated_paths: frozenset[str] = frozenset(),
     ) -> None:
         self.app = app
         self.issuer = issuer
@@ -78,10 +79,16 @@ class JWTAuthMiddleware:
         # fetch isn't challenged. The origin-root + AS-metadata + OAuth
         # paths are static (UNAUTHENTICATED_PATHS); the path-suffixed PRM
         # is derived from mcp_path so we add it per-instance.
-        self._unauthenticated_paths: frozenset[str] = self.UNAUTHENTICATED_PATHS
+        #
+        # `extra_unauthenticated_paths` carries other public, bearer-free
+        # routes (e.g. the hosted contract docs) that must stay outside the
+        # OAuth/JWT path entirely.
+        self._unauthenticated_paths: frozenset[str] = (
+            self.UNAUTHENTICATED_PATHS | extra_unauthenticated_paths
+        )
         if resource_metadata_url is not None:
             suffixed_path = resource_metadata_url[len(issuer) :]
-            self._unauthenticated_paths = self.UNAUTHENTICATED_PATHS | {suffixed_path}
+            self._unauthenticated_paths = self._unauthenticated_paths | {suffixed_path}
         # Derive the public key once. We need the cryptography object, not
         # the JWK dict, because PyJWT takes the raw key.
         private: RSAPrivateKey = serialization.load_pem_private_key(  # type: ignore[assignment]

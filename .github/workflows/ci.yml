@@ -40,6 +40,35 @@ jobs:
       - name: Pytest
         run: pytest -v
 
+  conformance:
+    name: pocketid-mcp-as conformance + contract hosting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        # The editable build hook (hatch_build.py) fetches the pinned
+        # contract content from GitHub into contract/ during install.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Boot server + run upstream conformance harness + drift guard
+        # Boots homelab-mcp, clones the pinned conformance harness fresh
+        # (pocketid-mcp-as, tag from contract/PINNED.json) and runs it
+        # UNPATCHED with --mcp-path /mcp (profile jwt-refresh, scope
+        # mcp-only), then verifies the served contract.json deep-equals
+        # upstream@pinned. Fails the build on any non-zero exit.
+        env:
+          RUNNER: ""  # console script is on PATH after `pip install -e .`
+        run: bash scripts/conformance-ci.sh
+
   nix:
     name: Nix flake check
     runs-on: ubuntu-latest

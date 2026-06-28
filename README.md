@@ -52,6 +52,67 @@ Neither of the obvious off-the-shelf options work:
 So we run our own spec-clean OAuth AS in-process and federate the actual user login (passkey)
 upstream to PocketID. Claude never touches PocketID directly.
 
+## Contract conformance
+
+This server **conforms to [pocketid-mcp-as](https://github.com/carpenike/mcp-as-contract)
+v1.1, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.**
+
+`pocketid-mcp-as` is the shared contract for the self-hosted MCP OAuth 2.1
+Authorization Servers that federate login to PocketID across several
+carpenike apps (`replog`, `whiskey-whiskey-whiskey`, `marginalia`, and this
+one). It standardizes the discovery field names, OAuth wire behavior, and
+discovery documents — not the token storage model, and (since v1.1) not the
+MCP resource path, which is app-declared. This app uses the `jwt-refresh`
+profile (RS256 access tokens + rotating refresh tokens, publishes
+`jwks_uri`), the `mcp-only` scope posture (the minted token is accepted only
+on the `/mcp` resource path), and keeps its original `/mcp` transport path.
+The path-suffixed RFC 9728 §3.3 PRM, its `resource`, and the §1.7
+`WWW-Authenticate` hint are all derived from the single `mcp_path` setting.
+
+Run the upstream conformance harness against a live AS. It's cloned fresh at
+the pinned tag (`contract/PINNED.json`) and run **unpatched** with the path
+flag — the v1.1.0 harness fixed the earlier subshell bug, so we no longer
+vendor or patch it:
+
+```bash
+make conformance ORIGIN=http://127.0.0.1:9200     # local dev
+make conformance ORIGIN=https://mcp.holthome.net  # production
+# which clones the pinned tag and runs:
+#   conformance/check.sh <origin> jwt-refresh mcp-only --mcp-path /mcp
+```
+
+CI boots the server and runs both the upstream harness and the drift guard
+on every push (`make conformance-ci`).
+
+### Hosting the contract (mcp.holthome.net is its public home)
+
+This host serves the canonical public copy of the contract so other repos'
+build/CI harnesses can fetch the spec at runtime. Both routes are
+unauthenticated, GET-only, CORS-open (`Access-Control-Allow-Origin: *`), and
+live entirely outside the OAuth/bearer path:
+
+| Route | Serves | Headers |
+|-------|--------|---------|
+| `/.well-known/mcp-as-contract.json` | machine-readable `contract.json` | `application/json`, `Cache-Control: public, max-age=300`, `X-Contract-Version` |
+| `/contract` | human-readable `CONTRACT.md` (raw) | `text/markdown`, same cache + version headers |
+
+**GitHub is the single source of truth — we don't commit the contract into
+this tree.** The content is fetched at wheel-build time
+([`hatch_build.py`](hatch_build.py)) from the ref pinned in
+[`contract/PINNED.json`](contract/PINNED.json) and force-included into the
+wheel as package data, so the running server is self-contained (no runtime
+GitHub dependency) but the source carries no copy (the fetched files under
+`contract/` are gitignored). Bumping the pin is a deliberate, reviewable
+step:
+
+```bash
+make contract-pull REF=v1.1.0   # update the pinned ref; review PINNED.json diff
+```
+
+The drift guard is **upstream-aware**: CI fetches `contract.json` from the
+pinned tag on GitHub and asserts the live-served bytes deep-equal it
+(served == upstream@pinned), so a serving bug *or* a stale pin is caught.
+
 ## Tools
 
 | Category | Tool name | What it does |
@@ -100,6 +161,8 @@ upstream to PocketID. Claude never touches PocketID directly.
 │   ├─ /.well-known/oauth-protected-resource (RFC 9728)    │
 │   ├─ /.well-known/oauth-protected-resource/mcp (RFC 9728 §3.3, VS Code) │
 │   ├─ /.well-known/oauth-authorization-server (RFC 8414)  │
+│   ├─ /.well-known/mcp-as-contract.json (hosted contract, public) │
+│   ├─ /contract              (hosted CONTRACT.md, public)  │
 │   ├─ /oauth/jwks.json     (public verifier key)          │
 │   ├─ /oauth/register      (RFC 7591 DCR)                 │
 │   ├─ /oauth/authorize ────► 302 to PocketID              │

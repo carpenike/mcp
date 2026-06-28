@@ -62,10 +62,11 @@ class Settings(BaseSettings):
         default="/mcp",
         description=(
             "Path component of the Streamable-HTTP MCP endpoint (leading slash). "
-            "MUST match FastMCP's streamable_http_path (default '/mcp'). Used to "
-            "build the spec-strict RFC 9728 §3.3 path-suffixed protected-resource "
-            "metadata document VS Code requires (served at "
-            "'/.well-known/oauth-protected-resource<mcp_path>')."
+            "Wired into FastMCP's streamable_http_path at startup. The contract "
+            "(pocketid-mcp-as v1.1) makes the MCP resource path app-declared; this "
+            "server keeps its original '/mcp'. Used to build the spec-strict "
+            "RFC 9728 §3.3 path-suffixed protected-resource metadata document VS "
+            "Code requires (served at '/.well-known/oauth-protected-resource<mcp_path>')."
         ),
     )
 

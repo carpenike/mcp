@@ -41,3 +41,10 @@ result-*
 # Local env
 .env
 .env.local
+
+# Fetched-at-build pocketid-mcp-as contract content. GitHub is the single
+# source of truth; hatch_build.py + the scripts pull these from upstream@ref
+# (see contract/PINNED.json). Never commit the contract content here.
+/contract/contract.json
+/contract/CONTRACT.md
+/src/homelab_mcp/_vendored/

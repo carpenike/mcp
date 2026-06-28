@@ -28,6 +28,41 @@
   `homelab-mcp` system user (extra group: `cooklang`, so it can write to
   `/data/cooklang/recipes/claude/`).
 
+## Contract conformance (pocketid-mcp-as)
+
+This server **conforms to [pocketid-mcp-as](https://github.com/carpenike/mcp-as-contract)
+v1.1, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.** That contract
+is the single source of truth that keeps this AS aligned with the sibling apps
+(`replog`, `whiskey-whiskey-whiskey`, `marginalia`). It standardizes the
+discovery field names + OAuth wire behavior, NOT the token storage model, and
+(since v1.1) NOT the MCP resource path, which is app-declared.
+
+- **MCP resource path is `/mcp`** (app-declared, v1.1). It comes from
+  `settings.mcp_path` and is wired into FastMCP's `streamable_http_path`; the
+  RFC 9728 §3.3 path-suffixed PRM, its `resource` byte-match, and the §1.7
+  `WWW-Authenticate` hint all derive from that one setting so the transport
+  URL and advertised resource can never drift. Don't move it to `/api/mcp`.
+- **Discovery field names are load-bearing.** A non-spec field name silently
+  breaks Claude with no client-side log. If you touch the RFC 8414 metadata
+  (`oauth_provider.authorization_server_metadata`) or the RFC 9728 PRM docs
+  (`app._build_protected_resource_metadata`), run `make conformance-ci`.
+- **Profile `jwt-refresh` is intentional** — do NOT convert this app to opaque
+  tokens to match the others. AS metadata MUST publish `jwks_uri` and the
+  token endpoint MUST support `grant_type=refresh_token`.
+- **Conformance harness is NOT vendored.** `make conformance` / `conformance-ci`
+  clone the harness fresh at the pinned tag (`contract/PINNED.json`) and run it
+  **unpatched** with `--mcp-path /mcp`. The v1.1.0 harness fixed the old
+  subshell bug, so there's no patch to maintain.
+- **mcp.holthome.net hosts the contract publicly** (see `homelab_mcp.contract`):
+  `/.well-known/mcp-as-contract.json` + `/contract`, unauthenticated, GET-only,
+  CORS-open, outside the bearer path. **GitHub is the single source of truth —
+  the contract content is NOT committed.** `hatch_build.py` fetches it at
+  build time from the pinned ref into the wheel; `contract/contract.json` +
+  `CONTRACT.md` are gitignored. Bump the pin with `make contract-pull REF=<tag>`.
+  The drift guard is upstream-aware: CI asserts served == upstream@pinned.
+- Run `make conformance` / `make conformance-ci` after any change to the AS,
+  its discovery, or the contract-hosting endpoints.
+
 ## Tool registry pattern (the architectural decision)
 
 Each file under `src/homelab_mcp/tools/` that exports a top-level

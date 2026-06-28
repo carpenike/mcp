@@ -200,7 +200,9 @@ def test_path_suffixed_prm_returns_mcp_endpoint_as_resource(settings: Settings) 
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    # VS Code requires the exact endpoint URL, not the origin.
+    # VS Code requires the exact endpoint URL, not the origin. The contract
+    # (pocketid-mcp-as v1.1) makes the MCP resource path app-declared; this
+    # server keeps /mcp.
     assert body["resource"] == "https://mcp.example.com/mcp"
     assert body["authorization_servers"] == ["https://mcp.example.com"]
 

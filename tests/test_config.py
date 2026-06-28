@@ -48,6 +48,11 @@ def test_required_oauth_passes_when_set(monkeypatch: pytest.MonkeyPatch) -> None
     assert s.issuer == "https://mcp.example.com"
     assert s.resource_url == "https://mcp.example.com"
     assert s.pocketid_redirect_uri == "https://mcp.example.com/oauth/callback"
+    # Contract (pocketid-mcp-as v1.1) makes the MCP resource path app-declared;
+    # this server keeps /mcp.
+    assert s.mcp_path == "/mcp"
+    assert s.mcp_resource_url == "https://mcp.example.com/mcp"
+    assert s.prm_path_suffixed == "/.well-known/oauth-protected-resource/mcp"
 
 
 def test_public_base_url_trailing_slash_normalized(monkeypatch: pytest.MonkeyPatch) -> None:

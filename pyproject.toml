@@ -60,6 +60,18 @@ Issues = "https://github.com/carpenike/mcp/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/homelab_mcp"]
 
+# Fetch-at-build: GitHub is the single source of truth for the
+# pocketid-mcp-as contract. hatch_build.py pulls contract.json + CONTRACT.md
+# from the ref pinned in contract/PINNED.json and force-includes them into
+# the wheel as homelab_mcp/_vendored/, so the installed package serves the
+# contract with no runtime GitHub dependency and the source tree carries no
+# committed copy. Refresh the pin with `make contract-pull`.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.editable.hooks.custom]
+path = "hatch_build.py"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

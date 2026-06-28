@@ -23,6 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from homelab_mcp import contract as contract_hosting
 from homelab_mcp import oauth_provider, signing_key
 from homelab_mcp.auth import JWTAuthMiddleware
 from homelab_mcp.config import Settings
@@ -57,7 +58,13 @@ def build_app(settings: Settings) -> Starlette:
     # (Claude shows it as the connector name on tool calls). Internal
     # naming stays "homelab-mcp" everywhere else (package, systemd
     # unit, user); this is purely the user-facing label.
-    mcp = FastMCP("Holthome")
+    #
+    # streamable_http_path pins the MCP transport at settings.mcp_path
+    # (default '/mcp'). The pocketid-mcp-as v1.1 contract makes this path
+    # app-declared; the RFC 9728 §3.3 path-suffixed PRM and its `resource`
+    # byte-match are derived from the same setting, so the transport URL
+    # and the advertised resource can never drift apart.
+    mcp = FastMCP("Holthome", streamable_http_path=settings.mcp_path)
 
     # Load the signing key BEFORE tool registration so tools that need
     # to mint per-call JWTs for downstream resource calls (the HOF-004
@@ -95,8 +102,18 @@ def build_app(settings: Settings) -> Starlette:
     register_all(mcp, settings, mint_token)
 
     # FastMCP exposes its Streamable HTTP transport as an ASGI app we can
-    # mount middleware on. The route to call from clients is `/mcp`.
+    # mount middleware on. The route to call from clients is `settings.mcp_path`
+    # (default `/mcp`).
     app: Starlette = mcp.streamable_http_app()
+
+    # ── Host the pocketid-mcp-as contract publicly (Part B) ─────────
+    # mcp.holthome.net is the contract's designated public home. These
+    # routes are unauthenticated, GET-only, CORS-open and live entirely
+    # outside the OAuth/bearer path — same posture as the .well-known
+    # OAuth docs. Wired BEFORE the oauth_required early-return so they are
+    # always served, then exempted from the JWT middleware below.
+    for route in contract_hosting.build_routes():
+        app.router.routes.append(route)
 
     if not settings.oauth_required:
         log.warning(
@@ -161,6 +178,8 @@ def build_app(settings: Settings) -> Starlette:
         # clients (VS Code) at the path-suffixed PRM so they can discover
         # the AS without guessing well-known paths.
         resource_metadata_url=settings.issuer + settings.prm_path_suffixed,
+        # The public contract-hosting docs stay outside the bearer path.
+        extra_unauthenticated_paths=contract_hosting.CONTRACT_PATHS,
     )
     log.info(
         "OAuth enabled (issuer=%s audience=%s upstream=%s)",
