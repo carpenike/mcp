@@ -59,12 +59,13 @@ class ContractFetchHook(BuildHookInterface):
                 want = hashes.get(name)
                 if want is not None and _digest(dest) != want:
                     return False
-            # With no content digests to lean on, fall back to the ref stamp
-            # so a pin bump without a refetch is still caught.
-            if not hashes:
-                if not stamp.is_file() or stamp.read_text(encoding="utf-8").strip() != ref:
-                    return False
-            return True
+            # Reaching here means every file exists and (if digests are
+            # recorded) matched. With digests, that's sufficient. Without
+            # them, fall back to the ref stamp so a pin bump without a
+            # refetch is still caught.
+            if hashes:
+                return True
+            return stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == ref
 
         if not _staged_matches_pin():
             # Cache miss / stale / tampered: (re)fetch from the pin. Requires
