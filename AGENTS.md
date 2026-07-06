@@ -31,11 +31,13 @@
 ## Contract conformance (pocketid-mcp-as)
 
 This server **conforms to [pocketid-mcp-as](https://github.com/carpenike/mcp-as-contract)
-v1.1, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.** That contract
+v1.2, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.** That contract
 is the single source of truth that keeps this AS aligned with the sibling apps
 (`replog`, `whiskey-whiskey-whiskey`, `marginalia`). It standardizes the
 discovery field names + OAuth wire behavior, NOT the token storage model, and
-(since v1.1) NOT the MCP resource path, which is app-declared.
+(since v1.1) NOT the MCP resource path, which is app-declared. v1.2 added the
+redirect-URI hardening rule (parsed match + userinfo rejection) this app
+reported; see security non-negotiable #6.
 
 - **MCP resource path is `/mcp`** (app-declared, v1.1). It comes from
   `settings.mcp_path` and is wired into FastMCP's `streamable_http_path`; the
@@ -50,9 +52,9 @@ discovery field names + OAuth wire behavior, NOT the token storage model, and
   tokens to match the others. AS metadata MUST publish `jwks_uri` and the
   token endpoint MUST support `grant_type=refresh_token`.
 - **Conformance harness is NOT vendored.** `make conformance` / `conformance-ci`
-  clone the harness fresh at the pinned tag (`contract/PINNED.json`) and run it
-  **unpatched** with `--mcp-path /mcp`. The v1.1.0 harness fixed the old
-  subshell bug, so there's no patch to maintain.
+  clone the harness fresh at the pinned ref (`contract/PINNED.json`) and run it
+  **unpatched** with `--mcp-path /mcp`. The v1.2.0 harness adds the redirect-URI
+  userinfo-bypass probe and the §1.7 challenge check; there's no patch to maintain.
 - **mcp.holthome.net hosts the contract publicly** (see `homelab_mcp.contract`):
   `/.well-known/mcp-as-contract.json` + `/contract`, unauthenticated, GET-only,
   CORS-open, outside the bearer path. **GitHub is the single source of truth —
@@ -166,10 +168,10 @@ gets added next:
    `oauth_provider._redirect_allowed` rejects any redirect target carrying
    userinfo (`user:pass@host`) or a malformed scheme/host BEFORE the prefix
    check. A naive `startswith` on a `:`-terminated loopback prefix is
-   bypassable (`http://localhost:1@evil.com/`). Don't revert it. The
-   upstream `pocketid-mcp-as` contract specifies the vulnerable prefix
-   semantics; the divergence is deliberate and stays conformant — see
-   `CONTRACT_DEFECT.md`.
+   bypassable (`http://localhost:1@evil.com/`). Don't revert it. This was
+   reported upstream and adopted into the `pocketid-mcp-as` contract in
+   v1.2.0 (`dcr.match = "parsed-scheme-host-port"` + `dcr.reject_userinfo`,
+   with a conformance probe), which this implementation passes.
 7. **Refresh tokens rotate within a family with reuse detection.** Replaying
    an already-rotated refresh token revokes the whole rotation family
    (`oauth_state.consume_refresh`). Keep `family_id` threaded through both

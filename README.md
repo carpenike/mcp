@@ -55,7 +55,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 ## Contract conformance
 
 This server **conforms to [pocketid-mcp-as](https://github.com/carpenike/mcp-as-contract)
-v1.1, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.**
+v1.2, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.**
 
 `pocketid-mcp-as` is the shared contract for the self-hosted MCP OAuth 2.1
 Authorization Servers that federate login to PocketID across several
@@ -68,11 +68,14 @@ profile (RS256 access tokens + rotating refresh tokens, publishes
 on the `/mcp` resource path), and keeps its original `/mcp` transport path.
 The path-suffixed RFC 9728 §3.3 PRM, its `resource`, and the §1.7
 `WWW-Authenticate` hint are all derived from the single `mcp_path` setting.
+(v1.2 added a redirect-URI hardening rule — parsed scheme+host+port match
+plus mandatory userinfo rejection — that this server originally reported and
+already satisfies.)
 
 Run the upstream conformance harness against a live AS. It's cloned fresh at
-the pinned tag (`contract/PINNED.json`) and run **unpatched** with the path
-flag — the v1.1.0 harness fixed the earlier subshell bug, so we no longer
-vendor or patch it:
+the pinned ref (`contract/PINNED.json`) and run **unpatched** with the path
+flag — the v1.2.0 harness adds the redirect-URI userinfo-bypass probe and the
+§1.7 challenge check, and we no longer vendor or patch it:
 
 ```bash
 make conformance ORIGIN=http://127.0.0.1:9200     # local dev
@@ -106,7 +109,7 @@ GitHub dependency) but the source carries no copy (the fetched files under
 step:
 
 ```bash
-make contract-pull REF=v1.1.0   # update the pinned ref; review PINNED.json diff
+make contract-pull REF=v1.2.0   # update the pinned ref; review PINNED.json diff
 ```
 
 The drift guard is **upstream-aware**: CI fetches `contract.json` from the

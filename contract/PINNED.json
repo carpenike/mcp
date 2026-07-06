@@ -1,12 +1,12 @@
 {
   "contract": "pocketid-mcp-as",
-  "ref": "6aaabe084fed5dbe848fb0ed66f6fb5292425395",
-  "tag": "v1.1.0",
-  "version": "1.1.0",
+  "ref": "7d9a8b40093cd169cf5d0e9ecc82be6cb64ece83",
+  "tag": "v1.2.0-pre (untagged; main HEAD)",
+  "version": "1.2.0",
   "upstream_repo": "https://github.com/carpenike/mcp-as-contract",
   "sha256": {
-    "contract.json": "612108ca83da68a4c8ce33d858206e136cd1563fdf819ea4dd7b8c734bf55637",
-    "CONTRACT.md": "3abdd5c833a7da27b9508507d4ca7e80991cb2f8cb50337efb3e92ea549a9afe"
+    "contract.json": "067414fd50f8396c6151486aa5fd8af3153134b92c739804fd83a84a8296b865",
+    "CONTRACT.md": "3f90d11011f3d57ff3e2ccf847fc47198cf0f5d57be5488f72a2c1c52cb05eea"
   },
-  "note": "Pin by immutable commit SHA (`ref`), not the mutable tag. `tag` records the human-friendly release that SHA belongs to; keep them in sync. The contract content (contract.json + CONTRACT.md) is NOT committed here: GitHub is the single source of truth. It is fetched from upstream@ref at wheel-build time (hatch_build.py) and by the scripts/Makefile, and every fetch is verified against the per-file `sha256` digests below (build/pull fails on mismatch, so a repointed tag or tampered content is caught). nix/package.nix must pin the same SHA in its `rev` (CI asserts this). Bump the pin deliberately with `make contract-pull REF=<commit-sha>`, which refetches, re-hashes, and rewrites this file."
+  "note": "Pin by immutable commit SHA (`ref`). This is v1.2.0 content (the userinfo-bypass fix this app reported), pinned to the `main` commit it landed on because v1.2.0 was NOT YET TAGGED at pin time. Re-pin to the v1.2.0 tag's commit once it is cut: `make contract-pull REF=v1.2.0` (pull-contract.sh peels the tag to its commit SHA). `tag` is informational. The contract content (contract.json + CONTRACT.md) is NOT committed here: GitHub is the single source of truth. It is fetched from upstream@ref at wheel-build time (hatch_build.py) and by the scripts/Makefile, and every fetch is verified against the per-file `sha256` digests below (build/pull fails on mismatch). nix/package.nix must pin the same SHA in its `rev` (CI asserts this)."
 }

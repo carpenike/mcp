@@ -144,7 +144,10 @@ def _redirect_allowed(uri: str, settings: Settings) -> bool:
     parse the URL and reject any target carrying userinfo (``user:pass@host``)
     or a malformed host/scheme, THEN apply the prefix check. No legitimate
     client redirect_uri carries userinfo, so this closes the open-redirect
-    while still accepting every allowlisted prefix. See CONTRACT_DEFECT.md.
+    while still accepting every allowlisted prefix. This was reported upstream
+    and adopted into the pocketid-mcp-as contract in v1.2.0
+    (``dcr.match = "parsed-scheme-host-port"`` + ``dcr.reject_userinfo``); the
+    v1.2.0 conformance harness probes it directly.
     """
     try:
         parts = urlsplit(uri)

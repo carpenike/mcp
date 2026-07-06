@@ -184,11 +184,11 @@ class Settings(BaseSettings):
     # (`user:pass@host`) or a malformed host, THEN applies the prefix check.
     # This is load-bearing — a naive startswith() on a prefix ending in ':'
     # (`http://localhost:`) is bypassable by `http://localhost:1@evil.com/`,
-    # whose real host is evil.com. See CONTRACT_DEFECT.md: the upstream
-    # pocketid-mcp-as v1.1 contract specifies these exact prefixes with
-    # prefix-match semantics and inherits the same flaw; our stricter parse
-    # stays conformant (it still accepts every legitimate prefix) while
-    # closing the hole.
+    # whose real host is evil.com. The upstream pocketid-mcp-as contract
+    # originally specified these prefixes with prefix-match semantics and
+    # inherited the same flaw; it was reported and fixed in v1.2.0 (parsed
+    # scheme+host+port match + mandatory userinfo rejection), which this
+    # implementation already satisfies.
     oauth_redirect_uri_allowlist: list[str] = Field(
         default=[
             # Claude (claude.ai web + Claude Desktop).
