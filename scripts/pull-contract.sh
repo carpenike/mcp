@@ -28,13 +28,31 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${ROOT}/contract"
 PINNED="${DEST}/PINNED.json"
 
-for bin in curl jq sha256sum; do
+for bin in curl jq sha256sum git; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing required tool: $bin" >&2; exit 2; }
 done
 [[ -f "$PINNED" ]] || { echo "contract/PINNED.json not found" >&2; exit 2; }
 
 REF="${1:-$(jq -r '.ref' "$PINNED")}"
 [[ -n "$REF" && "$REF" != "null" ]] || { echo "no ref to pin" >&2; exit 1; }
+
+# Resolve a tag/branch to its underlying COMMIT sha. This is load-bearing: for
+# an ANNOTATED tag, `git ls-remote <repo> <tag>` returns the tag-OBJECT sha,
+# which raw.githubusercontent.com and fetchFromGitHub both 404 on. The commit
+# is the `<tag>^{}` (peeled) entry. A 40-hex input is already a commit and is
+# used as-is; a lightweight tag/branch peels to its single commit line.
+resolve_commit() {
+  local ref="$1" out
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && { echo "$ref"; return; }
+  out="$(git ls-remote "https://github.com/${REPO}" "$ref" "${ref}^{}" 2>/dev/null || true)"
+  awk '/\^\{\}$/{print $1; found=1; exit} END{if(!found) exit 1}' <<<"$out" && return
+  awk 'NR==1{print $1; exit}' <<<"$out"
+}
+RESOLVED="$(resolve_commit "$REF")"
+if [[ -n "$RESOLVED" && "$RESOLVED" != "$REF" ]]; then
+  echo "Resolved ${REF} -> commit ${RESOLVED}"
+  REF="$RESOLVED"
+fi
 
 raw() { curl -fsS "https://raw.githubusercontent.com/${REPO}/${1}/${2}"; }
 
@@ -69,6 +87,4 @@ echo "Pinned ref ${REF} (contract v${VERSION})."
 echo "  contract.json sha256 ${JSON_SHA}"
 echo "  CONTRACT.md   sha256 ${MD_SHA}"
 echo "Content staged in contract/ (gitignored)."
-echo "If you pinned a tag/branch, consider re-pinning the resolved commit SHA:"
-echo "  git ls-remote ${REPO_URL:-https://github.com/${REPO}} ${REF}"
 echo "Review the PINNED.json diff, then run: make conformance-ci"

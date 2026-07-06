@@ -30,7 +30,7 @@ let
   contractSrc = fetchFromGitHub {
     owner = "carpenike";
     repo = "mcp-as-contract";
-    rev = "ef5035fcae347bec20671925a80dff8e33d6cb74";
+    rev = "6aaabe084fed5dbe848fb0ed66f6fb5292425395";
     hash = "sha256-TCeq3AaIF6j4+x+GYgUOBDvQsMIVTlG+IbEKLG0m18M=";
   };
 in
