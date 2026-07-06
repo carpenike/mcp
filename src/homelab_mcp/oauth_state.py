@@ -35,10 +35,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 import time
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS oauth_client (
@@ -54,9 +57,20 @@ CREATE TABLE IF NOT EXISTS refresh_token (
     client_id   TEXT NOT NULL,
     user_email  TEXT NOT NULL,
     scope       TEXT,
-    expires_at  REAL NOT NULL
+    expires_at  REAL NOT NULL,
+    family_id   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_expiry ON refresh_token(expires_at);
+CREATE INDEX IF NOT EXISTS idx_refresh_family ON refresh_token(family_id);
+-- Tombstones of already-rotated refresh tokens, kept so a replay of a
+-- consumed token is distinguishable from an unknown one and can trigger
+-- reuse detection (revoke the whole rotation family). Pruned by age.
+CREATE TABLE IF NOT EXISTS consumed_refresh (
+    token_hash  TEXT PRIMARY KEY,
+    family_id   TEXT NOT NULL,
+    consumed_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consumed_at ON consumed_refresh(consumed_at);
 """
 
 
@@ -73,6 +87,31 @@ def _now() -> float:
 def _new_token(length: int = 32) -> str:
     """URL-safe random token used for codes, client_ids, client_secrets, etc."""
     return secrets.token_urlsafe(length)
+
+
+def _log_reuse(family_id: str, revoked_count: int) -> None:
+    """Emit a security warning when a rotated refresh token is replayed."""
+    log.warning(
+        "refresh-token reuse detected — revoked %d live token(s) in family %s… "
+        "(a rotated token was replayed; the chain may have leaked)",
+        revoked_count,
+        family_id[:8],
+    )
+
+
+def _migrate_refresh_family(conn: sqlite3.Connection) -> None:
+    """Add the `family_id` column to a pre-existing refresh_token table.
+
+    Databases created before reuse-detection was added lack the column.
+    `CREATE TABLE IF NOT EXISTS` won't alter an existing table, so we add
+    it explicitly. Legacy rows keep a NULL family_id; `consume_refresh`
+    treats a NULL family as the token's own singleton family, so old
+    tokens still rotate correctly (they just can't cross-revoke siblings
+    they never had).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(refresh_token)")}
+    if "family_id" not in cols:
+        conn.execute("ALTER TABLE refresh_token ADD COLUMN family_id TEXT")
 
 
 @dataclass
@@ -134,12 +173,17 @@ class IssuedRefreshToken:
     token (one-shot) and issues a fresh one with the same identity. This
     lets a long-lived client renew short-lived access tokens silently,
     without re-running the interactive PocketID login.
+
+    Every token in a rotation chain shares a `family_id`. If an
+    already-consumed token is ever presented again (a replay), the whole
+    family is revoked — see `OAuthState.consume_refresh`.
     """
 
     client_id: str
     user_email: str
     expires_at: float
     scope: str | None = None
+    family_id: str = ""
 
 
 @dataclass
@@ -158,12 +202,19 @@ class OAuthState:
     _pending: dict[str, PendingAuthorization] = field(default_factory=dict)
     _codes: dict[str, IssuedAuthorizationCode] = field(default_factory=dict)
     _refresh: dict[str, IssuedRefreshToken] = field(default_factory=dict)
+    # In-memory reuse-detection tombstones: sha256(token) -> family_id.
+    _consumed_refresh: dict[str, str] = field(default_factory=dict)
     _db: sqlite3.Connection | None = None
     _client_retention_seconds: float | None = None
+    _consumed_retention_seconds: float | None = None
 
     @classmethod
     def open(
-        cls, db_path: str | None, *, client_retention_seconds: float | None = None
+        cls,
+        db_path: str | None,
+        *,
+        client_retention_seconds: float | None = None,
+        consumed_retention_seconds: float | None = None,
     ) -> OAuthState:
         """Construct a store, optionally backed by a SQLite file at `db_path`.
 
@@ -176,14 +227,24 @@ class OAuthState:
         client (no live refresh token) is kept; pruned opportunistically on
         registration and via `run_startup_maintenance`. `None` disables
         pruning (used by the in-memory store, which has nothing to prune).
+
+        `consumed_retention_seconds` bounds how long a rotated refresh
+        token's reuse-detection tombstone is kept (set it to the refresh
+        token lifetime — a replay is only meaningful while the family could
+        still be live). `None` keeps them for the process lifetime.
         """
         if not db_path:
-            return cls()
+            return cls(_consumed_retention_seconds=consumed_retention_seconds)
         conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        _migrate_refresh_family(conn)
         conn.commit()
-        return cls(_db=conn, _client_retention_seconds=client_retention_seconds)
+        return cls(
+            _db=conn,
+            _client_retention_seconds=client_retention_seconds,
+            _consumed_retention_seconds=consumed_retention_seconds,
+        )
 
     def _delete_stale_locked(self) -> int:
         """Prune expired refresh tokens + abandoned clients. Caller must hold
@@ -197,6 +258,11 @@ class OAuthState:
         if self._db is None:
             return 0
         self._db.execute("DELETE FROM refresh_token WHERE expires_at < ?", (_now(),))
+        if self._consumed_retention_seconds is not None:
+            self._db.execute(
+                "DELETE FROM consumed_refresh WHERE consumed_at < ?",
+                (_now() - self._consumed_retention_seconds,),
+            )
         removed = 0
         if self._client_retention_seconds is not None:
             cutoff = _now() - self._client_retention_seconds
@@ -302,16 +368,25 @@ class OAuthState:
 
     # ── Refresh tokens (rotated on use) ──────────────────────
     async def store_refresh(self, token: str, payload: IssuedRefreshToken) -> None:
+        """Persist a freshly-issued refresh token.
+
+        `payload.family_id` MUST be set by the caller: a new value for the
+        first token of a chain (authorization_code grant) and the parent's
+        value for a rotated token (refresh_token grant).
+        """
         async with self._lock:
             if self._db is not None:
                 self._db.execute(
-                    "INSERT INTO refresh_token VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO refresh_token "
+                    "(token_hash, client_id, user_email, scope, expires_at, family_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         _sha256(token),
                         payload.client_id,
                         payload.user_email,
                         payload.scope,
                         payload.expires_at,
+                        payload.family_id,
                     ),
                 )
                 self._db.execute("DELETE FROM refresh_token WHERE expires_at < ?", (_now(),))
@@ -321,27 +396,77 @@ class OAuthState:
                 self._refresh[token] = payload
 
     async def consume_refresh(self, token: str) -> IssuedRefreshToken | None:
-        """Atomically retrieve + delete a refresh token (one-shot, rotated)."""
+        """Atomically retrieve + delete a refresh token (one-shot, rotated).
+
+        Reuse detection (OAuth 2.1 / RFC 9700): when a token that is not
+        active is presented, we check the consumed-token tombstones. A hit
+        means an already-rotated token was replayed — evidence the chain
+        leaked — so we revoke the entire rotation family (invalidating the
+        legitimate client's live descendant too) and return None. A miss is
+        an ordinary unknown token. Either way the caller sees None and
+        returns `invalid_grant`.
+        """
+        token_hash = _sha256(token)
         async with self._lock:
             if self._db is not None:
-                token_hash = _sha256(token)
                 row = self._db.execute(
-                    "SELECT client_id, user_email, scope, expires_at "
+                    "SELECT client_id, user_email, scope, expires_at, family_id "
                     "FROM refresh_token WHERE token_hash = ?",
                     (token_hash,),
                 ).fetchone()
                 if row is None:
+                    self._detect_reuse_locked(token_hash)
                     return None
+                family_id = row[4] or token_hash  # legacy rows: singleton family
                 self._db.execute("DELETE FROM refresh_token WHERE token_hash = ?", (token_hash,))
+                self._db.execute(
+                    "INSERT OR REPLACE INTO consumed_refresh "
+                    "(token_hash, family_id, consumed_at) VALUES (?, ?, ?)",
+                    (token_hash, family_id, _now()),
+                )
                 self._db.commit()
                 return IssuedRefreshToken(
                     client_id=row[0],
                     user_email=row[1],
                     scope=row[2],
                     expires_at=row[3],
+                    family_id=family_id,
                 )
+            # In-memory path.
             self._prune_locked(self._refresh)
-            return self._refresh.pop(token, None)
+            payload = self._refresh.pop(token, None)
+            if payload is None:
+                self._detect_reuse_locked(token_hash)
+                return None
+            family_id = payload.family_id or token_hash
+            self._consumed_refresh[token_hash] = family_id
+            payload.family_id = family_id
+            return payload
+
+    def _detect_reuse_locked(self, token_hash: str) -> None:
+        """Revoke a token's whole family if the token is a replayed tombstone.
+
+        Caller holds the lock. No-op for a genuinely unknown token.
+        """
+        if self._db is not None:
+            row = self._db.execute(
+                "SELECT family_id FROM consumed_refresh WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return
+            family_id = row[0]
+            cur = self._db.execute("DELETE FROM refresh_token WHERE family_id = ?", (family_id,))
+            self._db.commit()
+            _log_reuse(family_id, cur.rowcount or 0)
+            return
+        family_id = self._consumed_refresh.get(token_hash)
+        if family_id is None:
+            return
+        revoked = [t for t, p in self._refresh.items() if (p.family_id or "") == family_id]
+        for t in revoked:
+            del self._refresh[t]
+        _log_reuse(family_id, len(revoked))
 
     # ── Cleanup ─────────────────────────────────────────────
     @staticmethod

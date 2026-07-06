@@ -74,7 +74,13 @@ echo
 
 echo "=== Part A: upstream conformance harness (${REF}, unpatched) ==="
 checker="${tmp}/mcp-as-contract"
-git clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$checker"
+# Fetch the exact pinned rev by ref. `git clone --branch` only accepts named
+# refs (tags/branches), so it can't take the immutable commit SHA we now pin;
+# init + fetch <ref> + checkout FETCH_HEAD works for a SHA, tag, or branch.
+git init --quiet "$checker"
+git -C "$checker" remote add origin "$REPO_URL"
+git -C "$checker" fetch --quiet --depth 1 origin "$REF"
+git -C "$checker" checkout --quiet FETCH_HEAD
 bash "${checker}/conformance/check.sh" "$ORIGIN" jwt-refresh mcp-only --mcp-path "$MCP_PATH"
 echo
 

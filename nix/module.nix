@@ -34,7 +34,6 @@
 #       #   HOMELAB_MCP_GROCY_API_KEY=<from Grocy: Settings -> Manage API keys>
 #       # and optionally:
 #       #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, escaped newlines>
-#       #   HOMELAB_MCP_OAUTH_SESSION_SECRET=<random 32+ bytes hex/base64>
 #       environmentFile = config.sops.secrets."homelab-mcp/env".path;
 #     };
 #
@@ -95,22 +94,12 @@ in
       type = lib.types.path;
       default = "/data/cooklang/recipes";
       description = ''
-        Filesystem path to the cooklang recipes directory. The MCP
-        service runs with ReadWritePaths covering this path so the
-        `cooklang_save_recipe` tool can create files. We also create
-        `<recipesDir>/claude/` at startup with mode 02770 owned
-        `cooklang:<recipesGroup>` so the MCP user (which has
-        recipesGroup as a supplementary group) can write into it.
-      '';
-    };
-
-    recipesGroup = lib.mkOption {
-      type = lib.types.str;
-      default = "cooklang";
-      description = ''
-        Group the MCP service runs under as a supplementary group, so
-        it can write into `<recipesDir>/claude/` (which is owned by
-        the cooklang service's user/group on forge).
+        Cooklang recipes root, surfaced to the app as
+        HOMELAB_MCP_RECIPES_DIR (settings.recipes_dir). The cooklang
+        tools reach recipes over cook.holthome.net's HTTP API and never
+        touch this path on disk — the app uses it only to compute
+        recipe-relative paths. No filesystem permissions are granted
+        for it, so it does not need to exist on the MCP host.
       '';
     };
 
@@ -131,8 +120,7 @@ in
         Declarative, NON-SECRET environment variables. Values appear in
         the Nix store world-readable — keep anything sensitive out.
         Use `environmentFile` for HOMELAB_MCP_POCKETID_CLIENT_SECRET
-        and (optionally) HOMELAB_MCP_OAUTH_SIGNING_KEY +
-        HOMELAB_MCP_OAUTH_SESSION_SECRET.
+        and (optionally) HOMELAB_MCP_OAUTH_SIGNING_KEY.
       '';
     };
 
@@ -155,10 +143,6 @@ in
             If absent, the service generates and persists a fresh 2048-bit
             RSA key at /var/lib/homelab-mcp/signing-key.pem (mode 0600).
             Setting this via sops makes the key portable across hosts.
-          HOMELAB_MCP_OAUTH_SESSION_SECRET=<32+ random bytes, urlsafe-base64>
-            If absent, a fresh key is generated per process — surviving
-            restarts is not required because in-flight OAuth state
-            TTLs out in 120s anyway.
       '';
     };
 
@@ -179,36 +163,23 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Dedicated system user. DynamicUser doesn't compose well with
-    # supplementary group membership (we need access to the cooklang
-    # group to write under /data/cooklang/recipes), so we declare a
-    # real user.
+    # Dedicated system user, declared explicitly (rather than DynamicUser)
+    # so the StateDirectory at /var/lib/homelab-mcp — which persists the
+    # auto-generated OAuth signing key and the client/token SQLite store —
+    # keeps stable ownership across restarts and package upgrades.
     users.users.homelab-mcp = {
       isSystemUser = true;
       group = "homelab-mcp";
-      extraGroups = [ cfg.recipesGroup ];
       description = "homelab-mcp service user";
       home = "/var/lib/homelab-mcp";
       createHome = false; # StateDirectory handles it.
     };
     users.groups.homelab-mcp = { };
 
-    # Pre-create the `claude/` subdirectory that `cooklang_save_recipe`
-    # writes into. Mode 02770 = group-writable + setgid sticky, so
-    # files created here inherit `cooklang` as their group even though
-    # the homelab-mcp user creates them. This keeps the cooklang
-    # systemd service (which reads them) happy.
-    systemd.tmpfiles.rules = [
-      "d ${cfg.recipesDir}/claude 2770 cooklang ${cfg.recipesGroup} -"
-    ];
-
     systemd.services.homelab-mcp = {
       description = "homelab-mcp server (Model Context Protocol)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      # Don't start until the recipes ZFS dataset is mounted; otherwise
-      # save_recipe would write into a tmpfs the cooklang service won't see.
-      unitConfig.RequiresMountsFor = [ cfg.recipesDir ];
 
       environment = {
         HOMELAB_MCP_BIND_ADDRESS = cfg.host;
@@ -258,10 +229,11 @@ in
         SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
         CapabilityBoundingSet = [ "" ];
 
-        # MCP server writes recipes under recipesDir; everything else is
-        # read-only via ProtectSystem=strict. StateDirectory above is
-        # implicitly added to ReadWritePaths.
-        ReadWritePaths = [ cfg.recipesDir ];
+        # The only writable location the service needs is its
+        # StateDirectory (/var/lib/homelab-mcp), which systemd adds to
+        # ReadWritePaths implicitly. Everything else stays read-only via
+        # ProtectSystem=strict — the cooklang tools write recipes over
+        # cook.holthome.net's HTTP API, not the local filesystem.
 
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         MemoryMax = "256M";

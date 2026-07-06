@@ -55,7 +55,7 @@ upstream to PocketID. Claude never touches PocketID directly.
 ## Contract conformance
 
 This server **conforms to [pocketid-mcp-as](https://github.com/carpenike/mcp-as-contract)
-v1.1, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.**
+v1.2, profile `jwt-refresh`, scope `mcp-only`, MCP path `/mcp`.**
 
 `pocketid-mcp-as` is the shared contract for the self-hosted MCP OAuth 2.1
 Authorization Servers that federate login to PocketID across several
@@ -68,11 +68,14 @@ profile (RS256 access tokens + rotating refresh tokens, publishes
 on the `/mcp` resource path), and keeps its original `/mcp` transport path.
 The path-suffixed RFC 9728 §3.3 PRM, its `resource`, and the §1.7
 `WWW-Authenticate` hint are all derived from the single `mcp_path` setting.
+(v1.2 added a redirect-URI hardening rule — parsed scheme+host+port match
+plus mandatory userinfo rejection — that this server originally reported and
+already satisfies.)
 
 Run the upstream conformance harness against a live AS. It's cloned fresh at
-the pinned tag (`contract/PINNED.json`) and run **unpatched** with the path
-flag — the v1.1.0 harness fixed the earlier subshell bug, so we no longer
-vendor or patch it:
+the pinned ref (`contract/PINNED.json`) and run **unpatched** with the path
+flag — the v1.2.0 harness adds the redirect-URI userinfo-bypass probe and the
+§1.7 challenge check, and we no longer vendor or patch it:
 
 ```bash
 make conformance ORIGIN=http://127.0.0.1:9200     # local dev
@@ -106,7 +109,7 @@ GitHub dependency) but the source carries no copy (the fetched files under
 step:
 
 ```bash
-make contract-pull REF=v1.1.0   # update the pinned ref; review PINNED.json diff
+make contract-pull REF=v1.2.0   # update the pinned ref; review PINNED.json diff
 ```
 
 The drift guard is **upstream-aware**: CI fetches `contract.json` from the
@@ -115,37 +118,33 @@ pinned tag on GitHub and asserts the live-served bytes deep-equal it
 
 ## Tools
 
+Tool names follow `<category>_<verb>_<object>`. Every tool returns a
+structured `{"error": {code, message, hint}}` payload on failure (never
+raises), and list-shaped tools report `{returned, total, truncated}`.
+
 | Category | Tool name | What it does |
 |----------|-----------|--------------|
-| Cooklang | `cooklang_list_recipes` | List your canonical cookbook (cook.holthome.net) with optional course/cuisine/tag/text filters |
-| Cooklang | `cooklang_get_recipe` | Fetch one recipe's metadata + ingredients/cookware/steps, by slug or path |
-| Cooklang | `cooklang_search_recipes` | Search YOUR recipes by name/metadata (opt-in ingredient matching) |
+| Cooklang | `cooklang_list_recipes` | Browse/search your canonical cookbook (cook.holthome.net) with optional course/cuisine/tag/free-text filters and opt-in `match_ingredients` ranking (absorbs the old separate search tool) |
+| Cooklang | `cooklang_get_recipe` | Fetch one recipe's metadata + ingredients/cookware/steps AND its raw `.cook` `source`, by slug or path |
 | Cooklang | `cooklang_create_recipe` | Author a NEW `.cook` (frontmatter + body); `derived_from` is first-class; fails on collision |
-| Cooklang | `cooklang_update_recipe` | Amend an existing recipe (parser-validated before overwrite); can also move/rename it via `new_folder`/`new_slug` |
+| Cooklang | `cooklang_update_recipe` | Amend an existing recipe (parser-validated before overwrite); `body` optional for metadata-only edits; can move/rename via `new_folder`/`new_slug` |
 | Cooklang | `cooklang_delete_recipe` | Permanently delete a recipe; previews the target unless `confirm=true` |
 | Cooklang | `cooklang_search_federation` | Search the federated index (your repo + ~60 community feeds) |
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |
 | Homelab | `homelab_get_endpoint_history` | Recent check history for one specific endpoint |
-| Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then set/add/consume in one call; price + store on `add` |
+| Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then `set`/`add`/`consume`/`open` in one call (by name, id, or `barcode`); price + store on `add`; `create_new` forces a new product past disambiguation |
 | Grocy | `grocy_find_products` | Find products by name across ALL master data ("do we have X?") |
-| Grocy | `grocy_list_stock` | Everything currently in stock with amount + next due date |
-| Grocy | `grocy_expiring` | Planning feed: due soon / overdue / expired / missing |
-| Grocy | `grocy_consume_product` | Consume/spoil primitive (by id or barcode) |
-| Grocy | `grocy_open_product` | Mark an amount of a product as opened (by id or barcode) |
-| Grocy | `grocy_ensure_location` | Idempotently create a storage location |
-| Grocy | `grocy_ensure_unit` | Idempotently create a quantity unit |
-| Grocy | `grocy_ensure_store` | Idempotently create/update a store (shopping location); optional `address` in a dedicated userfield |
+| Grocy | `grocy_attention` | Planning feed: `kind='expiring'` (due soon / overdue / expired) or `kind='below_minimum'` (quantity-driven restock), summarized (absorbs the old expiring + restock tools) |
+| Grocy | `grocy_stock_by_location` | On-hand stock grouped by storage location, or all stock when no location given (absorbs the old list-stock tool) |
+| Grocy | `grocy_product_card` | Enriched product detail: on-hand, min/below-min, price, shelf life, locations |
+| Grocy | `grocy_consumption_history` | Burn rate from the stock log (purchased/consumed/spoiled + rates); flags truncation |
+| Grocy | `grocy_stock_value` | Total inventory value, optionally by location + top-N products |
+| Grocy | `grocy_convert_units` | Convert an amount between units (product-specific → global → identity); lists defined conversions when no path exists |
+| Grocy | `grocy_set_unit_conversion` | Upsert a unit conversion (product-specific or global); write one direction |
+| Grocy | `grocy_ensure` | Idempotently create a `kind='location'`/`'unit'`/`'store'` (store takes an optional `address` userfield) — absorbs the three old ensure tools |
 | Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
 | Grocy | `grocy_health` | Connectivity + Grocy version check |
-| Grocy | `grocy_convert_units` | Convert an amount between units (product-specific → global → identity) |
-| Grocy | `grocy_product_card` | Enriched product detail: on-hand, min/below-min, price, shelf life, locations |
-| Grocy | `grocy_consumption_history` | Burn rate from the stock log (purchased/consumed/spoiled + rates) |
-| Grocy | `grocy_stock_value` | Total inventory value, optionally by location + top-N products |
-| Grocy | `grocy_restock_suggestions` | Quantity-driven below-minimum signal (vs. date-driven `grocy_expiring`) |
-| Grocy | `grocy_stock_by_location` | On-hand stock grouped by storage location |
-| Grocy | `grocy_set_unit_conversion` | Upsert a unit conversion (product-specific or global); write one direction |
-| Grocy | `grocy_list_unit_conversions` | Inspect defined conversions (global and/or per product) |
 
 ## Architecture
 
@@ -266,7 +265,6 @@ inputs.homelab-mcp = {
     #   HOMELAB_MCP_POCKETID_CLIENT_SECRET=...
     # Optionally:
     #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, PKCS#8, escaped \n>
-    #   HOMELAB_MCP_OAUTH_SESSION_SECRET=<32+ random bytes>
     environmentFile = config.sops.secrets."homelab-mcp/env".path;
   };
 }

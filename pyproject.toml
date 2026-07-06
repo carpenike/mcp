@@ -19,7 +19,9 @@ classifiers = [
 ]
 dependencies = [
     # Core MCP transport. streamable-http transport requires >= 1.10.
-    "mcp>=1.10",
+    # Cap below 2.0 so an unrelated major (with breaking API changes) can't
+    # float in and redline CI on a routine dependency resolution.
+    "mcp>=1.10,<2",
     "starlette>=0.41",
     "uvicorn[standard]>=0.32",
     # HTTP client for upstream APIs (cooklang, federation, gatus) AND
@@ -30,9 +32,6 @@ dependencies = [
     # (AuthorizationServer, AuthorizationCodeGrant) + its JOSE library
     # for RS256 JWT issuance and verification.
     "authlib>=1.6",
-    # Signed session cookies for the in-flight authorize state
-    # (correlates Claude's request with PocketID's callback).
-    "itsdangerous>=2.2",
     # JWT validation library, kept for the verifier path.
     "pyjwt[crypto]>=2.10",
     "cryptography>=43",

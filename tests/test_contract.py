@@ -28,6 +28,14 @@ requires_staged_contract = pytest.mark.skipif(
     reason="contract content not staged; run `make contract-pull` (or reinstall)",
 )
 
+# Derive the expected served version from the staged pin rather than hardcoding
+# it, so a contract pin bump doesn't require touching this test.
+STAGED_VERSION = (
+    str(json.loads((STAGED_DIR / "contract.json").read_text(encoding="utf-8")).get("version"))
+    if (STAGED_DIR / "contract.json").is_file()
+    else ""
+)
+
 pytestmark = requires_staged_contract
 
 
@@ -51,7 +59,7 @@ def test_contract_json_served_unauthenticated_with_correct_headers(settings: Set
     assert resp.headers["access-control-allow-origin"] == "*"
     assert resp.headers["cache-control"] == "public, max-age=300"
     assert resp.headers["content-type"] == "application/json"
-    assert resp.headers["x-contract-version"] == "1.1.0"
+    assert resp.headers["x-contract-version"] == STAGED_VERSION
 
 
 def test_contract_json_byte_matches_staged_copy(settings: Settings) -> None:
@@ -74,7 +82,7 @@ def test_contract_markdown_served_as_markdown(settings: Settings) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/markdown")
     assert resp.headers["access-control-allow-origin"] == "*"
-    assert resp.headers["x-contract-version"] == "1.1.0"
+    assert resp.headers["x-contract-version"] == STAGED_VERSION
     assert resp.text == (STAGED_DIR / "CONTRACT.md").read_text(encoding="utf-8")
 
 

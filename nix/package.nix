@@ -11,7 +11,6 @@
 , uvicorn
 , httpx
 , authlib
-, itsdangerous
 , pyjwt
 , cryptography
 , pydantic
@@ -24,18 +23,23 @@ let
   # Fetch-at-build supplies the pocketid-mcp-as contract content from GitHub
   # (single source of truth). The Nix sandbox has no network, so we pin the
   # contract repo here with a content hash and stage the files where
-  # hatch_build.py expects them; the hook then sees them present and skips its
-  # own network fetch. Keep `rev` in sync with contract/PINNED.json (.ref).
+  # hatch_build.py expects them; the hook then verifies their sha256 against
+  # contract/PINNED.json and, seeing a match, skips its own network fetch.
+  # `rev` MUST equal contract/PINNED.json `.ref` (the immutable commit SHA) —
+  # CI asserts this. This is v1.2.0 content pinned to the main commit it landed
+  # on (v1.2.0 was untagged at pin time; see PINNED.json `.tag`).
   contractSrc = fetchFromGitHub {
     owner = "carpenike";
     repo = "mcp-as-contract";
-    rev = "v1.1.0";
-    hash = "sha256-TCeq3AaIF6j4+x+GYgUOBDvQsMIVTlG+IbEKLG0m18M=";
+    rev = "7d9a8b40093cd169cf5d0e9ecc82be6cb64ece83";
+    hash = "sha256-HJRNBMPTw6z3ezt8aTvZAGU1PKycNaFoA1ctP8LKHTo=";
   };
 in
 buildPythonApplication {
   pname = "homelab-mcp";
-  version = "0.1.0";
+  # Keep in sync with pyproject.toml [project].version and
+  # src/homelab_mcp/__init__.py __version__.
+  version = "0.4.0";
 
   pyproject = true;
 
@@ -57,16 +61,20 @@ buildPythonApplication {
     uvicorn
     httpx
     authlib
-    itsdangerous
     pyjwt
     cryptography
     pydantic
     pydantic-settings
   ];
 
-  # Build-time identity baked into env vars. We don't have a runtime
-  # `--version` flag yet but the data is staged so a future status
-  # endpoint can surface it.
+  # Build-time identity, passed as *derivation* environment variables. NOTE:
+  # these exist only for the build process — they are NOT baked into the
+  # installed package and are invisible to the running server (systemd starts
+  # it with a clean environment). Surfacing them at runtime needs an app-side
+  # read (e.g. a /healthz or --version handler in src/ that reads a bundled
+  # data file or a compile-time constant); until that lands these are
+  # effectively inert. Left in place so that app-side work has the values
+  # available to wire through.
   HOMELAB_MCP_GIT_REV = gitRev;
   HOMELAB_MCP_BUILD_TIME = buildTime;
 

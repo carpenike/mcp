@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Annotated, Any
 
-import httpx
 from pydantic import Field
+
+from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -26,6 +27,8 @@ log = logging.getLogger(__name__)
 def register(mcp: FastMCP, settings: Settings) -> None:
     """Register homelab_* gatus-backed tools on the given MCP server."""
     base = settings.gatus_base_url.rstrip("/")
+    # One pooled client for the lifetime of the process (see _http.make_client).
+    client = make_client(timeout=15.0)
 
     # ── list endpoints + their current status ───────────────────────
     @mcp.tool(
@@ -40,13 +43,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ),
     )
     async def list_status() -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{base}/api/v1/endpoints/statuses")
-            resp.raise_for_status()
-            raw = resp.json()
+        try:
+            raw = await request_json(
+                client,
+                "GET",
+                f"{base}/api/v1/endpoints/statuses",
+                service="gatus",
+                unreachable_hint="Check HOMELAB_MCP_GATUS_BASE_URL and that gatus is up.",
+            )
+        except ToolError as err:
+            return err.payload()
 
         summary: list[dict[str, Any]] = []
-        for endpoint in raw:
+        for endpoint in raw or []:
             results = endpoint.get("results") or []
             latest = results[-1] if results else None
             uptime = endpoint.get("uptime") or {}
@@ -99,10 +108,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ],
         limit: Annotated[int, Field(ge=1, le=50)] = 20,
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{base}/api/v1/endpoints/{key}/statuses",
+        # `key` is client-supplied — encode it as a single path segment so a
+        # value like '../../other' can't rewrite the request path.
+        try:
+            data = await request_json(
+                client,
+                "GET",
+                f"{base}/api/v1/endpoints/{enc(key)}/statuses",
+                service="gatus",
                 params={"page": 1, "pageSize": limit},
+                unreachable_hint="Check HOMELAB_MCP_GATUS_BASE_URL and that gatus is up.",
             )
-            resp.raise_for_status()
-            return resp.json()  # type: ignore[no-any-return]
+        except ToolError as err:
+            return err.payload()
+        return {"key": key, "results": data}

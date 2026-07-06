@@ -68,7 +68,16 @@ def register_all(
         if modname.startswith("_"):
             continue
         full = f"{tools_pkg.__name__}.{modname}"
-        mod = import_module(full)
+        # Isolate each category: an import error or a raising register() in one
+        # module must not abort discovery of the others. A single broken
+        # category degrades to "that category is unavailable", not "the server
+        # has no tools".
+        try:
+            mod = import_module(full)
+        except Exception:
+            log.exception("tool module %s failed to import — skipping", full)
+            skipped.append(modname)
+            continue
         register_fn = getattr(mod, "register", None)
         if not callable(register_fn):
             log.warning("tool module %s has no register() function — skipping", full)
@@ -95,7 +104,12 @@ def register_all(
                 skipped.append(modname)
                 continue
             args.append(mint_token)
-        register_fn(*args)
+        try:
+            register_fn(*args)
+        except Exception:
+            log.exception("tool module %s register() raised — skipping", full)
+            skipped.append(modname)
+            continue
         registered.append(modname)
 
     if not registered:

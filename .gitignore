@@ -47,4 +47,5 @@ result-*
 # (see contract/PINNED.json). Never commit the contract content here.
 /contract/contract.json
 /contract/CONTRACT.md
+/contract/.ref
 /src/homelab_mcp/_vendored/

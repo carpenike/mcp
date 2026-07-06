@@ -70,10 +70,44 @@ jobs:
         run: bash scripts/conformance-ci.sh
 
   nix:
-    name: Nix flake check
+    name: Nix build + contract pin sync
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/determinate-nix-action@v3
-      - name: Flake check (eval + builds)
+
+      - name: Assert contract pin is in sync
+        # Cheap guard (no Nix eval): nix/package.nix must pin the same
+        # immutable commit SHA that contract/PINNED.json records as `.ref`,
+        # otherwise the Nix build stages different contract content than the
+        # pip/CI fetch path. Also rejects a non-SHA (mutable tag) pin.
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+
+          pinned = json.loads(pathlib.Path("contract/PINNED.json").read_text())
+          ref = pinned["ref"]
+
+          if not re.fullmatch(r"[0-9a-f]{40}", ref):
+              sys.exit(f"contract/PINNED.json ref={ref!r} is not a 40-char commit SHA; "
+                       "pin an immutable commit, not a mutable tag")
+
+          pkg = pathlib.Path("nix/package.nix").read_text()
+          m = re.search(r'rev\s*=\s*"([^"]+)"', pkg)
+          if not m:
+              sys.exit('could not find `rev = "..."` in nix/package.nix')
+          rev = m.group(1)
+
+          if rev != ref:
+              sys.exit(f"contract pin drift: nix/package.nix rev={rev!r} != "
+                       f"contract/PINNED.json ref={ref!r}")
+          print(f"OK: contract pin in sync at {rev}")
+          PY
+
+      - name: Flake check (eval)
         run: nix flake check --no-build --show-trace
+
+      - name: Build package (x86_64-linux)
+        # Actually build the derivation (fetches + stages the pinned contract
+        # and exercises hatch_build.py's integrity check), not just eval.
+        run: nix build .#packages.x86_64-linux.default --show-trace
