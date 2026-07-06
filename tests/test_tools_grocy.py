@@ -489,7 +489,9 @@ async def test_location_not_found(tools: dict[str, Any], fake: FakeGrocy) -> Non
 
 @pytest.mark.asyncio
 async def test_unit_not_found_on_create(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    await tools["grocy_ensure"](kind="location", name="Chest Freezer")  # location exists, unit does not
+    await tools["grocy_ensure"](
+        kind="location", name="Chest Freezer"
+    )  # location exists, unit does not
     res = await tools["grocy_stock_item"](
         name="ribeye", amount=1, location="Chest Freezer", unit="ton"
     )

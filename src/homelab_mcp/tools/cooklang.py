@@ -229,9 +229,7 @@ def _yaml_frontmatter(metadata: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _validate_frontmatter_input(
-    metadata: dict[str, Any] | None, *scalars: Any
-) -> ToolError | None:
+def _validate_frontmatter_input(metadata: dict[str, Any] | None, *scalars: Any) -> ToolError | None:
     """Reject caller-supplied frontmatter that could inject or corrupt YAML.
 
     Guards the write path against frontmatter injection: user-supplied metadata
@@ -550,7 +548,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     else:
                         unmatched.append(entry)
                 if match_ingredients and unmatched:
-                    matched.extend(await _scan_ingredients(unmatched[:_MAX_INGREDIENT_SCAN], tokens))
+                    matched.extend(
+                        await _scan_ingredients(unmatched[:_MAX_INGREDIENT_SCAN], tokens)
+                    )
                 matched.sort(key=lambda r: (-int(r.get("_score", 0)), str(r.get("title") or "")))
                 selected = matched
             else:
@@ -844,15 +844,11 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         try:
             relpath = await _resolve_to_path(slug)
             if relpath is None:
-                return ToolError(
-                    "recipe_not_found", f"No recipe found for {slug!r}.", ""
-                ).payload()
+                return ToolError("recipe_not_found", f"No recipe found for {slug!r}.", "").payload()
 
             current = await _fetch_recipe(relpath)
             if current.status_code != 200:
-                return ToolError(
-                    "recipe_not_found", f"No recipe found for {slug!r}.", ""
-                ).payload()
+                return ToolError("recipe_not_found", f"No recipe found for {slug!r}.", "").payload()
             current_data = _decode(current)
             current_meta = _normalize_metadata(
                 current_data.get("recipe", {}).get("metadata")
@@ -991,16 +987,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         try:
             relpath = await _resolve_to_path(slug)
             if relpath is None:
-                return ToolError(
-                    "recipe_not_found", f"No recipe found for {slug!r}.", ""
-                ).payload()
+                return ToolError("recipe_not_found", f"No recipe found for {slug!r}.", "").payload()
 
             # Read the title for a human-meaningful preview/confirmation.
             current = await _fetch_recipe(relpath)
             if current.status_code != 200:
-                return ToolError(
-                    "recipe_not_found", f"No recipe found for {slug!r}.", ""
-                ).payload()
+                return ToolError("recipe_not_found", f"No recipe found for {slug!r}.", "").payload()
             current_data = _decode(current)
             meta = _normalize_metadata(
                 current_data.get("recipe", {}).get("metadata")

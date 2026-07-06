@@ -695,9 +695,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     )
     async def ensure(
         name: Annotated[str, Field(min_length=1, description="Object name to ensure.")],
-        kind: Annotated[
-            str, Field(description="'location' | 'unit' | 'store'.")
-        ] = "location",
+        kind: Annotated[str, Field(description="'location' | 'unit' | 'store'.")] = "location",
         description: Annotated[
             str | None, Field(default=None, description="location/store: optional description.")
         ] = None,
@@ -1450,8 +1448,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         )
         if truncated:
             note += (
-                f" NOTE: stock log capped at {_MAX_LOG_ROWS} rows — totals/rates "
-                "may undercount."
+                f" NOTE: stock log capped at {_MAX_LOG_ROWS} rows — totals/rates may undercount."
             )
         return {
             "product": prod,

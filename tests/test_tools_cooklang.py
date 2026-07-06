@@ -424,9 +424,7 @@ async def test_list_recipes_match_ingredients(tools: dict[str, Any], fake: FakeC
     assert deep["recipes"][0]["slug"] == "caprese-diem-kabobs"
 
 
-async def test_temp_artifacts_filtered_from_listings(
-    tools: dict[str, Any], fake: FakeCook
-) -> None:
+async def test_temp_artifacts_filtered_from_listings(tools: dict[str, Any], fake: FakeCook) -> None:
     # An orphaned validation artifact must never surface in a listing.
     fake.store["claude/zz-tmp-orphan"] = _SEED["Appetizers/Caprese Diem Kabobs"]
     res = await tools["cooklang_list_recipes"]()
