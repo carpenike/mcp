@@ -259,6 +259,13 @@ class FakeCook:
             if relpath.endswith(".cook"):
                 relpath = relpath[:-5]
             if method == "GET":
+                if request.url.params.get("format") == "raw":
+                    content = self.store.get(relpath)
+                    if content is None:
+                        return httpx.Response(404, json={"error": f"not found: {relpath}"})
+                    return httpx.Response(
+                        200, text=content, headers={"content-type": "text/plain; charset=utf-8"}
+                    )
                 return self._get(relpath)
             if method == "PUT":
                 self.store[relpath] = request.content.decode("utf-8")
@@ -377,7 +384,9 @@ def fake(httpx_mock: Any) -> FakeCook:
 # ─────────────────────────────────────────────────────────────────────────
 async def test_list_recipes(tools: dict[str, Any], fake: FakeCook) -> None:
     res = await tools["cooklang_list_recipes"]()
-    assert res["count"] == 2
+    assert res["returned"] == 2
+    assert res["total"] == 2
+    assert res["truncated"] is False
     slugs = {r["slug"] for r in res["recipes"]}
     assert "calvados-glazed-pork-belly-bites" in slugs
     paths = {r["path"] for r in res["recipes"]}
@@ -386,11 +395,53 @@ async def test_list_recipes(tools: dict[str, Any], fake: FakeCook) -> None:
 
 async def test_list_recipes_filters(tools: dict[str, Any], fake: FakeCook) -> None:
     by_cuisine = await tools["cooklang_list_recipes"](cuisine="french")
-    assert by_cuisine["count"] == 1
+    assert by_cuisine["returned"] == 1
     by_tag = await tools["cooklang_list_recipes"](tag="griddle")
-    assert by_tag["count"] == 1
+    assert by_tag["returned"] == 1
     by_query = await tools["cooklang_list_recipes"](query="caprese")
-    assert by_query["count"] == 1
+    assert by_query["returned"] == 1
+
+
+async def test_list_recipes_truncation_contract(tools: dict[str, Any], fake: FakeCook) -> None:
+    res = await tools["cooklang_list_recipes"](limit=1)
+    assert res["returned"] == 1
+    assert res["total"] == 2
+    assert res["truncated"] is True
+
+
+async def test_list_recipes_ranked_query(tools: dict[str, Any], fake: FakeCook) -> None:
+    res = await tools["cooklang_list_recipes"](query="pork smoker")
+    assert res["returned"] >= 1
+    assert res["recipes"][0]["slug"] == "calvados-glazed-pork-belly-bites"
+
+
+async def test_list_recipes_match_ingredients(tools: dict[str, Any], fake: FakeCook) -> None:
+    # Ingredient-only match: not found in metadata, found with the opt-in scan.
+    shallow = await tools["cooklang_list_recipes"](query="mozzarella")
+    assert shallow["returned"] == 0
+    deep = await tools["cooklang_list_recipes"](query="mozzarella", match_ingredients=True)
+    assert deep["returned"] == 1
+    assert deep["recipes"][0]["slug"] == "caprese-diem-kabobs"
+
+
+async def test_temp_artifacts_filtered_from_listings(
+    tools: dict[str, Any], fake: FakeCook
+) -> None:
+    # An orphaned validation artifact must never surface in a listing.
+    fake.store["claude/zz-tmp-orphan"] = _SEED["Appetizers/Caprese Diem Kabobs"]
+    res = await tools["cooklang_list_recipes"]()
+    assert res["returned"] == 2
+    assert not any("zz-tmp-" in r["path"] for r in res["recipes"])
+
+
+async def test_non_json_upstream_returns_structured_error(
+    tools: dict[str, Any], httpx_mock: Any
+) -> None:
+    # A proxy/SSO 200 HTML page must map to a structured error, never a raise.
+    httpx_mock.add_response(status_code=200, text="<html>login</html>", is_reusable=True)
+    res = await tools["cooklang_list_recipes"]()
+    assert "error" in res
+    assert res["error"]["code"].startswith("cooklang_http")
 
 
 async def test_get_recipe_by_path(tools: dict[str, Any], fake: FakeCook) -> None:
@@ -401,6 +452,15 @@ async def test_get_recipe_by_path(tools: dict[str, Any], fake: FakeCook) -> None
     assert any(c["name"] == "smoker" for c in res["cookware"])
 
 
+async def test_get_recipe_exposes_source(tools: dict[str, Any], fake: FakeCook) -> None:
+    # get_recipe must return the raw `.cook` source so the model can edit it
+    # without reconstructing (and losing formatting).
+    res = await tools["cooklang_get_recipe"](identifier="calvados-glazed-pork-belly-bites")
+    assert res["source"] is not None
+    assert "@pork belly{1%kg}" in res["source"]
+    assert res["source"].startswith("---\n")
+
+
 async def test_get_recipe_by_slug(tools: dict[str, Any], fake: FakeCook) -> None:
     # Slug does not resolve a direct GET; resolver must fall back to the tree.
     res = await tools["cooklang_get_recipe"](identifier="calvados-glazed-pork-belly-bites")
@@ -409,21 +469,13 @@ async def test_get_recipe_by_slug(tools: dict[str, Any], fake: FakeCook) -> None
 
 async def test_get_recipe_not_found(tools: dict[str, Any], fake: FakeCook) -> None:
     res = await tools["cooklang_get_recipe"](identifier="does-not-exist")
-    assert res["error"] == "recipe not found"
+    assert res["error"]["code"] == "recipe_not_found"
 
 
-async def test_search_recipes_by_metadata(tools: dict[str, Any], fake: FakeCook) -> None:
-    res = await tools["cooklang_search_recipes"](query="pork smoker")
-    assert res["count"] >= 1
-    assert res["recipes"][0]["slug"] == "calvados-glazed-pork-belly-bites"
-
-
-async def test_search_recipes_by_ingredient(tools: dict[str, Any], fake: FakeCook) -> None:
-    shallow = await tools["cooklang_search_recipes"](query="mozzarella")
-    assert shallow["count"] == 0
-    deep = await tools["cooklang_search_recipes"](query="mozzarella", match_ingredients=True)
-    assert deep["count"] == 1
-    assert deep["recipes"][0]["slug"] == "caprese-diem-kabobs"
+async def test_search_recipes_tool_removed(tools: dict[str, Any]) -> None:
+    # cooklang_search_recipes was merged into cooklang_list_recipes.
+    assert "cooklang_search_recipes" not in tools
+    assert "cooklang_list_recipes" in tools
 
 
 async def test_create_recipe_happy_path(tools: dict[str, Any], fake: FakeCook) -> None:
@@ -448,7 +500,7 @@ async def test_create_recipe_happy_path(tools: dict[str, Any], fake: FakeCook) -
 async def test_create_recipe_rejects_collision(tools: dict[str, Any], fake: FakeCook) -> None:
     fake.store["claude/dup"] = _SEED["Appetizers/Caprese Diem Kabobs"]
     res = await tools["cooklang_create_recipe"](title="Dup", slug="dup", body="Mix @water{1%cup}.")
-    assert res["error"] == "recipe already exists"
+    assert res["error"]["code"] == "recipe_exists"
 
 
 async def test_create_recipe_overwrite(tools: dict[str, Any], fake: FakeCook) -> None:
@@ -463,8 +515,34 @@ async def test_create_recipe_invalid_slug(tools: dict[str, Any], fake: FakeCook)
     res = await tools["cooklang_create_recipe"](
         title="Bad", slug="../escape", body="Mix @water{1%cup}."
     )
-    assert res["error"] == "invalid slug"
+    assert res["error"]["code"] == "invalid_slug"
     assert "../escape" not in str(list(fake.store.keys()))
+
+
+async def test_create_recipe_rejects_metadata_key_injection(
+    tools: dict[str, Any], fake: FakeCook
+) -> None:
+    # A metadata KEY carrying a newline + a second frontmatter line must be
+    # rejected before any write (YAML frontmatter injection).
+    res = await tools["cooklang_create_recipe"](
+        title="Bad",
+        slug="badmeta",
+        body="Mix @water{1%cup}.",
+        metadata={"foo: x\nsource": "evil"},
+    )
+    assert res["error"]["code"] == "invalid_metadata_key"
+    assert "claude/badmeta" not in fake.store
+
+
+async def test_create_recipe_rejects_metadata_value_newline(
+    tools: dict[str, Any], fake: FakeCook
+) -> None:
+    # A VALUE with a literal newline (here via the title) must be rejected.
+    res = await tools["cooklang_create_recipe"](
+        title="Bad\nid: evil", slug="badval", body="Mix @water{1%cup}."
+    )
+    assert res["error"]["code"] == "invalid_metadata_value"
+    assert "claude/badval" not in fake.store
 
 
 async def test_create_recipe_rejects_traversal_folder(
@@ -473,17 +551,17 @@ async def test_create_recipe_rejects_traversal_folder(
     res = await tools["cooklang_create_recipe"](
         title="Bad", slug="ok", folder="../../etc", body="Mix @water{1%cup}."
     )
-    assert res["error"] == "invalid folder"
+    assert res["error"]["code"] == "invalid_folder"
 
 
 async def test_create_recipe_empty_body(tools: dict[str, Any], fake: FakeCook) -> None:
     res = await tools["cooklang_create_recipe"](title="Empty", slug="empty", body="   ")
-    assert res["error"] == "empty body"
+    assert res["error"]["code"] == "empty_body"
 
 
 async def test_update_recipe_not_found(tools: dict[str, Any], fake: FakeCook) -> None:
     res = await tools["cooklang_update_recipe"](slug="ghost", body="Mix @water{1%cup}.")
-    assert res["error"] == "recipe not found"
+    assert res["error"]["code"] == "recipe_not_found"
 
 
 async def test_update_recipe_merges_metadata(tools: dict[str, Any], fake: FakeCook) -> None:
@@ -500,6 +578,25 @@ async def test_update_recipe_merges_metadata(tools: dict[str, Any], fake: FakeCo
     assert "derived_from" in stored
     assert 'course: "main"' in stored  # preserved
     assert "2%L" in stored  # body replaced
+
+
+async def test_update_recipe_metadata_only_reuses_source(
+    tools: dict[str, Any], fake: FakeCook
+) -> None:
+    # With body omitted, the current raw source is reused so the body (incl.
+    # its formatting) is preserved while only metadata changes.
+    fake.store["claude/keep-body"] = (
+        "---\n"
+        'title: "Keep Body"\n'
+        'id: "keep-body"\n'
+        "---\n\n"
+        "Simmer @sauce{1%cup} slowly and precisely.\n"
+    )
+    res = await tools["cooklang_update_recipe"](slug="keep-body", metadata={"course": "main"})
+    assert res["ok"] is True
+    stored = fake.store["claude/keep-body"]
+    assert "Simmer @sauce{1%cup} slowly and precisely." in stored  # body preserved
+    assert 'course: "main"' in stored  # metadata added
 
 
 async def test_update_recipe_moves_to_new_folder(tools: dict[str, Any], fake: FakeCook) -> None:
@@ -537,7 +634,7 @@ async def test_update_recipe_move_collision_guarded(tools: dict[str, Any], fake:
     blocked = await tools["cooklang_update_recipe"](
         slug="claude/mover", body="Boil @water{1%L}.", new_folder="Smoker"
     )
-    assert blocked["error"] == "destination already exists"
+    assert blocked["error"]["code"] == "destination_exists"
     assert "claude/mover" in fake.store  # original untouched
     # With overwrite it succeeds and removes the original.
     ok = await tools["cooklang_update_recipe"](
@@ -554,11 +651,11 @@ async def test_update_recipe_rejects_bad_move_targets(
     bad_folder = await tools["cooklang_update_recipe"](
         slug="safe", body="Boil @water{1%L}.", new_folder="../../etc"
     )
-    assert bad_folder["error"] == "invalid folder"
+    assert bad_folder["error"]["code"] == "invalid_folder"
     bad_slug = await tools["cooklang_update_recipe"](
         slug="safe", body="Boil @water{1%L}.", new_slug="../escape"
     )
-    assert bad_slug["error"] == "invalid slug"
+    assert bad_slug["error"]["code"] == "invalid_slug"
     # Nothing escaped the recipe tree.
     assert not any(".." in k for k in fake.store)
 
@@ -587,7 +684,7 @@ async def test_delete_recipe_confirmed(tools: dict[str, Any], fake: FakeCook) ->
 
 async def test_delete_recipe_not_found(tools: dict[str, Any], fake: FakeCook) -> None:
     res = await tools["cooklang_delete_recipe"](slug="ghost", confirm=True)
-    assert res["error"] == "recipe not found"
+    assert res["error"]["code"] == "recipe_not_found"
 
 
 async def test_create_recipe_validation_failure_no_write(
@@ -599,11 +696,12 @@ async def test_create_recipe_validation_failure_no_write(
     res = await tools["cooklang_create_recipe"](
         title="Will Fail", slug="will-fail", body="Mix @water{1%cup}."
     )
-    assert res["error"] == "recipe failed CookLang parser validation"
+    assert res["error"]["code"] == "validation_failed"
     assert "claude/will-fail" not in fake.store
     assert not any(k.startswith("claude/zz-tmp-") for k in fake.store)
 
 
-async def test_search_empty_query(tools: dict[str, Any], fake: FakeCook) -> None:
-    res = await tools["cooklang_search_recipes"](query="   ")
-    assert res["error"] == "empty query"
+async def test_list_recipes_blank_query_lists_all(tools: dict[str, Any], fake: FakeCook) -> None:
+    # A blank query is no longer an error — it just lists everything.
+    res = await tools["cooklang_list_recipes"](query="   ")
+    assert res["returned"] == 2
