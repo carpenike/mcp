@@ -108,6 +108,11 @@ class FakeGrocy:
 
         url = urlsplit(str(request.url))
         path, method = url.path, request.method
+        # The Grocy REST API is mounted under /api; the tools now always route
+        # through {base}/api{path}. Strip that prefix so the router below can
+        # match on the real API path shape (/objects/…, /stock/…).
+        if path.startswith("/api/"):
+            path = path[len("/api") :]
         qs = parse_qs(url.query)
         body = json.loads(request.content) if request.content else {}
 
@@ -142,6 +147,21 @@ class FakeGrocy:
                     "missing_products": [],
                 },
             )
+
+        # /objects/stock — synthesized stock entries (product_id + location).
+        if path == "/objects/stock" and method == "GET":
+            out = [
+                {
+                    "product_id": p["id"],
+                    "amount": self.stock.get(p["id"], 0),
+                    "location_id": p.get("location_id"),
+                    "best_before_date": "2026-12-01",
+                    "price": None,
+                }
+                for p in self.products
+                if self.stock.get(p["id"], 0) > 0
+            ]
+            return httpx.Response(200, json=out)
 
         # /objects/{entity}
         m = re.match(r"^/objects/(\w+)$", path)
@@ -212,6 +232,11 @@ class FakeGrocy:
                 self.stock[pid] = cur - want
             return httpx.Response(200, json=[{"id": 1}])
 
+        # By-barcode stock actions (consume/open via grocy_stock_item barcode).
+        m = re.match(r"^/stock/products/by-barcode/([^/]+)/(consume|open|add|inventory)$", path)
+        if m and method == "POST":
+            return httpx.Response(200, json=[{"id": 1}])
+
         return httpx.Response(404, json={"error_message": f"unhandled {method} {path}"})
 
 
@@ -276,15 +301,32 @@ async def test_health_version_shapes(
 
 
 @pytest.mark.asyncio
-async def test_health_uses_api_route_then_falls_back(
+async def test_health_default_base_reaches_api(tools: dict[str, Any], httpx_mock: Any) -> None:
+    """F3 regression: the configured base has NO /api suffix, yet the tool must
+    route system-info to {base}/api/system/info out of the box. If normalization
+    regressed to hitting the bare /system/info route this mock would go
+    unmatched and health would report a connect error."""
+    httpx_mock.add_response(
+        url=f"{BASE}/api/system/info", json={"grocy_version": {"Version": "4.6.0"}}
+    )
+    res = await tools["grocy_health"]()
+    assert res["ok"] is True
+    assert res["grocy_version"] == "4.6.0"
+
+
+@pytest.mark.asyncio
+async def test_health_api_route_404_surfaces_raw_no_fallback(
     tools: dict[str, Any], httpx_mock: Any
 ) -> None:
-    """If /api/system/info is wrong for the deployment (404/redirect), fall back
-    to the legacy /system/info path rather than reporting null."""
+    """A 404 on the (single) API route surfaces the raw status — the old
+    double-/api fallback hack is gone, so no second request is made."""
     httpx_mock.add_response(url=f"{BASE}/api/system/info", status_code=404, json={})
-    httpx_mock.add_response(url=f"{BASE}/system/info", json={"grocy_version": {"Version": "4.6.0"}})
     res = await tools["grocy_health"]()
-    assert res["grocy_version"] == "4.6.0"
+    assert res["ok"] is True
+    assert res["grocy_version"] is None
+    assert res["raw_system_info"]["status"] == 404
+    # Only the API route was probed — no bare /system/info fallback.
+    assert [urlsplit(str(r.url)).path for r in httpx_mock.get_requests()] == ["/api/system/info"]
 
 
 @pytest.mark.asyncio
@@ -296,7 +338,7 @@ async def test_health_unknown_shape_echoes_raw(tools: dict[str, Any], httpx_mock
     res = await tools["grocy_health"]()
     assert res["ok"] is True
     assert res["grocy_version"] is None
-    assert res["raw_system_info"]["path"] == "/api/system/info"
+    assert res["raw_system_info"]["path"] == "/system/info"
     assert res["raw_system_info"]["status"] == 200
     assert res["raw_system_info"]["json"] == payload
 
@@ -331,7 +373,7 @@ async def test_health_empty_body_reports_raw_status(tools: dict[str, Any], httpx
     res = await tools["grocy_health"]()
     assert res["ok"] is True
     assert res["grocy_version"] is None
-    assert res["raw_system_info"]["path"] == "/api/system/info"
+    assert res["raw_system_info"]["path"] == "/system/info"
     assert res["raw_system_info"]["status"] == 200
     assert res["raw_system_info"]["json"] is None
     assert res["raw_system_info"]["body_excerpt"] == ""
@@ -349,12 +391,12 @@ async def test_seed_defaults_is_idempotent(tools: dict[str, Any], fake: FakeGroc
 
 @pytest.mark.asyncio
 async def test_ensure_location_and_unit(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    a = await tools["grocy_ensure_location"](name="Chest Freezer")
+    a = await tools["grocy_ensure"](kind="location", name="Chest Freezer")
     assert a["created"] is True
-    b = await tools["grocy_ensure_location"](name="chest freezer")  # case-insensitive
+    b = await tools["grocy_ensure"](kind="location", name="chest freezer")  # case-insensitive
     assert b["created"] is False
     assert b["id"] == a["id"]
-    u = await tools["grocy_ensure_unit"](name="count")
+    u = await tools["grocy_ensure"](kind="unit", name="count")
     assert u["created"] is True
 
 
@@ -365,8 +407,11 @@ async def test_ensure_location_and_unit(tools: dict[str, Any], fake: FakeGrocy) 
 async def test_cold_instance_acceptance_loop(tools: dict[str, Any], fake: FakeGrocy) -> None:
     # 2. seed
     await tools["grocy_seed_defaults"]()
-    # 3. empty stock
-    assert (await tools["grocy_list_stock"]())["count"] == 0
+    # 3. empty stock (grocy_stock_by_location with no filter is the 'what do we
+    #    have?' view that absorbed the old grocy_list_stock)
+    empty = await tools["grocy_stock_by_location"]()
+    assert empty["returned"] == 0
+    assert empty["locations"] == []
     # 4. create + set ribeye to 2
     r = await tools["grocy_stock_item"](
         name="ribeye",
@@ -392,9 +437,10 @@ async def test_cold_instance_acceptance_loop(tools: dict[str, Any], fake: FakeGr
         name="ribeye", amount=1, action="consume", location="Chest Freezer"
     )
     assert r3["resulting_amount_on_hand"] == 0
-    # 8. expiring feed reachable + structured
-    exp = await tools["grocy_expiring"](days=365)
-    assert set(exp) >= {"due_products", "overdue_products", "expired_products", "missing_products"}
+    # 8. attention feed reachable + structured (absorbed grocy_expiring)
+    exp = await tools["grocy_attention"](kind="expiring", days=365)
+    assert exp["kind"] == "expiring"
+    assert isinstance(exp["items"], list)
     # 9. still exactly one product
     assert len(fake.products) == 1
 
@@ -443,7 +489,7 @@ async def test_location_not_found(tools: dict[str, Any], fake: FakeGrocy) -> Non
 
 @pytest.mark.asyncio
 async def test_unit_not_found_on_create(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    await tools["grocy_ensure_location"](name="Chest Freezer")  # location exists, unit does not
+    await tools["grocy_ensure"](kind="location", name="Chest Freezer")  # location exists, unit does not
     res = await tools["grocy_stock_item"](
         name="ribeye", amount=1, location="Chest Freezer", unit="ton"
     )
@@ -461,7 +507,7 @@ async def test_unknown_action(tools: dict[str, Any], fake: FakeGrocy) -> None:
     res = await tools["grocy_stock_item"](
         name="ribeye", amount=1, location="Chest Freezer", action="frobnicate"
     )
-    assert res["error"]["code"] == "amount_invalid"
+    assert res["error"]["code"] == "action_invalid"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -549,7 +595,7 @@ async def test_create_within_priced_add_sets_price_unit(
     create = next(
         json.loads(r.content)
         for r in fake.requests
-        if r.method == "POST" and r.url.path == "/objects/products"
+        if r.method == "POST" and r.url.path.endswith("/objects/products")
     )
     assert create["qu_id_price"] == create["qu_id_stock"]
     assert create["qu_id_consume"] == create["qu_id_stock"]
@@ -613,11 +659,11 @@ async def test_add_without_price_is_backward_compatible(
 
 @pytest.mark.asyncio
 async def test_ensure_store_idempotent(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    a = await tools["grocy_ensure_store"](name="Costco")
+    a = await tools["grocy_ensure"](kind="store", name="Costco")
     assert a["created"] is True
     assert a["address"] is None
     assert a["updated"] is False
-    b = await tools["grocy_ensure_store"](name="costco")  # case-insensitive
+    b = await tools["grocy_ensure"](kind="store", name="costco")  # case-insensitive
     assert b["created"] is False
     assert b["id"] == a["id"]
 
@@ -625,7 +671,7 @@ async def test_ensure_store_idempotent(tools: dict[str, Any], fake: FakeGrocy) -
 @pytest.mark.asyncio
 async def test_ensure_store_address_on_create(tools: dict[str, Any], fake: FakeGrocy) -> None:
     addr = "6316 Mount Phillip Road, Frederick, MD 21703"
-    res = await tools["grocy_ensure_store"](name="Stone Pillar Farm", address=addr)
+    res = await tools["grocy_ensure"](kind="store", name="Stone Pillar Farm", address=addr)
     assert res["created"] is True
     assert res["address"] == addr
     # The address lives in a userfield, NOT the store's description column.
@@ -637,9 +683,9 @@ async def test_ensure_store_address_on_create(tools: dict[str, Any], fake: FakeG
 @pytest.mark.asyncio
 async def test_ensure_store_address_not_clobbered(tools: dict[str, Any], fake: FakeGrocy) -> None:
     addr = "123 Farm Rd"
-    await tools["grocy_ensure_store"](name="Farm", address=addr)
+    await tools["grocy_ensure"](kind="store", name="Farm", address=addr)
     # Re-run with no address: must not wipe the existing one.
-    res = await tools["grocy_ensure_store"](name="farm")
+    res = await tools["grocy_ensure"](kind="store", name="farm")
     assert res["created"] is False
     assert res["updated"] is False
     assert res["address"] == addr
@@ -647,10 +693,10 @@ async def test_ensure_store_address_not_clobbered(tools: dict[str, Any], fake: F
 
 @pytest.mark.asyncio
 async def test_ensure_store_backfills_existing(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    first = await tools["grocy_ensure_store"](name="Market")  # no address
+    first = await tools["grocy_ensure"](kind="store", name="Market")  # no address
     assert first["created"] is True
     assert first["address"] is None
-    res = await tools["grocy_ensure_store"](name="Market", address="1 Main St")
+    res = await tools["grocy_ensure"](kind="store", name="Market", address="1 Main St")
     assert res["created"] is False
     assert res["updated"] is True
     assert res["address"] == "1 Main St"
@@ -658,12 +704,12 @@ async def test_ensure_store_backfills_existing(tools: dict[str, Any], fake: Fake
 
 @pytest.mark.asyncio
 async def test_ensure_store_updates_changed_address(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    await tools["grocy_ensure_store"](name="Shop", address="old")
-    res = await tools["grocy_ensure_store"](name="Shop", address="new")
+    await tools["grocy_ensure"](kind="store", name="Shop", address="old")
+    res = await tools["grocy_ensure"](kind="store", name="Shop", address="new")
     assert res["updated"] is True
     assert res["address"] == "new"
     # Same address again → no update.
-    again = await tools["grocy_ensure_store"](name="Shop", address="new")
+    again = await tools["grocy_ensure"](kind="store", name="Shop", address="new")
     assert again["updated"] is False
 
 
@@ -671,8 +717,8 @@ async def test_ensure_store_updates_changed_address(tools: dict[str, Any], fake:
 async def test_ensure_store_description_separate_from_address(
     tools: dict[str, Any], fake: FakeGrocy
 ) -> None:
-    res = await tools["grocy_ensure_store"](
-        name="Co-op", address="500 Elm St", description="Members-only, cash preferred"
+    res = await tools["grocy_ensure"](
+        kind="store", name="Co-op", address="500 Elm St", description="Members-only, cash preferred"
     )
     assert res["created"] is True
     assert res["address"] == "500 Elm St"
@@ -687,12 +733,12 @@ async def test_ensure_store_description_separate_from_address(
 async def test_ensure_store_description_backfill_no_clobber(
     tools: dict[str, Any], fake: FakeGrocy
 ) -> None:
-    await tools["grocy_ensure_store"](name="Bodega")  # no description
-    r1 = await tools["grocy_ensure_store"](name="Bodega", description="Open late")
+    await tools["grocy_ensure"](kind="store", name="Bodega")  # no description
+    r1 = await tools["grocy_ensure"](kind="store", name="Bodega", description="Open late")
     assert r1["updated"] is True
     assert r1["description"] == "Open late"
     # Re-run with no description must not wipe it.
-    r2 = await tools["grocy_ensure_store"](name="Bodega")
+    r2 = await tools["grocy_ensure"](kind="store", name="Bodega")
     assert r2["updated"] is False
     assert r2["description"] == "Open late"
 
@@ -714,27 +760,50 @@ async def test_consume_over_stock_surfaces_http_error(
 async def test_missing_api_key_short_circuits(httpx_mock: Any) -> None:
     mcp = CapturingMCP()
     register(mcp, _settings(api_key=""))  # type: ignore[arg-type]
-    res = await mcp.tools["grocy_list_stock"]()
+    res = await mcp.tools["grocy_stock_by_location"]()
     assert res["error"]["code"] == "grocy_unreachable"
     assert not httpx_mock.get_requests()
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Primitives
+# Consume / open via the merged grocy_stock_item (absorbed the standalone
+# grocy_consume_product / grocy_open_product primitives)
 # ─────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_consume_primitive_requires_one_identifier(tools: dict[str, Any]) -> None:
-    both = await tools["grocy_consume_product"](product_id=1, barcode="x")
-    neither = await tools["grocy_consume_product"]()
-    assert both["error"]["code"] == "amount_invalid"
-    assert neither["error"]["code"] == "amount_invalid"
+async def test_stock_item_consume_by_product_id(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    await tools["grocy_seed_defaults"]()
+    created = await tools["grocy_stock_item"](
+        name="butter", amount=3, location="Kitchen Fridge", unit="count"
+    )
+    pid = created["product"]["id"]
+    # Consume by product_id, no location required.
+    res = await tools["grocy_stock_item"](product_id=pid, amount=1, action="consume")
+    assert res["action_taken"] == "consume"
+    assert res["resulting_amount_on_hand"] == 2
 
 
 @pytest.mark.asyncio
-async def test_open_primitive_by_barcode_is_encoded(tools: dict[str, Any], fake: FakeGrocy) -> None:
-    await tools["grocy_open_product"](barcode="../x", amount=1)
+async def test_stock_item_open_by_barcode_is_encoded(
+    tools: dict[str, Any], fake: FakeGrocy
+) -> None:
+    res = await tools["grocy_stock_item"](barcode="../x", amount=1, action="open")
+    assert res["action_taken"] == "open"
     path = urlsplit(str(fake.requests[-1].url)).path
-    assert path == "/stock/products/by-barcode/..%2Fx/open"
+    assert path == "/api/stock/products/by-barcode/..%2Fx/open"
+
+
+@pytest.mark.asyncio
+async def test_stock_item_barcode_rejected_for_set(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_stock_item"](
+        barcode="abc", amount=1, action="set", location="Chest Freezer"
+    )
+    assert res["error"]["code"] == "identifier_invalid"
+
+
+@pytest.mark.asyncio
+async def test_stock_item_barcode_and_name_conflict(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_stock_item"](barcode="abc", name="ribeye", amount=1, action="consume")
+    assert res["error"]["code"] == "identifier_invalid"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -837,6 +906,8 @@ class SeededGrocy:
 
         url = urlsplit(str(request.url))
         path = url.path
+        if path.startswith("/api/"):
+            path = path[len("/api") :]
         conds = parse_qs(url.query).get("query[]", [])
 
         if path == "/system/info":
@@ -1002,17 +1073,51 @@ async def test_stock_value_by_location(tools: dict[str, Any], seeded: SeededGroc
 
 
 @pytest.mark.asyncio
-async def test_restock_suggestions(tools: dict[str, Any], seeded: SeededGrocy) -> None:
-    res = await tools["grocy_restock_suggestions"]()
-    assert res["below_minimum"] == [
+async def test_attention_below_minimum(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_attention"](kind="below_minimum")
+    assert res["kind"] == "below_minimum"
+    assert res["items"] == [
         {
-            "product": "Ribeye",
+            "product_id": 1,
+            "name": "Ribeye",
             "on_hand": 2,
             "min_stock": 5,
             "shortfall": 3,
             "default_location": "Chest Freezer",
+            "bucket": "below_minimum",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_attention_expiring_is_summarized(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_attention"](kind="expiring", days=30)
+    assert res["kind"] == "expiring"
+    # Projected to a compact summary — not the raw ~30-field volatile rows.
+    assert res["items"] == [
+        {
+            "product_id": None,
+            "name": "Ribeye",
+            "amount": None,
+            "due_date": "2026-12-01",
+            "days_until_due": res["items"][0]["days_until_due"],
+            "bucket": "due_soon",
+        }
+    ]
+    assert set(res["items"][0]) == {
+        "product_id",
+        "name",
+        "amount",
+        "due_date",
+        "days_until_due",
+        "bucket",
+    }
+
+
+@pytest.mark.asyncio
+async def test_attention_invalid_kind(tools: dict[str, Any], seeded: SeededGrocy) -> None:
+    res = await tools["grocy_attention"](kind="bogus")
+    assert res["error"]["code"] == "kind_invalid"
 
 
 @pytest.mark.asyncio
@@ -1023,6 +1128,7 @@ async def test_stock_by_location_scoped(tools: dict[str, Any], seeded: SeededGro
             "location": "Chest Freezer",
             "products": [
                 {
+                    "id": 1,
                     "name": "Ribeye",
                     "amount": 2,
                     "stock_unit": "count",
@@ -1031,6 +1137,8 @@ async def test_stock_by_location_scoped(tools: dict[str, Any], seeded: SeededGro
             ],
         }
     ]
+    assert res["returned"] == 1
+    assert res["truncated"] is False
 
 
 @pytest.mark.asyncio
@@ -1039,7 +1147,8 @@ async def test_enrichment_reads_are_read_only(tools: dict[str, Any], seeded: See
     await tools["grocy_product_card"](product="ribeye")
     await tools["grocy_consumption_history"](product="ribeye")
     await tools["grocy_stock_value"](by_location=True)
-    await tools["grocy_restock_suggestions"](include_due_soon=True)
+    await tools["grocy_attention"](kind="below_minimum")
+    await tools["grocy_attention"](kind="expiring")
     await tools["grocy_stock_by_location"]()
     assert seeded.requests  # sanity
     assert all(r.method == "GET" for r in seeded.requests)
@@ -1135,13 +1244,94 @@ async def test_set_conversion_unit_not_found(tools: dict[str, Any], seeded: Seed
 
 
 @pytest.mark.asyncio
-async def test_list_unit_conversions_for_product(
+async def test_no_conversion_path_lists_defined_rows(
     tools: dict[str, Any], seeded: SeededGrocy
 ) -> None:
-    res = await tools["grocy_list_unit_conversions"](product="ribeye")
-    assert len(res["conversions"]) == 1
-    row = res["conversions"][0]
-    assert row["from_unit"] == "pack"
-    assert row["to_unit"] == "lb"
-    assert row["factor"] == 4
-    assert row["product"]["name"] == "Ribeye"
+    """grocy_convert_units absorbed grocy_list_unit_conversions: when no path
+    exists the payload carries the product's defined rows (global +
+    product-specific) for inspection."""
+    res = await tools["grocy_convert_units"](
+        product="ribeye", amount=1, from_unit="count", to_unit="lb"
+    )
+    assert res["error"]["code"] == "no_conversion_path"
+    convs = res["conversions"]
+    # Seeded: product-specific pack→lb (factor 4) + global lb→oz (factor 16).
+    pairs = {(c["from_unit"], c["to_unit"], c["factor"]) for c in convs}
+    assert ("pack", "lb", 4) in pairs
+    assert ("lb", "oz", 16) in pairs
+    specific = next(c for c in convs if c["from_unit"] == "pack")
+    assert specific["product"]["name"] == "Ribeye"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# create_new escape hatch, grocy_ensure dispatch, truncation flags
+# ─────────────────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_create_new_bypasses_disambiguation(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    """A near (non-exact) match normally returns needs_disambiguation; passing
+    create_new=true forces a brand-new product with the exact spoken name."""
+    await tools["grocy_seed_defaults"]()
+    await tools["grocy_stock_item"](
+        name="Ribeye Steak", amount=1, location="Chest Freezer", unit="count"
+    )
+    assert len(fake.products) == 1
+    # Without create_new: disambiguation.
+    dis = await tools["grocy_stock_item"](name="ribeye", amount=1, location="Chest Freezer")
+    assert dis["error"]["code"] == "needs_disambiguation"
+    assert "create_new" in dis["error"]["hint"]
+    # With create_new: a second product is created despite the near-match.
+    res = await tools["grocy_stock_item"](
+        name="ribeye", amount=2, location="Chest Freezer", unit="count", create_new=True
+    )
+    assert res["product"]["created"] is True
+    assert res["resulting_amount_on_hand"] == 2
+    assert len(fake.products) == 2
+
+
+@pytest.mark.asyncio
+async def test_set_reports_previous_amount(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    await tools["grocy_seed_defaults"]()
+    await tools["grocy_stock_item"](
+        name="peas", amount=4, location="Chest Freezer", unit="count", action="set"
+    )
+    res = await tools["grocy_stock_item"](name="peas", amount=1, location="Chest Freezer")
+    assert res["previous_amount_on_hand"] == 4
+    assert res["resulting_amount_on_hand"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_unit_via_dispatch(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    u = await tools["grocy_ensure"](kind="unit", name="pack", name_plural="packs")
+    assert u["created"] is True
+    again = await tools["grocy_ensure"](kind="unit", name="pack")
+    assert again["created"] is False
+    assert again["id"] == u["id"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_location_via_dispatch(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    loc = await tools["grocy_ensure"](kind="location", name="Basement", description="cold room")
+    assert loc["created"] is True
+    assert any(x["name"] == "Basement" for x in fake.locations)
+
+
+@pytest.mark.asyncio
+async def test_ensure_invalid_kind(tools: dict[str, Any], fake: FakeGrocy) -> None:
+    res = await tools["grocy_ensure"](kind="widget", name="x")
+    assert res["error"]["code"] == "kind_invalid"
+
+
+@pytest.mark.asyncio
+async def test_consumption_history_truncation_flag(
+    tools: dict[str, Any], seeded: SeededGrocy, monkeypatch: Any
+) -> None:
+    """When the stock-log read hits the row cap, consumption_history flags
+    truncated=true and notes the possible undercount rather than dropping data
+    silently."""
+    import homelab_mcp.tools.grocy as grocy_mod
+
+    monkeypatch.setattr(grocy_mod, "_MAX_LOG_ROWS", 3)  # seeded log has 3 rows
+    res = await tools["grocy_consumption_history"](product="ribeye", days=90)
+    assert res["truncated"] is True
+    assert res["returned"] == 3
+    assert "undercount" in res["notes"]

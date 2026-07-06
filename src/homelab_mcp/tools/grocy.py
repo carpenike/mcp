@@ -32,13 +32,15 @@ Tool name convention: `grocy_<verb>_<object>`. See AGENTS.md.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
-from urllib.parse import quote
 
 import httpx
 from pydantic import Field
+
+from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -49,6 +51,11 @@ log = logging.getLogger(__name__)
 
 # Bound on how long we wait for any single Grocy call.
 _TIMEOUT = 15
+
+# Cap on concurrent per-item enrichment fan-outs, so a wide read (many
+# products / many below-minimum rows) pools its follow-up calls instead of
+# issuing them all at once. Mirrors cooklang's `_scan_ingredients`.
+_ENRICH_CONCURRENCY = 8
 
 # Idempotent seed for a blank instance (see handoff §7.2). Plurals default
 # to the singular — Grocy requires name_plural but our units read naturally
@@ -78,22 +85,11 @@ _SHOPPING_LOCATIONS = "shopping_locations"
 _STORE_ADDRESS_FIELD = "address"
 
 
-class _GrocyError(Exception):
-    """An internal failure carrying a stable error `code` for the client.
-
-    Always surfaced as a structured ``{"error": {code, message, hint}}``
-    payload — never raised to the MCP transport, and never carrying the
-    API key or a raw upstream response.
-    """
-
-    def __init__(self, code: str, message: str, hint: str = "") -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.hint = hint
-
-    def payload(self) -> dict[str, Any]:
-        return {"error": {"code": self.code, "message": self.message, "hint": self.hint}}
+# Grocy's structured error is the shared `ToolError` — same
+# ``{"error": {code, message, hint}}`` payload shape. Kept under the local
+# name `_GrocyError` so the module's many `except _GrocyError` boundaries and
+# `raise _GrocyError(code, message, hint)` sites read unchanged.
+_GrocyError = ToolError
 
 
 class _Disambiguation(Exception):  # noqa: N818 - a control-flow signal, not an error
@@ -120,9 +116,9 @@ class _Disambiguation(Exception):  # noqa: N818 - a control-flow signal, not an 
         }
 
 
-def _enc(segment: str) -> str:
-    """URL-encode a single path segment, leaving no `/` to enable traversal."""
-    return quote(segment, safe="")
+# The shared path-segment encoder, re-exported under the module's historical
+# name so `_enc(...)` call sites (and the helper's unit tests) keep working.
+_enc = enc
 
 
 def _compact(body: dict[str, Any]) -> dict[str, Any]:
@@ -133,6 +129,38 @@ def _compact(body: dict[str, Any]) -> dict[str, Any]:
 def _norm(value: Any) -> str:
     """Trim + lowercase for case-insensitive name comparison."""
     return str(value or "").strip().lower()
+
+
+def _like_escape(value: str) -> str:
+    """Escape SQL-LIKE metacharacters for a Grocy ``name~`` query filter.
+
+    Grocy translates ``name~value`` into ``name LIKE %value%`` (SQL LIKE
+    semantics), so a raw ``%`` or ``_`` in the value acts as a wildcard and
+    a backslash can break the pattern. We backslash-escape those so a spoken
+    name containing them is searched as a literal substring rather than
+    over-matching (or 400-ing). Exact-match layering still guards correctness;
+    this keeps the raw substring search robust.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _map_bounded(
+    fn: Any, items: list[dict[str, Any]], concurrency: int = _ENRICH_CONCURRENCY
+) -> list[dict[str, Any]]:
+    """Apply an async `fn` over `items` concurrently (bounded), preserving order.
+
+    `asyncio.gather` keeps result order aligned to the input, so a fan-out of
+    per-item enrichment stays ordered while pooling its calls behind a
+    semaphore. A `_GrocyError` from any task propagates (caught at the tool
+    boundary) exactly as the old sequential loop would have raised.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run(item: dict[str, Any]) -> dict[str, Any]:
+        async with sem:
+            return await fn(item)  # type: ignore[no-any-return]
+
+    return list(await asyncio.gather(*(_run(i) for i in items)))
 
 
 def _extract_grocy_version(info: Any) -> str | None:
@@ -158,8 +186,19 @@ def _extract_grocy_version(info: Any) -> str | None:
 
 def register(mcp: FastMCP, settings: Settings) -> None:
     """Register grocy_* stock/inventory tools on the given MCP server."""
-    base = settings.grocy_base_url.rstrip("/")
     api_key = settings.grocy_api_key
+
+    # The Grocy REST API lives under `/api`, while tool paths are written as
+    # `/objects/...`, `/stock/...`, `/system/info`. Compute the API base ONCE
+    # so it works whether or not the configured base already ends in `/api`
+    # (config default is `https://grocy.holthome.net`, no `/api`).
+    _raw_base = settings.grocy_base_url.rstrip("/")
+    api_base = _raw_base if _raw_base.endswith("/api") else _raw_base + "/api"
+
+    # ONE pooled client, reused across every call so TLS handshakes and
+    # connections are pooled instead of rebuilt per request. Constructing it
+    # outside the event loop is fine — httpx binds to the loop on first use.
+    client = make_client(headers={"GROCY-API-KEY": api_key}, timeout=_TIMEOUT)
 
     # ── core HTTP ───────────────────────────────────────────────────
     async def _call(
@@ -179,44 +218,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "Grocy API key is not configured.",
                 "Set HOMELAB_MCP_GROCY_API_KEY (Grocy → Settings → Manage API keys).",
             )
-        url = f"{base}{path}"
-        try:
-            async with httpx.AsyncClient(
-                timeout=_TIMEOUT,
-                headers={"GROCY-API-KEY": api_key},
-            ) as client:
-                resp = await client.request(method, url, params=params, json=json)
-        except httpx.HTTPError as exc:
-            # Log class + path only — never the key, query, or body.
-            log.warning("grocy %s %s failed: %s", method, path, exc.__class__.__name__)
-            raise _GrocyError(
-                "grocy_unreachable",
-                f"Could not reach Grocy ({exc.__class__.__name__}).",
-                "Check HOMELAB_MCP_GROCY_BASE_URL and that the instance is up.",
-            ) from exc
-
-        if resp.status_code >= 400:
-            detail: str | None = None
-            try:
-                payload = resp.json()
-                if isinstance(payload, dict):
-                    detail = payload.get("error_message")
-            except ValueError:
-                detail = (resp.text or "")[:200] or None
-            raise _GrocyError(
-                f"grocy_http_{resp.status_code}",
-                detail or f"Grocy returned HTTP {resp.status_code}.",
-                "",
-            )
-
-        if resp.status_code == 204 or not resp.content:
-            return None
-        try:
-            return resp.json()
-        except ValueError as exc:
-            raise _GrocyError(
-                f"grocy_http_{resp.status_code}", "Grocy returned a non-JSON response.", ""
-            ) from exc
+        return await request_json(
+            client,
+            method,
+            f"{api_base}{path}",
+            service="grocy",
+            params=params,
+            json=json,
+            unreachable_hint="Check HOMELAB_MCP_GROCY_BASE_URL and that the instance is up.",
+        )
 
     async def _probe(path: str) -> dict[str, Any]:
         """Raw GET for diagnostics — returns status/headers/body WITHOUT raising
@@ -227,10 +237,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         if not api_key:
             return {"connect_error": "no_api_key"}
         try:
-            async with httpx.AsyncClient(
-                timeout=_TIMEOUT, headers={"GROCY-API-KEY": api_key}
-            ) as client:
-                resp = await client.get(f"{base}{path}")
+            resp = await client.get(f"{api_base}{path}")
         except httpx.HTTPError as exc:
             return {"connect_error": exc.__class__.__name__}
         body = resp.text or ""
@@ -247,8 +254,14 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── master-data helpers ─────────────────────────────────────────
     async def _search(entity: str, name: str) -> list[dict[str, Any]]:
-        """LIKE-search an /objects/{entity} collection by name (substring)."""
-        data = await _call("GET", f"/objects/{entity}", params={"query[]": f"name~{name}"})
+        """LIKE-search an /objects/{entity} collection by name (substring).
+
+        The name is LIKE-escaped so `%`/`_`/`\\` in a spoken name search as
+        literals instead of wildcards (Grocy uses SQL LIKE for `~`).
+        """
+        data = await _call(
+            "GET", f"/objects/{entity}", params={"query[]": f"name~{_like_escape(name)}"}
+        )
         return data if isinstance(data, list) else []
 
     async def _list_all(entity: str) -> list[dict[str, Any]]:
@@ -441,7 +454,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         raise _GrocyError(
             "unit_not_found",
             f"No quantity unit named '{s}'.",
-            "Create it with grocy_ensure_unit.",
+            "Create it with grocy_ensure (kind='unit').",
         )
 
     async def _query_conversions(from_id: int, to_id: int) -> list[dict[str, Any]]:
@@ -480,6 +493,34 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             return 1.0 / rhit[0], rhit[1]
         return None
 
+    async def _conversion_rows(pid: int | None) -> list[dict[str, Any]]:
+        """Projected conversion rows for inspection: global + (optionally) one
+        product's specific rows, unit/product ids resolved to names.
+        """
+        rows = await _call("GET", f"/objects/{_CONV_ENTITY}")
+        unit_names = await _name_map("quantity_units")
+        prod_names = await _name_map("products")
+        out: list[dict[str, Any]] = []
+        for r in rows if isinstance(rows, list) else []:
+            raw_pid = r.get(_CONV_PRODUCT)
+            rpid = int(raw_pid) if raw_pid not in (None, "") else None
+            # Keep global rows (rpid is None) always; keep product-specific rows
+            # only for the requested product when one is given.
+            if pid is not None and rpid is not None and rpid != pid:
+                continue
+            fid = r.get(_CONV_FROM)
+            tid = r.get(_CONV_TO)
+            out.append(
+                {
+                    "conversion_id": r.get("id"),
+                    "product": {"id": rpid, "name": prod_names.get(rpid)} if rpid else None,
+                    "from_unit": unit_names.get(int(fid)) if fid is not None else None,
+                    "to_unit": unit_names.get(int(tid)) if tid is not None else None,
+                    "factor": r.get(_CONV_FACTOR),
+                }
+            )
+        return out
+
     async def _name_map(entity: str) -> dict[int, str | None]:
         """id → name map for a whole /objects/{entity} collection."""
         items = await _call("GET", f"/objects/{entity}")
@@ -508,26 +549,18 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ),
     )
     async def health() -> dict[str, Any]:
-        # The API route is /api/system/info. Hitting the bare /system/info web
-        # route returns a 302→login (HTML) for an unauthenticated browser —
-        # which is why this read came back empty while every /api-based tool
-        # worked. Try the API route first; fall back to the legacy path only if
-        # the API route looks wrong for this deployment (redirect / not-found),
-        # so we're robust whether or not the base URL already includes /api.
-        probe = await _probe("/api/system/info")
+        # `api_base` already resolves to the instance's `/api` root (whether or
+        # not the configured base included it), so the system-info route is a
+        # single probe of `{api_base}/system/info` — no double-/api fallback.
+        used_path = "/system/info"
+        probe = await _probe(used_path)
         if "connect_error" in probe:
             return _GrocyError(
                 "grocy_unreachable",
                 f"Could not reach Grocy ({probe['connect_error']}).",
                 "Check HOMELAB_MCP_GROCY_BASE_URL and that the instance is up.",
             ).payload()
-        used_path = "/api/system/info"
         version = _extract_grocy_version(probe.get("json"))
-        if version is None and probe.get("status") in (301, 302, 307, 308, 404):
-            legacy = await _probe("/system/info")
-            if "connect_error" not in legacy:
-                probe, used_path = legacy, "/system/info"
-                version = _extract_grocy_version(legacy.get("json"))
 
         log.info("grocy health %s -> status=%s version=%s", used_path, probe.get("status"), version)
         result: dict[str, Any] = {
@@ -588,125 +621,110 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "notes": f"Seed complete: {created} created, {existing} already present.",
         }
 
-    @mcp.tool(
-        name="grocy_ensure_location",
-        description=(
-            "Idempotently ensure a storage location exists (e.g. 'Chest Freezer'). "
-            "Matches case-insensitively by exact name; creates only if absent. "
-            "Returns {id, name, created}. Use before stocking an item into a "
-            "location that may not exist yet."
-        ),
-    )
-    async def ensure_location(
-        name: Annotated[str, Field(min_length=1, description="Location name, e.g. 'Pantry'.")],
-        description: Annotated[str, Field(description="Optional description.")] = "",
+    async def _ensure_store(
+        name: str, address: str | None, description: str | None
     ) -> dict[str, Any]:
-        try:
-            return await _ensure(
-                "locations", name.strip(), {"name": name.strip(), "description": description}
-            )
-        except _GrocyError as exc:
-            return exc.payload()
+        """Idempotent store (shopping-location) upsert with separate address/desc.
 
-    @mcp.tool(
-        name="grocy_ensure_unit",
-        description=(
-            "Idempotently ensure a quantity unit exists (e.g. 'count', 'lb', "
-            "'pack'). Matches case-insensitively by exact name; creates only if "
-            "absent. `name_plural` defaults to the singular. Returns {id, name, "
-            "created}. Use before creating a product that needs a new unit."
-        ),
-    )
-    async def ensure_unit(
-        name: Annotated[str, Field(min_length=1, description="Unit name, e.g. 'count'.")],
-        name_plural: Annotated[str, Field(description="Plural form; defaults to name.")] = "",
-    ) -> dict[str, Any]:
-        plural = name_plural.strip() or name.strip()
-        try:
-            return await _ensure(
-                "quantity_units", name.strip(), {"name": name.strip(), "name_plural": plural}
-            )
-        except _GrocyError as exc:
-            return exc.payload()
-
-    @mcp.tool(
-        name="grocy_ensure_store",
-        description=(
-            "Idempotently ensure a store (shopping location) exists, e.g. 'Costco'. "
-            "Matches case-insensitively by exact name; creates only if absent. "
-            "Optionally record an `address` (free text — e.g. a farm's street "
-            "address for provenance), stored in a DEDICATED Grocy userfield "
-            "('address' on shopping_locations, auto-defined on first use), and a "
-            "`description` (general notes about the store), stored in the store's "
-            "own description column — the two are kept separate. Upsert: on an "
-            "existing store a provided `address`/`description` backfills/updates it "
-            "(updated=true); a null value never clobbers an existing one. Returns "
-            "{id, name, address, description, created, updated}. `grocy_stock_item` "
-            "auto-creates a store on a purchase, so calling this first is optional "
-            "— use it to add or correct an address or note."
-        ),
-    )
-    async def ensure_store(
-        name: Annotated[str, Field(min_length=1, description="Store name, e.g. 'Costco'.")],
-        address: Annotated[
-            str | None,
-            Field(
-                default=None, description="Free-text address; stored in the 'address' userfield."
-            ),
-        ] = None,
-        description: Annotated[
-            str | None,
-            Field(default=None, description="General notes; stored in the store's description."),
-        ] = None,
-    ) -> dict[str, Any]:
+        Address lives in a dedicated userfield; description in the store's own
+        column. A provided value backfills/updates; a null never clobbers.
+        """
         name_s = name.strip()
         addr = address.strip() if address and address.strip() else None
         desc = description.strip() if description and description.strip() else None
+        rows = await _list_all(_SHOPPING_LOCATIONS)
+        existing = next((r for r in rows if _norm(r.get("name")) == _norm(name_s)), None)
+        store_name: str | None
+        current_desc: Any
+        if existing is None:
+            body: dict[str, Any] = {"name": name_s}
+            if desc is not None:
+                body["description"] = desc
+            res = await _call("POST", f"/objects/{_SHOPPING_LOCATIONS}", json=body)
+            new_id = res.get("created_object_id") if isinstance(res, dict) else None
+            if new_id is None:
+                raise _GrocyError("missing_fk", "Grocy did not return a new store id.", "")
+            sid, store_name, created = int(new_id), name_s, True
+            current_desc = desc
+        else:
+            sid, store_name, created = int(existing["id"]), existing.get("name"), False
+            current_desc = existing.get("description")
+
+        updated = False
+        if existing is not None and desc is not None and desc != (current_desc or ""):
+            await _call("PUT", f"/objects/{_SHOPPING_LOCATIONS}/{sid}", json={"description": desc})
+            current_desc, updated = desc, True
+
+        current_addr = (await _userfield_values(_SHOPPING_LOCATIONS, sid)).get(
+            _STORE_ADDRESS_FIELD
+        ) or None
+        if addr is not None and addr != (current_addr or ""):
+            await _ensure_userfield(_SHOPPING_LOCATIONS, _STORE_ADDRESS_FIELD, "Address")
+            await _set_userfield(_SHOPPING_LOCATIONS, sid, _STORE_ADDRESS_FIELD, addr)
+            current_addr, updated = addr, True
+
+        return {
+            "id": sid,
+            "name": store_name,
+            "address": current_addr,
+            "description": current_desc or None,
+            "created": created,
+            "updated": updated,
+        }
+
+    @mcp.tool(
+        name="grocy_ensure",
+        description=(
+            "Idempotently ensure a piece of master data exists, dispatched by "
+            "`kind`:\n"
+            "  • 'location' → a storage location (e.g. 'Chest Freezer'); optional "
+            "`description`. Returns {id, name, created}.\n"
+            "  • 'unit' → a quantity unit (e.g. 'count', 'lb', 'pack'); "
+            "`name_plural` defaults to the singular. Returns {id, name, created}.\n"
+            "  • 'store' → a store / shopping location (e.g. 'Costco'). Optional "
+            "`address` (stored in a DEDICATED 'address' userfield, auto-defined on "
+            "first use) and `description` (the store's own column) are kept "
+            "separate. Upsert: a provided address/description backfills/updates "
+            "(updated=true); a null never clobbers. Returns {id, name, address, "
+            "description, created, updated}.\n"
+            "All kinds match case-insensitively by exact name and create only if "
+            "absent. Use before stocking into a location/unit that may not exist "
+            "yet; `grocy_stock_item` auto-creates a store on a purchase, so "
+            "kind='store' is optional — use it to add/correct an address or note."
+        ),
+    )
+    async def ensure(
+        name: Annotated[str, Field(min_length=1, description="Object name to ensure.")],
+        kind: Annotated[
+            str, Field(description="'location' | 'unit' | 'store'.")
+        ] = "location",
+        description: Annotated[
+            str | None, Field(default=None, description="location/store: optional description.")
+        ] = None,
+        name_plural: Annotated[
+            str | None, Field(default=None, description="unit: plural form; defaults to name.")
+        ] = None,
+        address: Annotated[
+            str | None, Field(default=None, description="store: free-text address (userfield).")
+        ] = None,
+    ) -> dict[str, Any]:
+        if kind not in ("location", "unit", "store"):
+            return _GrocyError(
+                "kind_invalid", f"Unknown kind '{kind}'.", "Use 'location', 'unit', or 'store'."
+            ).payload()
         try:
-            rows = await _list_all(_SHOPPING_LOCATIONS)
-            existing = next((r for r in rows if _norm(r.get("name")) == _norm(name_s)), None)
-            store_name: str | None
-            current_desc: Any
-            if existing is None:
-                body: dict[str, Any] = {"name": name_s}
-                if desc is not None:
-                    body["description"] = desc
-                res = await _call("POST", f"/objects/{_SHOPPING_LOCATIONS}", json=body)
-                new_id = res.get("created_object_id") if isinstance(res, dict) else None
-                if new_id is None:
-                    raise _GrocyError("missing_fk", "Grocy did not return a new store id.", "")
-                sid, store_name, created = int(new_id), name_s, True
-                current_desc = desc
-            else:
-                sid, store_name, created = int(existing["id"]), existing.get("name"), False
-                current_desc = existing.get("description")
-
-            updated = False
-            # Description lives in the store's own column; update on an existing
-            # store only when given and changed (null never clobbers).
-            if existing is not None and desc is not None and desc != (current_desc or ""):
-                await _call(
-                    "PUT", f"/objects/{_SHOPPING_LOCATIONS}/{sid}", json={"description": desc}
+            if kind == "location":
+                return await _ensure(
+                    "locations",
+                    name.strip(),
+                    {"name": name.strip(), "description": description or ""},
                 )
-                current_desc, updated = desc, True
-
-            # Address lives in a dedicated userfield.
-            current_addr = (await _userfield_values(_SHOPPING_LOCATIONS, sid)).get(
-                _STORE_ADDRESS_FIELD
-            ) or None
-            if addr is not None and addr != (current_addr or ""):
-                await _ensure_userfield(_SHOPPING_LOCATIONS, _STORE_ADDRESS_FIELD, "Address")
-                await _set_userfield(_SHOPPING_LOCATIONS, sid, _STORE_ADDRESS_FIELD, addr)
-                current_addr, updated = addr, True
-
-            return {
-                "id": sid,
-                "name": store_name,
-                "address": current_addr,
-                "description": current_desc or None,
-                "created": created,
-                "updated": updated,
-            }
+            if kind == "unit":
+                plural = (name_plural or "").strip() or name.strip()
+                return await _ensure(
+                    "quantity_units", name.strip(), {"name": name.strip(), "name_plural": plural}
+                )
+            return await _ensure_store(name, address, description)
         except _GrocyError as exc:
             return exc.payload()
 
@@ -729,54 +747,128 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     ) -> dict[str, Any]:
         try:
             matches = await _search("products", query.strip())
-            enriched = [await _enrich(p) for p in matches[:limit]]
+            enriched = await _map_bounded(_enrich, matches[:limit])
         except _GrocyError as exc:
             return exc.payload()
-        return {"count": len(enriched), "products": enriched}
+        total = len(matches)
+        return {
+            "count": len(enriched),
+            "returned": len(enriched),
+            "total": total,
+            "truncated": total > len(enriched),
+            "products": enriched,
+        }
 
     @mcp.tool(
-        name="grocy_list_stock",
+        name="grocy_attention",
         description=(
-            "List every product currently in stock with amount on hand, stock unit, "
-            "and next due date. Use for 'what do we have?' / 'how much X is left?'. "
-            "For items needing attention (expiring/overdue/missing) use "
-            "`grocy_expiring` instead."
+            "The 'what needs attention?' feed, summarized (not raw stock rows). "
+            "`kind='expiring'` (default) is the DATE-driven meal-planning view — "
+            "products due soon, overdue, or expired within `days` — for 'what's "
+            "going bad?' / 'what should I use up?'. `kind='below_minimum'` is the "
+            "QUANTITY-driven restock signal — products under their configured "
+            "minimum stock, with shortfall and default location, for a buy list. "
+            "Each item is projected to {product_id, name, amount/on_hand, due/"
+            "shortfall, bucket}. Read-only."
         ),
     )
-    async def list_stock() -> dict[str, Any]:
-        try:
-            data = await _call("GET", "/stock")
-        except _GrocyError as exc:
-            return exc.payload()
-        items = data if isinstance(data, list) else []
-        products = [
-            {
-                "id": p.get("product_id"),
-                "name": (p.get("product") or {}).get("name"),
-                "amount": p.get("amount"),
-                "next_due_date": p.get("best_before_date"),
-            }
-            for p in items
-        ]
-        return {"count": len(products), "products": products}
-
-    @mcp.tool(
-        name="grocy_expiring",
-        description=(
-            "The meal-planning feed: products that are due soon, overdue, expired, "
-            "or currently missing (below minimum stock). Use for 'what's going "
-            "bad?', 'what should I use up?', or 'what are we out of?'. `days` sets "
-            "the 'due soon' horizon."
-        ),
-    )
-    async def expiring(
-        days: Annotated[int, Field(ge=0, le=365, description="'Due soon' horizon in days.")] = 5,
+    async def attention(
+        kind: Annotated[
+            str, Field(description="'expiring' (date-driven) | 'below_minimum' (quantity-driven).")
+        ] = "expiring",
+        days: Annotated[
+            int, Field(ge=0, le=365, description="'Due soon' horizon (kind='expiring').")
+        ] = 5,
     ) -> dict[str, Any]:
+        if kind not in ("expiring", "below_minimum"):
+            return _GrocyError(
+                "kind_invalid", f"Unknown kind '{kind}'.", "Use 'expiring' or 'below_minimum'."
+            ).payload()
         try:
-            data = await _call("GET", "/stock/volatile", params={"due_soon_days": days})
+            params = {"due_soon_days": days} if kind == "expiring" else None
+            vol = await _call("GET", "/stock/volatile", params=params)
+            vol = vol if isinstance(vol, dict) else {}
+
+            if kind == "expiring":
+                today = datetime.now(UTC).date()
+
+                def _proj(entry: dict[str, Any], bucket: str) -> dict[str, Any]:
+                    raw_prod = entry.get("product")
+                    prod = raw_prod if isinstance(raw_prod, dict) else {}
+                    pid = prod.get("id") or entry.get("product_id") or entry.get("id")
+                    name = prod.get("name") or entry.get("name")
+                    due = entry.get("best_before_date") or entry.get("next_due_date")
+                    days_until: int | None = None
+                    if due:
+                        try:
+                            days_until = (date.fromisoformat(str(due)[:10]) - today).days
+                        except ValueError:
+                            days_until = None
+                    return {
+                        "product_id": pid,
+                        "name": name,
+                        "amount": entry.get("amount"),
+                        "due_date": due,
+                        "days_until_due": days_until,
+                        "bucket": bucket,
+                    }
+
+                items = [
+                    _proj(e, bucket)
+                    for key, bucket in (
+                        ("due_products", "due_soon"),
+                        ("overdue_products", "overdue"),
+                        ("expired_products", "expired"),
+                    )
+                    for e in (vol.get(key) or [])
+                ]
+            else:
+
+                async def _below(m: dict[str, Any]) -> dict[str, Any]:
+                    pid = m.get("id")
+                    on_hand: Any = None
+                    min_stock: Any = None
+                    location: str | None = None
+                    if pid is not None:
+                        try:
+                            master = await _call("GET", f"/objects/products/{pid}")
+                            if isinstance(master, dict):
+                                min_stock = master.get("min_stock_amount")
+                        except _GrocyError:
+                            pass
+                        detail = await _stock_detail(int(pid))
+                        if detail:
+                            on_hand = detail.get("stock_amount")
+                            loc = detail.get("location") or detail.get("default_location") or {}
+                            location = loc.get("name")
+                    return {
+                        "product_id": pid,
+                        "name": m.get("name"),
+                        "on_hand": on_hand,
+                        "min_stock": min_stock,
+                        "shortfall": m.get("amount_missing"),
+                        "default_location": location,
+                        "bucket": "below_minimum",
+                    }
+
+                items = await _map_bounded(_below, list(vol.get("missing_products") or []))
         except _GrocyError as exc:
             return exc.payload()
-        return data if isinstance(data, dict) else {"result": data}
+
+        note = (
+            f"{len(items)} product(s) due within {days}d / overdue / expired."
+            if kind == "expiring"
+            else f"{len(items)} product(s) below minimum."
+        )
+        return {
+            "kind": kind,
+            "days": days,
+            "returned": len(items),
+            "total": len(items),
+            "truncated": False,
+            "items": items,
+            "notes": note,
+        }
 
     # ─────────────────────────────────────────────────────────────────
     # The keystone walkthrough tool
@@ -790,21 +882,27 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "ACTIONS:\n"
             "  • set     → reconcile to an ABSOLUTE amount (inventory). Use for a "
             "walkthrough: 'there are two racks' means the truth is 2. Grocy "
-            "reconciles the product's total on hand; new stock lands at `location`.\n"
+            "reconciles the product's total on hand; new stock lands at `location`. "
+            "The result reports previous_amount_on_hand so a surprising "
+            "reconciliation is visible.\n"
             "  • add     → append stock (a restock/purchase). Prefer this when "
             "items carry DISTINCT best-before dates you want tracked separately — "
             "each add is its own dated entry.\n"
             "  • consume → remove stock (oldest-due first). Set `spoiled=true` to "
-            "record waste rather than use.\n\n"
-            "NAME RESOLUTION (never guesses): exact case-insensitive match → use "
-            "it. No match at all + create_if_missing → create it (result marks "
-            "created=true so you can confirm verbally). A NEAR match but no exact "
-            "one → returns needs_disambiguation with candidates; confirm in "
-            "conversation, then re-call with `product_id`.\n\n"
+            "record waste rather than use.\n"
+            "  • open    → mark an amount opened (can shift the applicable due "
+            "date).\n\n"
+            "IDENTIFICATION: pass a `name` (resolved find-or-create), a known "
+            "`product_id`, or a `barcode` (consume/open only). NAME RESOLUTION "
+            "never guesses: exact case-insensitive match → use it. No match at all "
+            "+ create_if_missing → create it (created=true). A NEAR match but no "
+            "exact one → returns needs_disambiguation with candidates; confirm, "
+            "then re-call with `product_id` — OR pass create_new=true to force a "
+            "brand-new product with that exact name instead of disambiguating.\n\n"
             "Creating a product requires `location` and `unit` to already exist — "
             "if they don't, you get location_not_found / unit_not_found naming the "
-            "missing one (run the ensure_* tool first; this tool never invents "
-            "master scaffolding). For meat, always pass a real `best_before` date.\n\n"
+            "missing one (run grocy_ensure first; this tool never invents master "
+            "scaffolding). For meat, always pass a real `best_before` date.\n\n"
             "PRICE (action='add' only): pass `total_price` (for the whole `amount`) "
             "OR `unit_price` (per stock unit) — not both (price_ambiguous). Grocy "
             "stores price per stock unit, so for variable-weight items stock by "
@@ -817,14 +915,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     )
     async def stock_item(
         amount: Annotated[float, Field(description="Amount > 0, in the product's stock unit.")],
-        location: Annotated[str | int, Field(description="Location name or id.")],
+        location: Annotated[
+            str | int | None,
+            Field(default=None, description="Location name or id (required for set/add)."),
+        ] = None,
         name: Annotated[
             str | None,
             Field(
                 default=None, description="Spoken product name, e.g. 'ribeye' (or pass product_id)."
             ),
         ] = None,
-        action: Annotated[str, Field(description="'set' | 'add' | 'consume'.")] = "set",
+        action: Annotated[str, Field(description="'set' | 'add' | 'consume' | 'open'.")] = "set",
         unit: Annotated[
             str | int, Field(description="Unit (name or id); used only when creating.")
         ] = "count",
@@ -835,8 +936,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         create_if_missing: Annotated[
             bool, Field(description="Create the product if no match.")
         ] = True,
+        create_new: Annotated[
+            bool,
+            Field(
+                description="Force-create a NEW product with this exact name even if "
+                "near-matches exist (skips disambiguation).",
+            ),
+        ] = False,
         product_id: Annotated[
             int | None, Field(default=None, ge=1, description="Bypass name resolution if known.")
+        ] = None,
+        barcode: Annotated[
+            str | None,
+            Field(default=None, description="Identify by barcode (consume/open only)."),
         ] = None,
         total_price: Annotated[
             float | None,
@@ -857,15 +969,60 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             Field(default=None, description="action='add' only: YYYY-MM-DD; default today."),
         ] = None,
     ) -> dict[str, Any]:
-        if action not in ("set", "add", "consume"):
+        if action not in ("set", "add", "consume", "open"):
             return _GrocyError(
-                "amount_invalid", f"Unknown action '{action}'.", "Use set, add, or consume."
+                "action_invalid", f"Unknown action '{action}'.", "Use set, add, consume, or open."
             ).payload()
         if amount is None or amount <= 0:
             return _GrocyError("amount_invalid", "Amount must be greater than zero.", "").payload()
+
+        # ── barcode identification (absorbs the old consume/open primitives) ──
+        if barcode is not None and str(barcode).strip():
+            bc = str(barcode).strip()
+            if action not in ("consume", "open"):
+                return _GrocyError(
+                    "identifier_invalid",
+                    "Barcode identification supports only consume/open.",
+                    "Use product_id or name for set/add.",
+                ).payload()
+            if product_id is not None or (name and name.strip()):
+                return _GrocyError(
+                    "identifier_invalid",
+                    "Provide a barcode OR a name/product_id, not both.",
+                    "",
+                ).payload()
+            path = f"/stock/products/by-barcode/{_enc(bc)}/{action}"
+            bc_body = (
+                {"amount": amount, "transaction_type": "consume", "spoiled": spoiled}
+                if action == "consume"
+                else {"amount": amount}
+            )
+            try:
+                data = await _call("POST", path, json=bc_body)
+            except _GrocyError as exc:
+                return exc.payload()
+            did = "consumed" if action == "consume" else "opened"
+            return {
+                "action_taken": action,
+                "product": {"barcode": bc},
+                "amount": amount,
+                "resulting_amount_on_hand": None,
+                "stock_log": data,
+                "notes": f"{did} {amount} via barcode"
+                + (" (spoiled)." if (action == "consume" and spoiled) else "."),
+            }
+
         if product_id is None and not (name and name.strip()):
             return _GrocyError(
-                "product_not_found", "No product name or id given.", "Pass name or product_id."
+                "product_not_found",
+                "No product name, id, or barcode given.",
+                "Pass name, product_id, or barcode.",
+            ).payload()
+        if action in ("set", "add") and (location is None or str(location).strip() == ""):
+            return _GrocyError(
+                "location_not_found",
+                "A location is required for set/add.",
+                "Pass a location name or id.",
             ).payload()
 
         # Price contract (action='add' only). Grocy stores price PER STOCK UNIT.
@@ -898,8 +1055,11 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 eff_unit_price = total_price / amount
 
         try:
-            # Location is needed for the action regardless of create path.
-            location_id = await _resolve_id("locations", location, "location_not_found")
+            # Location is needed for set/add and for a create path; for a
+            # consume/open by id/name it is optional (omitted from the body).
+            location_id: int | None = None
+            if location is not None and str(location).strip() != "":
+                location_id = await _resolve_id("locations", location, "location_not_found")
 
             # ── resolve product ──────────────────────────────────────
             product: dict[str, Any]
@@ -926,13 +1086,26 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                         "name": exact[0].get("name"),
                         "created": False,
                     }
+                elif create_new:
+                    # Escape hatch: force a brand-new product with this exact
+                    # name instead of disambiguating against near-matches.
+                    if location_id is None:
+                        raise _GrocyError(
+                            "location_not_found",
+                            "A location is required to create a product.",
+                            "Pass a location name or id.",
+                        )
+                    unit_id = await _resolve_id("quantity_units", unit, "unit_not_found")
+                    product = await _create_product(name, location_id, unit_id)
+                    created = True
                 elif len(exact) > 1 or candidates:
-                    cands = [await _enrich(c) for c in candidates[:10]]
+                    cands = await _map_bounded(_enrich, candidates[:10])
                     return {
                         **_GrocyError(
                             "needs_disambiguation",
                             f"'{name}' matches existing products; not guessing.",
-                            "Re-call with product_id set to the intended one.",
+                            "Re-call with product_id set to the intended one, "
+                            "or pass create_new=true to make a new product.",
                         ).payload(),
                         "candidates": cands,
                     }
@@ -956,6 +1129,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                             "created": False,
                         }
                     else:
+                        if location_id is None:
+                            raise _GrocyError(
+                                "location_not_found",
+                                "A location is required to create a product.",
+                                "Pass a location name or id.",
+                            )
                         unit_id = await _resolve_id("quantity_units", unit, "unit_not_found")
                         product = await _create_product(name, location_id, unit_id)
                         created = True
@@ -978,7 +1157,11 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 store_created = bool(store_info.get("created"))
 
             # ── apply the action ─────────────────────────────────────
+            previous: float | None = None
             if action == "set":
+                # Grocy's inventory endpoint sets the product-wide total; read
+                # what it will reconcile FROM so a surprising set is visible.
+                previous = await _amount_on_hand(pid)
                 body = _compact(
                     {
                         "new_amount": amount,
@@ -1000,6 +1183,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     }
                 )
                 await _call("POST", f"/stock/products/{pid}/add", json=body)
+            elif action == "open":
+                await _call("POST", f"/stock/products/{pid}/open", json={"amount": amount})
             else:  # consume
                 body = _compact(
                     {
@@ -1024,6 +1209,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 verb += f" @ {round(eff_unit_price, 4)}/unit"
             if store_name:
                 verb += f" from {store_name}" + (" (new store)" if store_created else "")
+        elif action == "open":
+            verb = f"opened {amount} {pname}"
         else:
             verb = f"consumed {amount} {pname}" + (" (spoiled)" if spoiled else "")
         on_hand = "unknown" if resulting is None else resulting
@@ -1037,6 +1224,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "resulting_amount_on_hand": resulting,
             "notes": f"{prefix}{verb}; {on_hand} on hand.",
         }
+        if action == "set":
+            result["previous_amount_on_hand"] = previous
         if action == "add":
             result["unit_price"] = round(eff_unit_price, 4) if eff_unit_price is not None else None
             result["total_price"] = (
@@ -1045,83 +1234,6 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             result["store"] = store_name
             result["purchased_date"] = purchased_date
         return result
-
-    # ─────────────────────────────────────────────────────────────────
-    # Primitives (retained for direct use)
-    # ─────────────────────────────────────────────────────────────────
-    @mcp.tool(
-        name="grocy_consume_product",
-        description=(
-            "Consume (remove) stock for a product identified by EITHER `product_id` "
-            "OR `barcode` (exactly one). Set `spoiled=true` to record waste. A "
-            "lower-level primitive; for conversational intake prefer "
-            "`grocy_stock_item`."
-        ),
-    )
-    async def consume_product(
-        product_id: Annotated[int | None, Field(default=None, ge=1)] = None,
-        barcode: Annotated[str | None, Field(default=None)] = None,
-        amount: Annotated[float, Field(gt=0, description="Amount to remove.")] = 1,
-        spoiled: Annotated[
-            bool, Field(description="True when discarded rather than used.")
-        ] = False,
-    ) -> dict[str, Any]:
-        if (product_id is None) == (barcode is None):
-            return _GrocyError(
-                "amount_invalid", "Provide exactly one of product_id or barcode.", ""
-            ).payload()
-        path = (
-            f"/stock/products/by-barcode/{_enc(barcode)}/consume"
-            if barcode
-            else f"/stock/products/{product_id}/consume"
-        )
-        body = {"amount": amount, "transaction_type": "consume", "spoiled": spoiled}
-        try:
-            data = await _call("POST", path, json=body)
-            resulting = await _amount_on_hand(product_id) if product_id else None
-        except _GrocyError as exc:
-            return exc.payload()
-        return {
-            "ok": True,
-            "resulting_amount_on_hand": resulting,
-            "stock_log": data,
-            "notes": f"Consumed {amount}" + (" (spoiled)." if spoiled else "."),
-        }
-
-    @mcp.tool(
-        name="grocy_open_product",
-        description=(
-            "Mark an amount of a product as opened (this can shift the applicable "
-            "due date in Grocy). Identify it by EITHER `product_id` OR `barcode` "
-            "(exactly one). The returned next due date reflects the post-open state."
-        ),
-    )
-    async def open_product(
-        product_id: Annotated[int | None, Field(default=None, ge=1)] = None,
-        barcode: Annotated[str | None, Field(default=None)] = None,
-        amount: Annotated[float, Field(gt=0, description="Amount to mark as opened.")] = 1,
-    ) -> dict[str, Any]:
-        if (product_id is None) == (barcode is None):
-            return _GrocyError(
-                "amount_invalid", "Provide exactly one of product_id or barcode.", ""
-            ).payload()
-        path = (
-            f"/stock/products/by-barcode/{_enc(barcode)}/open"
-            if barcode
-            else f"/stock/products/{product_id}/open"
-        )
-        try:
-            data = await _call("POST", path, json={"amount": amount})
-            detail = await _stock_detail(product_id) if product_id else None
-        except _GrocyError as exc:
-            return exc.payload()
-        next_due = detail.get("next_due_date") if detail else None
-        return {
-            "ok": True,
-            "next_due_date": next_due,
-            "stock_log": data,
-            "notes": f"Opened {amount}.",
-        }
 
     # ─────────────────────────────────────────────────────────────────
     # Enrichment reads (read-only; surface what Grocy's engine computes)
@@ -1136,7 +1248,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "identity (same unit). `conversion_source` reports which was used. If "
             "no conversion exists, returns `no_conversion_path` (never a silent "
             "1:1). Read-only. Resolve the product by name (exact match) or id; a "
-            "near-but-inexact name returns needs_disambiguation."
+            "near-but-inexact name returns needs_disambiguation. On "
+            "no_conversion_path the payload includes the product's defined "
+            "conversion rows (global + product-specific) for inspection."
         ),
     )
     async def convert_units(
@@ -1156,12 +1270,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             else:
                 conv = await _find_conversion(int(prod["id"]), from_id, to_id)
                 if conv is None:
-                    return _GrocyError(
-                        "no_conversion_path",
-                        f"No conversion from {from_name or from_unit} to "
-                        f"{to_name or to_unit} for {prod['name']}.",
-                        "Add a quantity-unit conversion in Grocy first.",
-                    ).payload()
+                    return {
+                        **_GrocyError(
+                            "no_conversion_path",
+                            f"No conversion from {from_name or from_unit} to "
+                            f"{to_name or to_unit} for {prod['name']}.",
+                            "Add a quantity-unit conversion in Grocy first.",
+                        ).payload(),
+                        "conversions": await _conversion_rows(int(prod["id"])),
+                    }
                 factor, source = conv
         except _Disambiguation as dis:
             return dis.payload()
@@ -1196,12 +1313,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         try:
             prod = await _resolve_product(product)
             pid = int(prod["id"])
-            detail = await _stock_detail(pid)
-            master = await _call("GET", f"/objects/products/{pid}")
-            try:
-                locs = await _call("GET", f"/stock/products/{pid}/locations")
-            except _GrocyError:
-                locs = []
+
+            async def _locs() -> Any:
+                try:
+                    return await _call("GET", f"/stock/products/{pid}/locations")
+                except _GrocyError:
+                    return []
+
+            # The three detail reads are independent — fetch them concurrently.
+            detail, master, locs = await asyncio.gather(
+                _stock_detail(pid),
+                _call("GET", f"/objects/products/{pid}"),
+                _locs(),
+            )
         except _Disambiguation as dis:
             return dis.payload()
         except _GrocyError as exc:
@@ -1316,6 +1440,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     last_consumed = ud
         per_week = round(consumed / (days / 7), 2) if days else 0.0
         per_month = round(consumed / (days / 30), 2) if days else 0.0
+        # The stock-log read is capped at _MAX_LOG_ROWS. When that cap is hit the
+        # window may extend past the oldest row we fetched, so totals/rates can
+        # undercount — flag it rather than silently dropping data.
+        truncated = len(rows) >= _MAX_LOG_ROWS
+        note = (
+            f"Over {days}d: consumed {round(consumed, 2)} ({per_week}/wk), "
+            f"{round(spoiled, 2)} spoiled."
+        )
+        if truncated:
+            note += (
+                f" NOTE: stock log capped at {_MAX_LOG_ROWS} rows — totals/rates "
+                "may undercount."
+            )
         return {
             "product": prod,
             "window_days": days,
@@ -1327,10 +1464,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "last_purchased_date": last_purchased,
             "last_consumed_date": last_consumed,
             "transactions_count": count,
-            "notes": (
-                f"Over {days}d: consumed {round(consumed, 2)} ({per_week}/wk), "
-                f"{round(spoiled, 2)} spoiled."
-            ),
+            "returned": len(rows),
+            "truncated": truncated,
+            "notes": note,
         }
 
     @mcp.tool(
@@ -1392,73 +1528,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return out
 
     @mcp.tool(
-        name="grocy_restock_suggestions",
-        description=(
-            "Quantity-driven restock signal: products currently below their "
-            "configured minimum stock, with the shortfall and default location, so "
-            "staples can be folded into a buy list. Distinct from `grocy_expiring` "
-            "(that's date-driven). Set `include_due_soon` to also surface items due "
-            "soon. Read-only."
-        ),
-    )
-    async def restock_suggestions(
-        include_due_soon: Annotated[
-            bool, Field(description="Also include items that are due soon.")
-        ] = False,
-    ) -> dict[str, Any]:
-        try:
-            vol = await _call("GET", "/stock/volatile")
-        except _GrocyError as exc:
-            return exc.payload()
-        vol = vol if isinstance(vol, dict) else {}
-
-        below: list[dict[str, Any]] = []
-        for m in vol.get("missing_products") or []:
-            pid = m.get("id")
-            on_hand: Any = None
-            min_stock: Any = None
-            location: str | None = None
-            if pid is not None:
-                try:
-                    master = await _call("GET", f"/objects/products/{pid}")
-                    if isinstance(master, dict):
-                        min_stock = master.get("min_stock_amount")
-                except _GrocyError:
-                    master = None
-                detail = await _stock_detail(int(pid))
-                if detail:
-                    on_hand = detail.get("stock_amount")
-                    loc = detail.get("location") or detail.get("default_location") or {}
-                    location = loc.get("name")
-            below.append(
-                {
-                    "product": m.get("name"),
-                    "on_hand": on_hand,
-                    "min_stock": min_stock,
-                    "shortfall": m.get("amount_missing"),
-                    "default_location": location,
-                }
-            )
-
-        out: dict[str, Any] = {"below_minimum": below}
-        if include_due_soon:
-            out["due_soon"] = [
-                {
-                    "product": (d.get("product") or {}).get("name") or d.get("name"),
-                    "next_due_date": d.get("best_before_date"),
-                }
-                for d in vol.get("due_products") or []
-            ]
-        out["notes"] = f"{len(below)} product(s) below minimum."
-        return out
-
-    @mcp.tool(
         name="grocy_stock_by_location",
         description=(
             "On-hand stock grouped by storage location — 'what's in the chest "
             "freezer'. Pass a `location` (name or id) to scope to one, or omit for "
-            "all. Each product shows amount, stock unit, and next due date. "
-            "Read-only."
+            "all (the full 'what do we have?' view). Each product shows id, amount, "
+            "stock unit, and next due date. Read-only."
         ),
     )
     async def stock_by_location(
@@ -1471,10 +1546,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             loc_filter: int | None = None
             if location is not None and str(location).strip() != "":
                 loc_filter = await _resolve_id("locations", location, "location_not_found")
-            entries = await _call("GET", "/objects/stock")
-            products = await _call("GET", "/objects/products")
-            unit_names = await _name_map("quantity_units")
-            loc_names = await _name_map("locations")
+            # Four independent collection reads — fetch them concurrently.
+            entries, products, unit_names, loc_names = await asyncio.gather(
+                _call("GET", "/objects/stock"),
+                _call("GET", "/objects/products"),
+                _name_map("quantity_units"),
+                _name_map("locations"),
+            )
         except _GrocyError as exc:
             return exc.payload()
 
@@ -1499,6 +1577,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 unit = unit_names.get(int(prod["qu_id_stock"]))
             groups.setdefault(lid, []).append(
                 {
+                    "id": pid,
                     "name": prod.get("name") if prod else None,
                     "amount": e.get("amount"),
                     "stock_unit": unit,
@@ -1511,6 +1590,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ]
         n_items = sum(len(v) for v in groups.values())
         return {
+            "returned": n_items,
+            "total": n_items,
+            "truncated": False,
             "locations": locations,
             "notes": f"{n_items} stock entr{'y' if n_items == 1 else 'ies'} "
             f"across {len(locations)} location(s).",
@@ -1598,52 +1680,3 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "(reverse resolves automatically)."
             ),
         }
-
-    @mcp.tool(
-        name="grocy_list_unit_conversions",
-        description=(
-            "List defined quantity-unit conversions for inspection/debugging. Pass "
-            "a `product` to see that product's specific conversions, or omit it for "
-            "all (global + product-specific). Read-only."
-        ),
-    )
-    async def list_unit_conversions(
-        product: Annotated[
-            str | int | None,
-            Field(default=None, description="Product name or id; omit for all."),
-        ] = None,
-    ) -> dict[str, Any]:
-        try:
-            pid: int | None = None
-            pname: str | None = None
-            if product is not None and str(product).strip() != "":
-                prod = await _resolve_product(product)
-                pid, pname = int(prod["id"]), prod["name"]
-            rows = await _call("GET", f"/objects/{_CONV_ENTITY}")
-            unit_names = await _name_map("quantity_units")
-            prod_names = await _name_map("products")
-        except _Disambiguation as dis:
-            return dis.payload()
-        except _GrocyError as exc:
-            return exc.payload()
-
-        rows = rows if isinstance(rows, list) else []
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            raw_pid = r.get(_CONV_PRODUCT)
-            rpid = int(raw_pid) if raw_pid not in (None, "") else None
-            if pid is not None and rpid != pid:
-                continue
-            fid = r.get(_CONV_FROM)
-            tid = r.get(_CONV_TO)
-            out.append(
-                {
-                    "conversion_id": r.get("id"),
-                    "product": {"id": rpid, "name": prod_names.get(rpid)} if rpid else None,
-                    "from_unit": unit_names.get(int(fid)) if fid is not None else None,
-                    "to_unit": unit_names.get(int(tid)) if tid is not None else None,
-                    "factor": r.get(_CONV_FACTOR),
-                }
-            )
-        scope = f"for {pname}" if pname else "(all)"
-        return {"conversions": out, "notes": f"{len(out)} conversion(s) {scope}."}
