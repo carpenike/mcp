@@ -118,11 +118,14 @@ class JWTAuthMiddleware:
         try:
             claims = self._validate(token)
         except jwt.InvalidTokenError as e:
+            # The specific reason goes to our logs and the JSON body, but the
+            # WWW-Authenticate header uses a fixed string: PyJWT's message can
+            # contain quotes/newlines that would break the quoted header param.
             log.warning("JWT rejected: %s", e)
             await self._respond_401(
                 send,
                 f"invalid token: {e}",
-                www_authenticate=self._www_authenticate(f"invalid token: {e}"),
+                www_authenticate=self._www_authenticate("the access token is invalid or expired"),
             )
             return
 
@@ -139,11 +142,16 @@ class JWTAuthMiddleware:
 
         Includes `resource_metadata` so spec-strict clients (VS Code)
         discover the AS from the 401 rather than guessing well-known paths.
+
+        `reason` is emitted as a quoted `error_description` param, so any
+        double-quote / backslash / control char is stripped defensively to
+        keep the header well-formed (callers already pass fixed strings).
         """
+        safe_reason = "".join(c for c in reason if c.isprintable() and c not in '"\\')
         parts = [
             'Bearer realm="homelab-mcp"',
             'error="invalid_token"',
-            f'error_description="{reason}"',
+            f'error_description="{safe_reason}"',
         ]
         if self.resource_metadata_url is not None:
             parts.append(f'resource_metadata="{self.resource_metadata_url}"')

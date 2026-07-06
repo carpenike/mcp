@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     bind_address: str = Field(default="127.0.0.1")
     port: int = Field(default=9200, ge=1, le=65535)
     log_level: str = Field(default="info", pattern="^(debug|info|warning|error|critical)$")
+    trusted_proxy_ips: str = Field(
+        default="127.0.0.1",
+        description=(
+            "Comma-separated peer IPs (or '*') whose X-Forwarded-* headers "
+            "uvicorn will honor. This server sits behind a reverse proxy "
+            "(Cloudflare Tunnel) that connects from loopback and sets the real "
+            "client IP in X-Forwarded-For; the DCR rate limiter keys on that "
+            "IP. Pinning this to the proxy's source address stops a direct-to-"
+            "uvicorn attacker from spoofing X-Forwarded-For to mint fresh "
+            "rate-limit buckets. Do NOT set to '*' on an internet-exposed bind."
+        ),
+    )
 
     # ── Public URL ───────────────────────────────────────────────────
     public_base_url: str = Field(
@@ -163,9 +175,20 @@ class Settings(BaseSettings):
     )
 
     # Allowlist of redirect_uri prefixes accepted in DCR. Anything that
-    # doesn't start with one of these is rejected — defense against an
-    # attacker registering a malicious redirect URI that turns our
-    # /authorize into an open redirector.
+    # doesn't match one of these is dropped — defense against an attacker
+    # registering a malicious redirect URI that turns our /authorize into
+    # an open redirector.
+    #
+    # Matching is NOT a bare startswith(): `oauth_provider._redirect_allowed`
+    # first parses the candidate URL and rejects any target carrying userinfo
+    # (`user:pass@host`) or a malformed host, THEN applies the prefix check.
+    # This is load-bearing — a naive startswith() on a prefix ending in ':'
+    # (`http://localhost:`) is bypassable by `http://localhost:1@evil.com/`,
+    # whose real host is evil.com. See CONTRACT_DEFECT.md: the upstream
+    # pocketid-mcp-as v1.1 contract specifies these exact prefixes with
+    # prefix-match semantics and inherits the same flaw; our stricter parse
+    # stays conformant (it still accepts every legitimate prefix) while
+    # closing the hole.
     oauth_redirect_uri_allowlist: list[str] = Field(
         default=[
             # Claude (claude.ai web + Claude Desktop).
@@ -173,9 +196,7 @@ class Settings(BaseSettings):
             "https://claude.com/",
             # VS Code 1.108+ sends four redirect_uris in a single DCR
             # request (see microsoft/vscode src/vs/base/common/oauth.ts
-            # fetchDynamicRegistration). We accept all four shapes. Every
-            # loopback prefix ends in ':' or '/' so a naive startswith()
-            # can't be bypassed by 'http://127.0.0.1.evil.com/'.
+            # fetchDynamicRegistration). We accept all four shapes.
             "https://vscode.dev/redirect",
             "https://insiders.vscode.dev/redirect",
             "http://127.0.0.1:",
@@ -187,8 +208,9 @@ class Settings(BaseSettings):
             "Allowlist of redirect_uri prefixes accepted in DCR + /authorize. "
             "DCR filters (not rejects) the submitted set against this list and "
             "stores only matches; /authorize then enforces the stored set at "
-            "use time. Loopback prefixes MUST end in ':' or '/' to keep the "
-            "startswith() check safe."
+            "use time. Matching parses the URL and rejects embedded userinfo "
+            "before the prefix check, so a ':'-terminated loopback prefix "
+            "cannot be bypassed via 'http://localhost:1@evil.com/'."
         ),
     )
 
@@ -203,18 +225,25 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Used to sign the encrypted session cookie that holds in-flight
-    # OAuth state across the redirect chain (Claude → us → PocketID → us).
-    # If unset, a random 32-byte key is generated at startup; that means
-    # in-flight authorizations are lost on restart, which is acceptable
-    # because the cookie's TTL matches `oauth_code_lifetime_seconds`.
-    oauth_session_secret: str | None = Field(
-        default=None,
-        description=(
-            "Secret used to sign the session cookie. Optional; auto-generated "
-            "at startup if unset. Surface via sops only if you want OAuth "
-            "redirects to survive service restarts."
-        ),
+    # ── DCR metadata size caps ───────────────────────────────────────
+    # Bound the client metadata a single unauthenticated /oauth/register
+    # call can persist, so a burst (even within the rate limit) can't
+    # inflate the SQLite client table with oversized rows.
+    oauth_dcr_max_redirect_uris: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="Max redirect_uris accepted in one DCR request.",
+    )
+    oauth_dcr_max_redirect_uri_length: int = Field(
+        default=512,
+        ge=16,
+        description="Max length (chars) of any single redirect_uri in DCR.",
+    )
+    oauth_dcr_max_client_name_length: int = Field(
+        default=256,
+        ge=1,
+        description="Max length (chars) of client_name accepted in DCR.",
     )
 
     # ── Upstream IdP (PocketID) ──────────────────────────────────────
@@ -257,7 +286,12 @@ class Settings(BaseSettings):
     # ── Grocy ────────────────────────────────────────────────────────
     grocy_base_url: str = Field(
         default="https://grocy.holthome.net",
-        description="Base URL of the Grocy instance (no trailing slash needed).",
+        description=(
+            "Base URL of the Grocy instance (no trailing slash needed). The "
+            "Grocy REST API lives under '/api'; the tools append it "
+            "automatically, so BOTH 'https://grocy.holthome.net' and "
+            "'https://grocy.holthome.net/api' work."
+        ),
     )
     grocy_api_key: str = Field(
         default="",
@@ -334,3 +368,36 @@ class Settings(BaseSettings):
                     f"are missing: {', '.join(missing)}. Set them, or set "
                     "HOMELAB_MCP_OAUTH_REQUIRED=false (dev only, no exposure)."
                 )
+            # The RFC 9728 §3.3 byte-match makes `public_base_url` load-bearing:
+            # issuer/audience/resource are all derived from it, and a client
+            # silently rejects a PRM whose `resource` doesn't equal the URL it
+            # called. Catch obviously-broken values (missing scheme, trailing
+            # slash, embedded path) at startup instead of shipping a PRM the
+            # client will reject with no client-side log line.
+            self._validate_public_base_url()
+
+    def _validate_public_base_url(self) -> None:
+        """Reject a malformed public_base_url before it poisons issuer/resource."""
+        from urllib.parse import urlsplit
+
+        raw = self.public_base_url
+        parts = urlsplit(raw)
+        problems: list[str] = []
+        if parts.scheme not in ("http", "https"):
+            problems.append("must start with http:// or https://")
+        if not parts.hostname:
+            problems.append("must include a host")
+        # A bare trailing slash (path == "/") is tolerated and normalized away
+        # by the derived issuer/resource properties; a real path segment is not.
+        if parts.path not in ("", "/"):
+            problems.append("must not include a path component")
+        if parts.query or parts.fragment:
+            problems.append("must not include a query or fragment")
+        if parts.username is not None or parts.password is not None:
+            problems.append("must not include userinfo")
+        if problems:
+            raise ValueError(
+                "HOMELAB_MCP_PUBLIC_BASE_URL is malformed "
+                f"({raw!r}): {'; '.join(problems)}. Expected exactly "
+                "'<scheme>://<host>[:<port>]', e.g. 'https://mcp.holthome.net'."
+            )

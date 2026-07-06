@@ -21,6 +21,20 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     return Settings()
 
 
+def test_healthz_is_unauthenticated_and_reports_version(settings: Settings) -> None:
+    """/healthz must be reachable without a bearer token and report status+version."""
+    from homelab_mcp import __version__
+
+    app = build_app(settings)
+    with TestClient(app) as client:
+        resp = client.get("/healthz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["version"] == __version__
+    assert "revision" in body
+
+
 def test_prm_endpoint_returns_well_formed_metadata(settings: Settings) -> None:
     """RFC 9728 metadata endpoint must be reachable WITHOUT auth, JSON-shaped, and point at us."""
     app = build_app(settings)

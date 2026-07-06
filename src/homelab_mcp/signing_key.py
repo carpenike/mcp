@@ -37,8 +37,6 @@ from homelab_mcp.config import Settings
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_KID = "homelab-mcp-1"
-
 
 @dataclass(frozen=True)
 class SigningKey:
@@ -110,11 +108,18 @@ def _build_from_pem(pem: bytes) -> SigningKey:
     )
     # JsonWebKey.import_key returns an object with as_dict() we can serve.
     public_jwk = JsonWebKey.import_key(public_pem, {"kty": "RSA", "use": "sig", "alg": "RS256"})
+    # Derive the `kid` from the key's RFC 7638 thumbprint rather than a static
+    # constant. This makes the key id change whenever the key material does
+    # (e.g. an accidental regeneration when the on-disk key is lost), so a
+    # verifier caching JWKS by `kid` gets a cache-miss + refetch instead of
+    # silently validating against a stale key. Sign + verify both read this
+    # same value, so they stay consistent within a process.
+    kid = public_jwk.thumbprint()
     public_dict: dict[str, Any] = dict(public_jwk.as_dict())
-    public_dict["kid"] = _DEFAULT_KID
+    public_dict["kid"] = kid
 
     return SigningKey(
         private_pem=pem,
-        kid=_DEFAULT_KID,
+        kid=kid,
         public_jwk=public_dict,
     )

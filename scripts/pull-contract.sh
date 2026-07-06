@@ -10,9 +10,15 @@
 #
 # Usage:
 #   scripts/pull-contract.sh [ref]
-#     ref   tag/branch/SHA to pin (default: keep the current pin, just refetch)
+#     ref   commit SHA (recommended) or tag/branch to pin
+#           (default: keep the current pin, just refetch + re-verify)
 #
-# Bumping the pin is a deliberate, reviewable step: run with a new tag, then
+# Prefer pinning an immutable commit SHA so the pin can't drift under a moved
+# tag. Whatever ref you pass, this records the per-file sha256 of the fetched
+# content into PINNED.json; hatch_build.py + the build then verify every future
+# fetch against those digests, so a repointed tag or tampered content fails.
+#
+# Bumping the pin is a deliberate, reviewable step: run with a new ref, then
 # review the PINNED.json diff and re-run `make conformance-ci`.
 #
 set -euo pipefail
@@ -22,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${ROOT}/contract"
 PINNED="${DEST}/PINNED.json"
 
-for bin in curl jq; do
+for bin in curl jq sha256sum; do
   command -v "$bin" >/dev/null 2>&1 || { echo "missing required tool: $bin" >&2; exit 2; }
 done
 [[ -f "$PINNED" ]] || { echo "contract/PINNED.json not found" >&2; exit 2; }
@@ -39,9 +45,30 @@ raw "$REF" "CONTRACT.md"   > "${DEST}/CONTRACT.md"
 
 VERSION="$(jq -r '.version' "${DEST}/contract.json")"
 
-# Record only the ref (never the content) in the committed pin file.
-tmp="$(mktemp)"
-jq --arg ref "$REF" '.ref = $ref' "$PINNED" > "$tmp" && mv "$tmp" "$PINNED"
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+JSON_SHA="$(sha_of "${DEST}/contract.json")"
+MD_SHA="$(sha_of "${DEST}/CONTRACT.md")"
 
-echo "Pinned ref ${REF} (contract v${VERSION}). Content staged in contract/ (gitignored)."
+# Record the ref + per-file content digests (never the content itself) in the
+# committed pin file, so the build path can verify integrity of every fetch.
+tmp="$(mktemp)"
+jq \
+  --arg ref "$REF" \
+  --arg version "$VERSION" \
+  --arg json_sha "$JSON_SHA" \
+  --arg md_sha "$MD_SHA" \
+  '.ref = $ref
+   | .version = $version
+   | .sha256 = { "contract.json": $json_sha, "CONTRACT.md": $md_sha }' \
+  "$PINNED" > "$tmp" && mv "$tmp" "$PINNED"
+
+# Refresh the local ref stamp so hatch_build.py sees the cache as current.
+printf '%s\n' "$REF" > "${DEST}/.ref"
+
+echo "Pinned ref ${REF} (contract v${VERSION})."
+echo "  contract.json sha256 ${JSON_SHA}"
+echo "  CONTRACT.md   sha256 ${MD_SHA}"
+echo "Content staged in contract/ (gitignored)."
+echo "If you pinned a tag/branch, consider re-pinning the resolved commit SHA:"
+echo "  git ls-remote ${REPO_URL:-https://github.com/${REPO}} ${REF}"
 echo "Review the PINNED.json diff, then run: make conformance-ci"

@@ -86,17 +86,30 @@ def register(mcp, settings):
 
 **Rules:**
 
-1. Files starting with `_` are ignored (e.g. `_registry.py`).
+1. Files starting with `_` are ignored (e.g. `_registry.py`, `_http.py`).
+   The registry isolates each module: an import error or a raising
+   `register()` in one category is logged and skipped, not fatal to the rest.
 2. Each module gets its own `register(mcp, settings)` function — keep
    tool definitions inside that closure so they can capture URLs from
-   `settings`.
+   `settings`. Create ONE long-lived HTTP client per module with
+   `tools._http.make_client(...)` and reuse it — don't build an
+   `httpx.AsyncClient` per call.
 3. Always validate inputs at the tool boundary. Path-like inputs need
-   strict regexes (see `cooklang.NAME_RE`).
-4. Never raise to the MCP transport — catch upstream errors and return
-   `{"error": "..."}` payloads. Claude can read those and adapt.
+   strict regexes (see `cooklang.NAME_RE`) and single-segment encoding
+   (`tools._http.enc`) so a value can't rewrite the request path.
+4. Never raise to the MCP transport. Use the shared error contract in
+   `tools._http`: raise `ToolError(code, message, hint)` (or let
+   `request_json` map upstream/transport/non-JSON failures to it) and
+   return `err.payload()` at the boundary. Every tool's error is the same
+   shape — `{"error": {"code": ..., "message": ..., "hint": ...}}` — so
+   Claude learns it once. `request_json` also guards `resp.json()` (an
+   SSO/proxy 200-HTML page must not throw a decode error to the transport).
 5. Tool descriptions matter — they're what Claude uses to decide which
    tool to call. Be specific about WHEN to use the tool, not just what
    it does.
+6. List-shaped outputs report truncation explicitly:
+   `{"returned": n, "total": m, "truncated": bool}`. Never silently drop
+   rows — a confident partial answer is worse than a flagged one.
 
 ## Adding a new tool category (the happy path)
 
@@ -128,15 +141,20 @@ gets added next:
    `cooklang_delete_recipe`)
    go through cook.holthome.net's `PUT`/`DELETE /api/recipes/<relpath>`
    API — they
-   never touch the filesystem directly. Slugs are constrained by
-   `NAME_RE = [a-zA-Z0-9_-]+`; folder/path segments are sanitised by
-   `_sanitize_relpath` (no `..`, no `\`, no NUL, no absolute paths) before
-   they reach the wire. New authored recipes default to the `claude/`
-   subfolder. Every write is round-trip validated through the CookLang
-   parser on a throwaway path BEFORE the real target is written, and
-   `create` refuses to clobber an existing recipe unless `overwrite=True`.
-   `delete` is destructive, so it refuses to act unless `confirm=True` —
-   without it, it returns a non-destructive preview of the resolved target.
+   never touch the filesystem directly. The systemd sandbox reflects this:
+   the service is granted NO write access to the recipe tree (only its
+   `StateDirectory`), so even a compromised process can't corrupt recipes
+   directly, bypassing the parser validation the HTTP API enforces. Slugs
+   are constrained by `NAME_RE = [a-zA-Z0-9_-]+`; folder/path segments are
+   sanitised by `_sanitize_relpath` (no `..`, no `\`, no NUL, no absolute
+   paths) before they reach the wire. New authored recipes default to the
+   `claude/` subfolder. Every write is round-trip validated through the
+   CookLang parser on a throwaway path BEFORE the real target is written,
+   and `create` refuses to clobber an existing recipe unless
+   `overwrite=True`. `delete` is destructive, so it refuses to act unless
+   `confirm=True` — without it, it returns a non-destructive preview of the
+   resolved target. Authored frontmatter keys are validated
+   (`^[A-Za-z0-9_-]+$`) so metadata can't inject arbitrary YAML lines.
 3. **No tool shells out without explicit input sanitisation.** Today no
    tool shells out at all. If a future tool does, it MUST use `subprocess`
    with `shell=False` and a fully validated argv list.
@@ -144,6 +162,18 @@ gets added next:
    that took a URL parameter and `httpx.get`'d it would be an SSRF vector.
 5. **Tokens never reach logs.** `auth.py` logs `kid` and `iss` but never
    the token contents. Keep it that way.
+6. **Redirect-URI matching parses the URL — never a bare `startswith`.**
+   `oauth_provider._redirect_allowed` rejects any redirect target carrying
+   userinfo (`user:pass@host`) or a malformed scheme/host BEFORE the prefix
+   check. A naive `startswith` on a `:`-terminated loopback prefix is
+   bypassable (`http://localhost:1@evil.com/`). Don't revert it. The
+   upstream `pocketid-mcp-as` contract specifies the vulnerable prefix
+   semantics; the divergence is deliberate and stays conformant — see
+   `CONTRACT_DEFECT.md`.
+7. **Refresh tokens rotate within a family with reuse detection.** Replaying
+   an already-rotated refresh token revokes the whole rotation family
+   (`oauth_state.consume_refresh`). Keep `family_id` threaded through both
+   grants in `oauth_provider`.
 
 ## Testing rules
 

@@ -39,7 +39,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from authlib.jose import JsonWebKey, JsonWebToken
@@ -131,17 +131,39 @@ def _check_pkce(code_verifier: str, expected_challenge: str, method: str) -> boo
     return False
 
 
+# RFC 6749 §5.1/§5.2: token AND error responses must not be cached.
+_NO_STORE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
 def _redirect_allowed(uri: str, settings: Settings) -> bool:
-    """Return True iff `uri` starts with one of the allowlisted prefixes."""
+    """Return True iff `uri` is an allowlisted redirect target.
+
+    This is NOT a bare startswith(): a prefix ending in ':'
+    (``http://localhost:``) is bypassable by ``http://localhost:1@evil.com/``,
+    whose real host is evil.com but which passes ``startswith``. We first
+    parse the URL and reject any target carrying userinfo (``user:pass@host``)
+    or a malformed host/scheme, THEN apply the prefix check. No legitimate
+    client redirect_uri carries userinfo, so this closes the open-redirect
+    while still accepting every allowlisted prefix. See CONTRACT_DEFECT.md.
+    """
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return False
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
     return any(uri.startswith(p) for p in settings.oauth_redirect_uri_allowlist)
 
 
 def _json_error(status: int, error: str, description: str) -> JSONResponse:
-    """Return an OAuth-shaped error per RFC 6749 §5.2."""
+    """Return an OAuth-shaped error per RFC 6749 §5.2 (uncacheable)."""
     log.info("oauth-error %s: %s (%s)", status, error, description)
     return JSONResponse(
         {"error": error, "error_description": description},
         status_code=status,
+        headers=_NO_STORE_HEADERS,
     )
 
 
@@ -159,11 +181,23 @@ def build_routes(
     register_hits: dict[str, tuple[float, int]] = {}
 
     def _register_rate_limited(request: Request) -> bool:
-        """Record a registration hit for the caller's IP; True if over the cap."""
-        ip = request.client.host if request.client else "unknown"
+        """Record a registration hit for the caller's IP; True if over the cap.
+
+        `request.client.host` is the value uvicorn resolves after applying
+        X-Forwarded-For from trusted proxies only (see `trusted_proxy_ips`),
+        so behind Cloudflare Tunnel it is the real client IP and a direct-to-
+        uvicorn attacker cannot spoof it.
+        """
         now = time.time()
+        window = settings.oauth_register_rate_window_seconds
+        # Evict stale buckets so the dict can't grow unbounded across many
+        # distinct source IPs over the process lifetime.
+        stale = [k for k, (start, _c) in register_hits.items() if now - start >= window]
+        for k in stale:
+            del register_hits[k]
+        ip = request.client.host if request.client else "unknown"
         window_start, count = register_hits.get(ip, (now, 0))
-        if now - window_start >= settings.oauth_register_rate_window_seconds:
+        if now - window_start >= window:
             window_start, count = now, 0
         count += 1
         register_hits[ip] = (window_start, count)
@@ -192,9 +226,6 @@ def build_routes(
                     "none",
                 ],
                 "scopes_supported": ["openid", "email", "profile"],
-                # RFC 8707 resource indicators — Claude sends ?resource=...
-                # and we just echo back support.
-                "resource_indicators_supported": True,
                 # OAuth 2.1 marker (informational; spec doesn't define an
                 # exact field but several clients sniff for it).
                 "service_documentation": "https://github.com/carpenike/mcp",
@@ -230,6 +261,35 @@ def build_routes(
         if not isinstance(redirect_uris, list) or not redirect_uris:
             return _json_error(
                 400, "invalid_redirect_uri", "redirect_uris must be a non-empty array"
+            )
+
+        # Bound the metadata a single unauthenticated call can persist so a
+        # burst (even within the rate limit) can't inflate the client table
+        # with oversized rows.
+        if len(redirect_uris) > settings.oauth_dcr_max_redirect_uris:
+            return _json_error(
+                400,
+                "invalid_redirect_uri",
+                f"too many redirect_uris (max {settings.oauth_dcr_max_redirect_uris})",
+            )
+        if any(
+            isinstance(u, str) and len(u) > settings.oauth_dcr_max_redirect_uri_length
+            for u in redirect_uris
+        ):
+            return _json_error(
+                400,
+                "invalid_redirect_uri",
+                f"redirect_uri exceeds {settings.oauth_dcr_max_redirect_uri_length} chars",
+            )
+        raw_client_name = body.get("client_name")
+        if (
+            isinstance(raw_client_name, str)
+            and len(raw_client_name) > settings.oauth_dcr_max_client_name_length
+        ):
+            return _json_error(
+                400,
+                "invalid_client_metadata",
+                f"client_name exceeds {settings.oauth_dcr_max_client_name_length} chars",
             )
 
         # Filter-don't-reject (VS Code compatibility): VS Code submits four
@@ -296,7 +356,8 @@ def build_routes(
             # 0 means "never expires" per RFC 7591 §3.2.1
             response["client_secret_expires_at"] = 0
 
-        return JSONResponse(response, status_code=201)
+        # The 201 carries client_secret — keep it out of any cache.
+        return JSONResponse(response, status_code=201, headers=_NO_STORE_HEADERS)
 
     # ── /oauth/authorize ─────────────────────────────────────────────
     async def authorize(request: Request) -> Response:
@@ -442,7 +503,10 @@ def build_routes(
         jwks_doc = await _load_upstream_jwks(upstream.jwks_uri)
         try:
             keys = JsonWebKey.import_key_set(jwks_doc)
-            claims = JsonWebToken(["RS256", "ES256"]).decode(id_token, keys)
+            # Pin to RS256, the algorithm PocketID signs id_tokens with (and
+            # the only one we mint). Accepting algorithms the IdP doesn't use
+            # is needless verification surface.
+            claims = JsonWebToken(["RS256"]).decode(id_token, keys)
             claims.validate()  # exp/iat/nbf
         except Exception as e:
             log.warning("pocketid id_token rejected: %s", e)
@@ -512,7 +576,7 @@ def build_routes(
 
     # ── /oauth/token ─────────────────────────────────────────────────
     async def _issue_token_response(
-        *, user_email: str, scope: str | None, client_id: str
+        *, user_email: str, scope: str | None, client_id: str, family_id: str
     ) -> JSONResponse:
         """Mint an access-token JWT plus a rotating refresh token.
 
@@ -520,6 +584,11 @@ def build_routes(
         always hand the client a fresh refresh token. Without a refresh
         token the client would have to re-run the interactive PocketID
         login every time the (short-lived) access token expires.
+
+        `family_id` ties the new refresh token to its rotation chain: a
+        fresh id for the first token (authorization_code grant), the parent's
+        id for a rotated token (refresh_token grant). Reuse detection keys
+        off this — see `OAuthState.consume_refresh`.
         """
         now = int(time.time())
         access_token = (
@@ -550,6 +619,7 @@ def build_routes(
                 user_email=user_email,
                 scope=scope,
                 expires_at=time.time() + settings.oauth_refresh_token_lifetime_seconds,
+                family_id=family_id,
             ),
         )
 
@@ -566,7 +636,8 @@ def build_routes(
                 "expires_in": settings.oauth_access_token_lifetime_seconds,
                 "refresh_token": refresh_token,
                 "scope": scope or "",
-            }
+            },
+            headers=_NO_STORE_HEADERS,
         )
 
     async def token(request: Request) -> JSONResponse:
@@ -611,10 +682,13 @@ def build_routes(
                 )
             # RFC 6749 §6: a narrowed scope may be requested; we keep the
             # original scope (single-user homelab — no scope downscoping).
+            # Rotate within the same family so reuse detection can trace the
+            # whole chain.
             return await _issue_token_response(
                 user_email=stored.user_email,
                 scope=stored.scope,
                 client_id=client_id,
+                family_id=stored.family_id,
             )
 
         # ── authorization_code grant ─────────────────────────────────
@@ -634,10 +708,12 @@ def build_routes(
         if not _check_pkce(code_verifier, issued.code_challenge, issued.code_challenge_method):
             return _json_error(400, "invalid_grant", "PKCE verification failed")
 
+        # First token of a new rotation chain: mint a fresh family id.
         return await _issue_token_response(
             user_email=issued.user_email,
             scope=issued.scope,
             client_id=client_id,
+            family_id=secrets.token_urlsafe(16),
         )
 
     return [

@@ -59,13 +59,16 @@
         default = pkgs.mkShell {
           packages = [
             (pkgs.python313.withPackages (ps: with ps; [
-              # Runtime deps — kept in lock-step with pyproject.toml.
+              # Runtime deps. SOURCE OF TRUTH is pyproject.toml
+              # [project.dependencies]; this list is a hand-maintained mirror
+              # for the dev shell and can drift. When you change a dependency
+              # in pyproject.toml, update this list (and nix/package.nix's
+              # `dependencies`) to match — there is no automatic derivation.
               mcp
               starlette
               uvicorn
               httpx
               authlib
-              itsdangerous
               pyjwt
               cryptography
               pydantic
@@ -85,7 +88,7 @@
             echo "  pytest                 — run tests"
             echo "  ruff check . && ruff format --check ."
             echo "  mypy src               — type check"
-            echo "  homelab-mcp            — run the server (set HOMELAB_MCP_CF_ACCESS_REQUIRED=false for local dev)"
+            echo "  homelab-mcp            — run the server (set HOMELAB_MCP_OAUTH_REQUIRED=false for local dev)"
           '';
         };
       });

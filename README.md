@@ -266,7 +266,6 @@ inputs.homelab-mcp = {
     #   HOMELAB_MCP_POCKETID_CLIENT_SECRET=...
     # Optionally:
     #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, PKCS#8, escaped \n>
-    #   HOMELAB_MCP_OAUTH_SESSION_SECRET=<32+ random bytes>
     environmentFile = config.sops.secrets."homelab-mcp/env".path;
   };
 }

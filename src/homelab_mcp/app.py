@@ -14,6 +14,7 @@ The CLI install (`pyproject.toml -> [project.scripts]`) points
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import uvicorn
@@ -22,15 +23,70 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from homelab_mcp import __version__, oauth_provider, signing_key
 from homelab_mcp import contract as contract_hosting
-from homelab_mcp import oauth_provider, signing_key
 from homelab_mcp.auth import JWTAuthMiddleware
+from homelab_mcp.buildinfo import build_revision
 from homelab_mcp.config import Settings
 from homelab_mcp.oauth_state import OAuthState
 from homelab_mcp.tools import register_all
 
 log = logging.getLogger("homelab_mcp")
+
+HEALTH_PATH = "/healthz"
+
+
+async def _healthz(_request: Request) -> JSONResponse:
+    """Unauthenticated liveness probe.
+
+    Cheap, dependency-free (does not touch upstreams or the DB) so a proxy /
+    monitor can confirm the process is up without a bearer token. Surfaces
+    the running version + build revision so a deploy can be verified.
+    """
+    return JSONResponse({"status": "ok", "version": __version__, "revision": build_revision()})
+
+
+class RequestLogMiddleware:
+    """Emit one INFO line per HTTP request: method, path, status, duration, user.
+
+    Installed INNER of the JWT middleware so `scope["user"]` (set on a
+    successful auth) is populated by the time we read it. Never logs headers,
+    tokens, or bodies — only the metadata a homelab operator needs to see
+    that the server is actually serving. This closes the "the observer is
+    itself unobservable" gap without the noise of uvicorn's access log.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        start = time.monotonic()
+        status_holder = {"status": 0}
+
+        async def _send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                status_holder["status"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        finally:
+            dur_ms = (time.monotonic() - start) * 1000.0
+            user = scope.get("user") or {}
+            email = user.get("email") if isinstance(user, dict) else None
+            log.info(
+                "%s %s -> %s (%.1fms)%s",
+                scope.get("method", "?"),
+                scope.get("path", "?"),
+                status_holder["status"] or "-",
+                dur_ms,
+                f" user={email}" if email else "",
+            )
 
 
 def _build_protected_resource_metadata(settings: Settings, *, resource: str) -> dict[str, object]:
@@ -115,6 +171,9 @@ def build_app(settings: Settings) -> Starlette:
     for route in contract_hosting.build_routes():
         app.router.routes.append(route)
 
+    # Unauthenticated liveness probe — always served, exempted from JWT below.
+    app.router.routes.append(Route(HEALTH_PATH, _healthz, methods=["GET"]))
+
     if not settings.oauth_required:
         log.warning(
             "OAuth DISABLED — anyone who reaches this port can call any tool. "
@@ -128,6 +187,9 @@ def build_app(settings: Settings) -> Starlette:
     state = OAuthState.open(
         settings.oauth_state_db_path,
         client_retention_seconds=settings.oauth_client_retention_seconds,
+        # A replayed refresh token only matters while its family could still
+        # be live, so keep reuse-detection tombstones for the refresh TTL.
+        consumed_retention_seconds=settings.oauth_refresh_token_lifetime_seconds,
     )
     # One-shot boot cleanup: drop expired refresh tokens and abandoned
     # DCR clients so the persisted table doesn't grow without bound.
@@ -168,7 +230,11 @@ def build_app(settings: Settings) -> Starlette:
         )
     )
 
-    # ── Install JWT middleware ──────────────────────────────────────
+    # ── Install middleware ──────────────────────────────────────────
+    # Order matters: add_middleware stacks last-added outermost. We want the
+    # request logger INNER of the JWT layer so it can read scope["user"] that
+    # JWT auth sets — so add the logger FIRST, then JWT auth.
+    app.add_middleware(RequestLogMiddleware)
     app.add_middleware(
         JWTAuthMiddleware,
         signing_key=key,
@@ -178,8 +244,9 @@ def build_app(settings: Settings) -> Starlette:
         # clients (VS Code) at the path-suffixed PRM so they can discover
         # the AS without guessing well-known paths.
         resource_metadata_url=settings.issuer + settings.prm_path_suffixed,
-        # The public contract-hosting docs stay outside the bearer path.
-        extra_unauthenticated_paths=contract_hosting.CONTRACT_PATHS,
+        # The public contract-hosting docs + health probe stay outside the
+        # bearer path.
+        extra_unauthenticated_paths=contract_hosting.CONTRACT_PATHS | {HEALTH_PATH},
     )
     log.info(
         "OAuth enabled (issuer=%s audience=%s upstream=%s)",
@@ -206,14 +273,21 @@ def main() -> None:
 
     app = build_app(settings)
 
+    # Trust X-Forwarded-* only from the configured proxy peer(s). Behind
+    # Cloudflare Tunnel the real client IP arrives via X-Forwarded-For from
+    # cloudflared on loopback; pinning forwarded_allow_ips stops a direct-to-
+    # uvicorn attacker from spoofing it to defeat the DCR rate limiter.
+    forwarded_allow_ips = [ip.strip() for ip in settings.trusted_proxy_ips.split(",") if ip.strip()]
     uvicorn.run(
         app,
         host=settings.bind_address,
         port=settings.port,
         log_level=settings.log_level,
-        # Uvicorn's access log spams DEBUG-level lines per request and the
-        # claim metadata we want is already logged by JWTAuthMiddleware.
+        # Our RequestLogMiddleware emits the metadata we care about; uvicorn's
+        # access log would just duplicate it more noisily.
         access_log=False,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips or "127.0.0.1",
     )
 
 

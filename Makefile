@@ -45,7 +45,10 @@ contract-pull:
 conformance:
 	@ref=$$(jq -r '.ref' contract/PINNED.json); \
 	dir=$$(mktemp -d); \
-	git clone --quiet --depth 1 --branch $$ref https://github.com/carpenike/mcp-as-contract $$dir; \
+	git init --quiet $$dir; \
+	git -C $$dir remote add origin https://github.com/carpenike/mcp-as-contract; \
+	git -C $$dir fetch --quiet --depth 1 origin $$ref; \
+	git -C $$dir checkout --quiet FETCH_HEAD; \
 	bash $$dir/conformance/check.sh $(ORIGIN) jwt-refresh mcp-only --mcp-path /mcp; \
 	rc=$$?; rm -rf $$dir; exit $$rc
 
