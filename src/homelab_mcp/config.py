@@ -305,6 +305,84 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Home Assistant ───────────────────────────────────────────────
+    ha_base_url: str = Field(
+        default="",
+        description=(
+            "Base URL of the Home Assistant instance, e.g. "
+            "'https://hass.holthome.net' (no trailing slash needed; the REST "
+            "API lives under '/api' and the tools append it). Empty disables "
+            "the ha_* tools — they return a configuration error instead of "
+            "calling out."
+        ),
+    )
+    ha_token: str = Field(
+        default="",
+        description=(
+            "Home Assistant long-lived access token, sent as "
+            "'Authorization: Bearer' on every HA request. SECRET — supply via "
+            "the sops-managed EnvironmentFile (HOMELAB_MCP_HA_TOKEN), never "
+            "via the world-readable Nix `settings`. Create it under the HA "
+            "user's profile → Security → Long-lived access tokens. Prefer a "
+            "DEDICATED HA user; note the automation config-API tools "
+            "(ha_get_automation / ha_upsert_automation) require that user to "
+            "be an HA administrator. If empty, the ha_* tools return a "
+            "configuration error instead of calling out."
+        ),
+    )
+    ha_domain_allowlist: list[str] = Field(
+        default=[
+            "light",
+            "switch",
+            "fan",
+            "scene",
+            "script",
+            "media_player",
+            "climate",
+            "vacuum",
+            "humidifier",
+            "input_boolean",
+            "automation",
+        ],
+        description=(
+            "Domains `ha_call_service` may actuate. BOTH the service domain "
+            "and the target entity's domain must be on this list. Anything "
+            "else is refused at the tool boundary — this is the HA "
+            "equivalent of 'upstream URLs never come from user input': the "
+            "callable service surface is operator-configured, not "
+            "model-chosen. High-impact domains (lock, alarm_control_panel, "
+            "cover, siren, valve) are deliberately absent from the default; "
+            "adding one of them also subjects it to the confirm gate "
+            "(`ha_confirm_domains`). Env value is a JSON array."
+        ),
+    )
+    ha_confirm_domains: list[str] = Field(
+        default=["lock", "alarm_control_panel", "cover", "siren", "valve"],
+        description=(
+            "Domains whose service calls additionally require confirm=true. "
+            "Without it the tool returns a non-destructive preview of the "
+            "target entity instead of actuating (same pattern as "
+            "cooklang_delete_recipe). Only matters for domains that are ALSO "
+            "on `ha_domain_allowlist`; the defaults keep the gate armed if "
+            "an operator later allowlists a high-impact domain. Env value is "
+            "a JSON array."
+        ),
+    )
+    ha_confirm_timeout_seconds: float = Field(
+        default=3.0,
+        ge=0.1,
+        le=30.0,
+        description=(
+            "How long `ha_call_service` polls the entity after a service "
+            "call before reporting confirmed=false. HA acknowledges a "
+            "service call when it is DISPATCHED, not when the device "
+            "actually changed — Zigbee/Z-Wave/Wi-Fi round-trips take up to "
+            "a few seconds. The tool re-reads the entity until it converges "
+            "or this deadline passes, so 'confirmed' means observed state, "
+            "never intent."
+        ),
+    )
+
     # ── Derived ──────────────────────────────────────────────────────
     @property
     def pocketid_redirect_uri(self) -> str:
