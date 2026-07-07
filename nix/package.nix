@@ -26,8 +26,8 @@ let
   # hatch_build.py expects them; the hook then verifies their sha256 against
   # contract/PINNED.json and, seeing a match, skips its own network fetch.
   # `rev` MUST equal contract/PINNED.json `.ref` (the immutable commit SHA) —
-  # CI asserts this. This is v1.2.0 content pinned to the main commit it landed
-  # on (v1.2.0 was untagged at pin time; see PINNED.json `.tag`).
+  # CI asserts this. This is the commit the v1.2.0 tag peels to (see
+  # PINNED.json `.tag`).
   contractSrc = fetchFromGitHub {
     owner = "carpenike";
     repo = "mcp-as-contract";
