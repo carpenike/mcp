@@ -176,6 +176,27 @@ gets added next:
    an already-rotated refresh token revokes the whole rotation family
    (`oauth_state.consume_refresh`). Keep `family_id` threaded through both
    grants in `oauth_provider`.
+8. **Home Assistant is a physical control plane — its tools are gated,
+   closed-loop, and audited.** `ha_call_service` refuses any domain not on
+   the operator-configured allowlist (`HOMELAB_MCP_HA_DOMAIN_ALLOWLIST`),
+   checked for BOTH the service domain and the target entity's domain, so
+   an allowlisted service can't smuggle in a non-allowlisted entity.
+   High-impact domains (`HOMELAB_MCP_HA_CONFIRM_DOMAINS`: lock, alarm,
+   cover, …) additionally require `confirm=true` and return a
+   non-destructive preview without it. Every actuation reads the entity
+   before AND after the call (polling up to the confirm timeout) and
+   reports an honest `confirmed` flag — HA acknowledges a service call
+   when it is *dispatched*, not when the device changed, so a tool must
+   never report intent as outcome. Automation edits go ONLY through HA's
+   config API (`/api/config/automation/config/<id>`), which validates and
+   hot-reloads — this service must NEVER get filesystem access to HA's
+   config directory (raw YAML write access is arbitrary-code-execution on
+   the HA host via `shell_command` et al., and bypasses HA's validation).
+   All writes emit an audit line on the `homelab_mcp.audit` logger
+   (tool, target, args, outcome) because `RequestLogMiddleware` only sees
+   `POST /mcp`. The HA token (`HOMELAB_MCP_HA_TOKEN`, sops-managed) never
+   comes from user input and is never logged; prefer a dedicated HA user
+   (admin only if the automation config-API tools are needed).
 
 ## Testing rules
 

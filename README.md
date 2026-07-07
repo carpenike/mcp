@@ -145,6 +145,44 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Grocy | `grocy_ensure` | Idempotently create a `kind='location'`/`'unit'`/`'store'` (store takes an optional `address` userfield) — absorbs the three old ensure tools |
 | Grocy | `grocy_seed_defaults` | One-shot bootstrap of default locations + units (idempotent) |
 | Grocy | `grocy_health` | Connectivity + Grocy version check |
+| Home Assistant | `ha_list_entities` | Find entities by domain and/or free-text search (id + friendly name) — the "never guess an entity_id" tool |
+| Home Assistant | `ha_get_state` | One entity's full state + attributes + availability; the re-check tool when a device "didn't respond" |
+| Home Assistant | `ha_get_history` | One entity's recent state changes over the last N hours |
+| Home Assistant | `ha_call_service` | Closed-loop actuation: allowlisted domains only, `confirm=true` gate on high-impact domains, and an observed before/after read-back — `confirmed` means the entity actually transitioned, never just "HA accepted the call" |
+| Home Assistant | `ha_list_automations` | Automations with enabled state, last-triggered, and whether they're editable via the config API (id) or YAML/git-managed |
+| Home Assistant | `ha_get_automation` | One automation's full config via HA's config API (admin token required) |
+| Home Assistant | `ha_upsert_automation` | Create/update an automation through HA's validated + hot-reloading config API; previews the diff unless `confirm=true` |
+| Home Assistant | `ha_check_config` | HA's own full configuration check (Developer Tools → Check configuration) |
+| Home Assistant | `ha_health` | Connectivity + HA version check |
+
+### Home Assistant posture
+
+HA is a **physical control plane**, so its category is stricter than the
+data-shaped ones (see AGENTS.md security non-negotiable #8):
+
+  - **Domain allowlist** (`HOMELAB_MCP_HA_DOMAIN_ALLOWLIST`, JSON array):
+    `ha_call_service` checks BOTH the service domain and the target entity's
+    domain. High-impact domains (lock, alarm_control_panel, cover, siren,
+    valve) are excluded by default; adding one also arms the confirm gate
+    (`HOMELAB_MCP_HA_CONFIRM_DOMAINS`), which returns a non-destructive
+    preview unless `confirm=true`.
+  - **Closed-loop actuation:** HA acks a service call when it's *dispatched*,
+    not when the device changed. Every actuation re-reads the entity (polling
+    up to `HOMELAB_MCP_HA_CONFIRM_TIMEOUT_SECONDS`, default 3s) and returns
+    `{before, after, confirmed, assumed_state}` — so the assistant can say
+    "HA accepted it but the light still reports off" instead of a false "Done".
+  - **Automations via API, never the filesystem:** edits go through
+    `/api/config/automation/config/<id>` (the HA UI editor's own endpoints —
+    validated, atomic, hot-reloaded). This service gets no access to HA's
+    config directory; hand-written YAML automations stay owned by the config
+    repo and are flagged read-only in `ha_list_automations`.
+  - **Audit trail:** every executed/previewed/denied write logs one line on
+    the `homelab_mcp.audit` logger (tool, target, args, outcome), because the
+    request log only ever sees `POST /mcp`.
+  - **Token custody:** `HOMELAB_MCP_HA_TOKEN` is a long-lived token from a
+    dedicated HA user, sops-managed, never logged. The automation config-API
+    tools require that user to be an HA administrator; if you skip those
+    tools, use a non-admin user.
 
 ## Architecture
 
@@ -175,7 +213,8 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
            ├──► fedcook.holthome.net  (federation search)
            ├──► cook.holthome.net     (CookLang recipes: read + author + shopping list)
            ├──► gatus.holthome.net    (uptime monitoring)
-           └──► grocy.holthome.net    (food inventory: stock + master data)
+           ├──► grocy.holthome.net    (food inventory: stock + master data)
+           └──► hass.holthome.net     (Home Assistant: states + services + automations)
 ```
 
 JWTs are RS256, signed by a 2048-bit RSA key resident on the host. The key comes from one of:
@@ -229,6 +268,7 @@ Coverage focuses on the security-critical bits:
   - `tests/test_auth.py` — JWT validation rejection paths (real RSA keypair).
   - `tests/test_oauth_flow.py` — end-to-end OAuth dance with PocketID mocked.
   - `tests/test_tools_cooklang.py` — recipe CRUD against a mocked CookLang wire + slug/path-traversal hardening.
+  - `tests/test_tools_ha.py` — HA domain allowlist + confirm gate + the closed-loop `confirmed` contract (a 200 on the service call must never read as "device changed").
   - `tests/test_app.py` — discovery + allowlist + middleware wiring.
 
 ## Deployment
@@ -259,10 +299,20 @@ inputs.homelab-mcp = {
       HOMELAB_MCP_COOKLANG_BASE_URL   = "https://cook.holthome.net";
       HOMELAB_MCP_FEDERATION_BASE_URL = "https://fedcook.holthome.net";
       HOMELAB_MCP_GATUS_BASE_URL      = "https://gatus.holthome.net";
+      HOMELAB_MCP_HA_BASE_URL         = "https://hass.holthome.net";
+      # Recommended once the physical-control (ha_*) category is enabled:
+      # tighten who can log in and how long a bearer token lives. Refresh
+      # rotation makes the shorter access-token lifetime invisible to clients.
+      HOMELAB_MCP_OAUTH_USER_ALLOWLIST = ''["ryan@ryanholt.net"]'';
+      HOMELAB_MCP_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS = "14400"; # 4h
+      # Optional overrides (shown with their defaults):
+      # HOMELAB_MCP_HA_DOMAIN_ALLOWLIST = ''["light","switch","fan","scene","script","media_player","climate","vacuum","humidifier","input_boolean","automation"]'';
+      # HOMELAB_MCP_HA_CONFIRM_DOMAINS  = ''["lock","alarm_control_panel","cover","siren","valve"]'';
     };
 
     # sops-managed env file with at minimum:
     #   HOMELAB_MCP_POCKETID_CLIENT_SECRET=...
+    #   HOMELAB_MCP_HA_TOKEN=<HA long-lived access token, dedicated user>
     # Optionally:
     #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, PKCS#8, escaped \n>
     environmentFile = config.sops.secrets."homelab-mcp/env".path;
