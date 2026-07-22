@@ -35,6 +35,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
@@ -110,6 +111,18 @@ WIKI_TEXT_MAX = 8000
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _NORM_RE = re.compile(r"[^a-z0-9]+")
+
+# Every arc_* tool is a pure lookup against public upstreams. Declaring
+# that explicitly matters: claude.ai's permission UI groups a connector's
+# tools by these hints ("Read-only tools" vs "Write/delete tools") and
+# lumps unannotated tools into an individually-approved "Other tools"
+# bucket. openWorldHint stays true — these DO reach external services.
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
 
 # Known hideout module files in RaidTheory/arcraiders-data. Used as a
 # fallback when the GitHub directory-listing API is unavailable (e.g.
@@ -437,6 +450,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── items ───────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_search_items",
         description=(
             "Search the ARC Raiders item database (weapons, ammo, gear, "
@@ -493,6 +507,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── quests ──────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_search_quests",
         description=(
             "Search ARC Raiders quests by name (empty query lists all, "
@@ -533,6 +548,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── trader stock ────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_get_trader_stock",
         description=(
             "Current ARC Raiders trader inventories: what each trader "
@@ -581,6 +597,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── keep-or-sell ────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_check_item_keep",
         description=(
             "Keep/sell/recycle helper — the one call for 'is this ARC "
@@ -719,6 +736,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── event schedule ──────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_get_event_schedule",
         description=(
             "The rotating ARC Raiders in-raid event schedule (Harvester, "
@@ -770,6 +788,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── maps ────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_list_maps",
         description=(
             "List the ARC Raiders playable maps (Dam Battlegrounds, Buried "
@@ -801,6 +820,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── wiki ────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_search_wiki",
         description=(
             "Full-text search of the ARC Raiders Wiki (the Embark-supported "
@@ -850,6 +870,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=READ_ONLY,
         name="arc_get_wiki_page",
         description=(
             "Fetch one ARC Raiders Wiki page by exact title: the prose as "

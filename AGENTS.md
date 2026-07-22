@@ -221,8 +221,16 @@ gets added next:
 - `ruff format` then `ruff check` then `mypy src` before committing.
   CI enforces all three.
 - All public functions: type-annotated, with a one-line docstring.
-- Tool decorators: use `name` + `description`. Skip `annotations.title`
-  for now (newer MCP SDK feature; client support is uneven).
+- Tool decorators: use `name` + `description`, and set the four
+  `annotations` booleans (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`) — claude.ai's permission UI groups
+  a connector's tools by these hints ("Read-only tools" vs "Write/delete
+  tools") and dumps unannotated tools into an individually-approved
+  "Other tools" bucket. Read-only categories can share one module-level
+  `ToolAnnotations` constant (see `arcraiders.READ_ONLY`). Be truthful:
+  never mark a state-changing tool read-only to smooth approvals — the
+  hints are a security signal first, display grouping second. Still skip
+  `annotations.title` (client support is uneven).
 
 ## Versioning
 
