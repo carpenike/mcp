@@ -27,7 +27,9 @@ class CapturingMCP:
     def __init__(self) -> None:
         self.tools: dict[str, Callable[..., Any]] = {}
 
-    def tool(self, *, name: str, description: str = "") -> Callable[..., Any]:
+    def tool(
+        self, *, name: str, description: str = "", annotations: Any = None
+    ) -> Callable[..., Any]:
         def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[name] = fn
             return fn

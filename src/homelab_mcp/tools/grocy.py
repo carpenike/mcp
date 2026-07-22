@@ -38,6 +38,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
 import httpx
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
@@ -48,6 +49,24 @@ if TYPE_CHECKING:
     from homelab_mcp.config import Settings
 
 log = logging.getLogger(__name__)
+
+# Annotation hints: claude.ai's permission UI groups a connector's tools
+# by these ("Read-only tools" vs "Write/delete tools"); unannotated tools
+# land in an individually-approved "Other tools" bucket. Be truthful —
+# security signal first, display grouping second (AGENTS.md). All
+# upstreams here are fixed internal homelab services: openWorldHint=False.
+_RO = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_ADDITIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_OVERWRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
+_MUTATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
 
 # Bound on how long we wait for any single Grocy call.
 _TIMEOUT = 15
@@ -541,6 +560,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # Diagnostics / bootstrap
     # ─────────────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="grocy_health",
         description=(
             "Check connectivity to Grocy and report its version. Call this first "
@@ -590,6 +610,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return result
 
     @mcp.tool(
+        annotations=_ADDITIVE,
         name="grocy_seed_defaults",
         description=(
             "One-shot, idempotent bootstrap for a blank Grocy instance: creates "
@@ -673,6 +694,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=_ADDITIVE,
         name="grocy_ensure",
         description=(
             "Idempotently ensure a piece of master data exists, dispatched by "
@@ -730,6 +752,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # Reads
     # ─────────────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="grocy_find_products",
         description=(
             "Find products by name (case-insensitive substring) across ALL master "
@@ -758,6 +781,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=_RO,
         name="grocy_attention",
         description=(
             "The 'what needs attention?' feed, summarized (not raw stock rows). "
@@ -872,6 +896,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # The keystone walkthrough tool
     # ─────────────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_MUTATE,
         name="grocy_stock_item",
         description=(
             "Book a single item in or out during a freezer/fridge/pantry "
@@ -1237,6 +1262,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # Enrichment reads (read-only; surface what Grocy's engine computes)
     # ─────────────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="grocy_convert_units",
         description=(
             "Convert an amount of a product between quantity units using Grocy's "
@@ -1296,6 +1322,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=_RO,
         name="grocy_product_card",
         description=(
             "The full enriched picture behind a product — what Grocy's product/"
@@ -1378,6 +1405,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=_RO,
         name="grocy_consumption_history",
         description=(
             "Burn rate for a product — 'how fast do we go through X' — derived from "
@@ -1467,6 +1495,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
+        annotations=_RO,
         name="grocy_stock_value",
         description=(
             "What the inventory is worth: total value of current stock in Grocy's "
@@ -1525,6 +1554,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return out
 
     @mcp.tool(
+        annotations=_RO,
         name="grocy_stock_by_location",
         description=(
             "On-hand stock grouped by storage location — 'what's in the chest "
@@ -1600,6 +1630,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # create — upsert only, no delete)
     # ─────────────────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_OVERWRITE,
         name="grocy_set_unit_conversion",
         description=(
             "Add or update a quantity-unit conversion so `grocy_convert_units` can "
