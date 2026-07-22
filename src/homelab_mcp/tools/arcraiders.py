@@ -115,6 +115,18 @@ answer is an enemy to kill — `arc_who_drops(item)` names it, then
 weapon vs ARC" loadout questions use `arc_compare_weapons` — its
 `armor_penetration` field is the deciding stat (item search lacks it).
 
+**Cross-device state**: the user's module levels, active quests/projects,
+loadout, and stash persist server-side (arc_get_state / arc_set_state),
+so a conversation started on desktop continues from a phone. When the
+user reports progress ("upgraded Refiner", "picked up The Trifecta",
+"finished phase 4"), offer to record it — arc_set_state returns a diff;
+tell the user exactly what changed, never rewrite silently. From any
+device, `arc_plan_upgrades(use_state=true)` plans in one call; if its
+state_used shows the stash section stale, ask for fresh counts of the
+shopping-list items instead of trusting day-old numbers. Explicit
+values from chat always beat stored state. On a season wipe, reset via
+arc_set_state({season: "s2"}, mode="reset") — old seasons stay readable.
+
 **Personal raid history**: when the user recaps a raid ("died at
 Spaceport, lost the Ferro"), offer to log it via `arc_log_raid` — one
 sentence is enough; don't interrogate for every field. Answer "does
@@ -157,6 +169,17 @@ TTL_STATIC = 21600
 # Project end dates further out than this are sentinels ("no deadline"),
 # not real deadlines — surfaced as permanent: true instead of a date.
 PERMANENT_HORIZON_S = 3 * 365 * 86400
+
+# Cross-device player state: the sections mirror arc_plan_upgrades'
+# params exactly so there is no translation layer to drift. Staleness is
+# PER SECTION — the objection that parked a persistent stash applies to
+# exactly one section (stash counts rot in hours; module levels don't),
+# so it's encoded per section instead of poisoning the whole blob.
+STATE_SECTIONS = ("modules", "progression", "loadout", "stash", "notes")
+STATE_STALE_AFTER_S: dict[str, float] = {
+    "stash": 12 * 3600,
+    "progression": 7 * 86400,
+}
 
 # Wiki pages can be long; cap what we return so one tool call can't flood
 # the context window. Truncation is always flagged, never silent.
@@ -1358,9 +1381,20 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     )
     async def plan_upgrades(
         current_levels: Annotated[
-            dict[str, int],
+            dict[str, int] | None,
             Field(description="Module name -> current level. 0 = not built. Omit if unknown."),
-        ],
+        ] = None,
+        use_state: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Read module levels, stash, and active quests/projects from the "
+                    "stored player state (arc_set_state) — one-call planning from any "
+                    "device. Explicit params override state; the response echoes which "
+                    "sections were used and their ages."
+                )
+            ),
+        ] = False,
         stash: Annotated[
             dict[str, int] | None,
             Field(description="Item name -> count on hand. Omit entirely if unknown."),
@@ -1400,6 +1434,49 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             Field(description="Module order for greedy stash allocation. Default: no allocation."),
         ] = None,
     ) -> dict[str, Any]:
+        # Stored-state integration: fill any param the caller omitted from
+        # the persisted blob. Explicit params always win (chat beats
+        # stored state) and the response says which source won.
+        state_used: dict[str, Any] = {}
+        if use_state:
+            if store is None:
+                return _store_error()
+            season = await store.current_season()
+            sections = await store.state_sections(season)
+            state_now = time.time()
+
+            def _used_meta(section: str) -> dict[str, Any]:
+                content_ts = sections[section][1]
+                return {**_section_meta(content_ts, section, state_now), "source": "state"}
+
+            if "modules" in sections:
+                if current_levels is None:
+                    current_levels = cast(dict[str, int], sections["modules"][0])
+                    state_used["modules"] = _used_meta("modules")
+                else:
+                    state_used["modules"] = {"source": "param"}
+            if "stash" in sections:
+                if stash is None:
+                    stash = cast(dict[str, int], sections["stash"][0])
+                    state_used["stash"] = _used_meta("stash")
+                else:
+                    state_used["stash"] = {"source": "param"}
+            prog = cast(dict[str, Any], sections.get("progression", ({}, 0.0))[0])
+            if active_quests is None and prog.get("active_quests"):
+                active_quests = list(prog["active_quests"])
+                include_quests = True
+                state_used["progression.active_quests"] = _used_meta("progression")
+            if active_projects is None and prog.get("active_projects"):
+                active_projects = dict(prog["active_projects"])
+                include_projects = True
+                state_used["progression.active_projects"] = _used_meta("progression")
+        if current_levels is None:
+            return ToolError(
+                "arcraiders_missing_levels",
+                "No module levels provided.",
+                "Pass current_levels, or store them once with arc_set_state and "
+                "call with use_state=true.",
+            ).payload()
         modules_db = await _hideout_modules()
         if not modules_db:
             return ToolError(
@@ -1787,6 +1864,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 )
                 > 0
             ),
+            **({"state_used": state_used} if use_state else {}),
             "coverage": _coverage(
                 quests=quests_coverage,
                 projects=projects_coverage,
@@ -2121,6 +2199,342 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "total": sum(loot),
                 "average": round(sum(loot) / len(loot)) if loot else None,
             },
+        }
+
+    # ── player state (cross-device continuity) ──────────────────────
+    def _section_meta(updated_at: float, section: str, now: float) -> dict[str, Any]:
+        """Server-computed age/staleness — a caller doing date math is a
+        caller getting it wrong (same principle as 'never sum by hand')."""
+        threshold = STATE_STALE_AFTER_S.get(section)
+        age_h = round((now - updated_at) / 3600, 1)
+        return {
+            "updated_at": _iso_utc(updated_at * 1000),
+            "age_hours": age_h,
+            "stale": bool(threshold is not None and (now - updated_at) > threshold),
+        }
+
+    async def _state_blob(season: str) -> dict[str, Any]:
+        """Full state for a season, with per-section _meta."""
+        assert store is not None
+        sections = await store.state_sections(season)
+        now = time.time()
+        blob: dict[str, Any] = {"season": season}
+        meta: dict[str, Any] = {}
+        for name in STATE_SECTIONS:
+            if name in sections:
+                content, ts = sections[name]
+                blob[name] = content
+                meta[name] = _section_meta(ts, name, now)
+        blob["_meta"] = meta
+        return blob
+
+    async def _resolve_stash_names(
+        raw: dict[str, Any],
+    ) -> tuple[dict[str, int], list[dict[str, Any]]]:
+        """Resolve stash keys to canonical item names (exact norm wins,
+        unique squash resolves, ambiguity is returned, never guessed)."""
+        items = await _all_items()
+        by_norm = {_norm(i.get("name") or ""): i for i in items}
+        resolved: dict[str, int] = {}
+        unresolved: list[dict[str, Any]] = []
+        for key, count in raw.items():
+            key_norm = _norm(str(key))
+            if key_norm in by_norm:
+                name = str(by_norm[key_norm].get("name"))
+                resolved[name] = resolved.get(name, 0) + _qty(count)
+                continue
+            squash = key_norm.replace(" ", "")
+            matches = sorted(
+                {
+                    str(i.get("name"))
+                    for n, i in by_norm.items()
+                    if i.get("name")
+                    and (
+                        n.replace(" ", "") == squash
+                        or (len(squash) > 3 and n.replace(" ", "") == squash.rstrip("s"))
+                    )
+                }
+            )
+            if len(matches) == 1:
+                resolved[matches[0]] = resolved.get(matches[0], 0) + _qty(count)
+            else:
+                unresolved.append({"key": str(key), "candidates": matches[:6]})
+        return resolved, unresolved
+
+    @mcp.tool(
+        annotations=READ_ONLY_LOCAL,
+        name="arc_get_state",
+        description=(
+            "Read the stored cross-device player state: module levels, "
+            "progression (raider level, active quests/projects), loadout, "
+            "stash counts, and notes — each with server-computed "
+            "_meta.age_hours and a per-section stale flag (stash rots in "
+            "12h, progression in 7d; modules/loadout never). Pass "
+            "section to read one section, or season to read an archived "
+            "season for prestige comparisons."
+        ),
+    )
+    async def get_state(
+        section: Annotated[
+            str, Field(description="One of modules|progression|loadout|stash|notes; empty = all.")
+        ] = "",
+        season: Annotated[
+            str, Field(description="Archived season to read (default: current).")
+        ] = "",
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        if section and section not in STATE_SECTIONS:
+            return ToolError(
+                "arcraiders_unknown_section",
+                f"Unknown state section {section!r}.",
+                f"Valid sections: {', '.join(STATE_SECTIONS)}.",
+            ).payload()
+        target_season = season or await store.current_season()
+        blob = await _state_blob(target_season)
+        if section:
+            return {
+                "season": target_season,
+                section: blob.get(section),
+                "_meta": {section: blob["_meta"].get(section)},
+            }
+        blob["known_seasons"] = await store.known_seasons()
+        return blob
+
+    @mcp.tool(
+        annotations=DESTRUCTIVE_LOCAL,
+        name="arc_set_state",
+        description=(
+            "Update the cross-device player state and get back a DIFF of "
+            "what changed (say 'updated Refiner 1→2' — never rewrite "
+            "silently). Key-level merge for modules/progression/loadout "
+            "(explicit null deletes a key). STASH REPLACES by default — a "
+            "merged stash is the staleness bug in disguise; pass "
+            "mode='merge' only for a deliberate incremental top-up. "
+            "mode='reset' with a new season archives the current blob and "
+            "starts clean (old seasons stay readable). Module/quest/"
+            "project/stash names are validated against the game data; "
+            "unresolved names are returned, never guessed or silently "
+            "dropped. expected_updated_at (from a prior read) rejects "
+            "concurrent-write conflicts."
+        ),
+    )
+    async def set_state(
+        patch: Annotated[
+            dict[str, Any],
+            Field(
+                description=(
+                    "Sections to write: season, modules {name: level}, progression "
+                    "{raider_level, active_quests: [names], active_projects: {name: "
+                    "phase}}, loadout {slot: item}, stash {item: count}, notes."
+                )
+            ),
+        ],
+        mode: Annotated[
+            str,
+            Field(description="'' (default) | 'merge' (stash merges too) | 'reset' (new season)"),
+        ] = "",
+        expected_updated_at: Annotated[
+            str,
+            Field(
+                description=(
+                    "Optional compare-and-swap: the newest _meta.updated_at from your "
+                    "last read. Rejected on mismatch (phone/desktop concurrency)."
+                )
+            ),
+        ] = "",
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        if mode not in ("", "merge", "reset"):
+            return ToolError(
+                "arcraiders_invalid_mode",
+                f"Unknown mode {mode!r}.",
+                "Valid modes: '' (default), 'merge', 'reset'.",
+            ).payload()
+        unknown_sections = set(patch) - {*STATE_SECTIONS, "season"}
+        if unknown_sections:
+            return ToolError(
+                "arcraiders_unknown_section",
+                f"Unknown state section(s): {', '.join(sorted(map(str, unknown_sections)))}.",
+                f"Valid sections: season, {', '.join(STATE_SECTIONS)}.",
+            ).payload()
+
+        season_now = await store.current_season()
+        existing = await store.state_sections(season_now)
+
+        # Compare-and-swap against the newest stored write.
+        if expected_updated_at:
+            latest_ts = max((ts for _c, ts in existing.values()), default=None)
+            latest_iso = _iso_utc(latest_ts * 1000) if latest_ts else None
+            if latest_iso != expected_updated_at:
+                return ToolError(
+                    "arcraiders_state_conflict",
+                    "State changed since your last read.",
+                    f"Current updated_at is {latest_iso!r}; re-read with arc_get_state and retry.",
+                ).payload()
+
+        changed: list[dict[str, Any]] = []
+        unresolved: dict[str, list[Any]] = {}
+
+        # Season reset: archive-by-pointer — old rows stay readable.
+        if mode == "reset":
+            new_season = str(patch.get("season") or "")
+            if not new_season:
+                return ToolError(
+                    "arcraiders_missing_season",
+                    "mode='reset' requires a new season name in the patch.",
+                    'Example: arc_set_state({"season": "s2"}, mode="reset").',
+                ).payload()
+            await store.set_current_season(new_season)
+            changed.append({"path": "season", "op": "reset", "from": season_now, "to": new_season})
+            season_now = new_season
+            existing = {}
+        elif "season" in patch and str(patch["season"]) != season_now:
+            await store.set_current_season(str(patch["season"]))
+            changed.append({"path": "season", "from": season_now, "to": str(patch["season"])})
+            season_now = str(patch["season"])
+            existing = await store.state_sections(season_now)
+
+        # ── modules: hard-validated key-level merge ──
+        if "modules" in patch and patch["modules"] is not None:
+            modules_db = await _hideout_modules()
+            if not modules_db:
+                return ToolError(
+                    "arcraiders_data_unreachable",
+                    "Cannot validate module names (hideout data unavailable).",
+                    "Try again shortly.",
+                ).payload()
+            canon = {}
+            for mod in modules_db:
+                en = (mod.get("name") or {}).get("en") or str(mod.get("id"))
+                canon[_norm(en)] = en
+                canon[_norm(str(mod.get("id") or ""))] = en
+            current_mods = dict(cast(dict[str, Any], existing.get("modules", ({}, 0))[0]))
+            for name, level in dict(patch["modules"]).items():
+                canonical = canon.get(_norm(str(name)))
+                if canonical is None:
+                    return ToolError(
+                        "arcraiders_unknown_module",
+                        f"Unknown hideout module {name!r}.",
+                        f"Valid modules: {', '.join(sorted(set(canon.values())))}.",
+                    ).payload()
+                before = current_mods.get(canonical)
+                if level is None:
+                    if canonical in current_mods:
+                        del current_mods[canonical]
+                        changed.append({"path": f"modules.{canonical}", "from": before, "to": None})
+                elif before != _qty(level):
+                    current_mods[canonical] = _qty(level)
+                    changed.append(
+                        {"path": f"modules.{canonical}", "from": before, "to": _qty(level)}
+                    )
+            await store.set_state_section(season_now, "modules", current_mods)
+
+        # ── progression: key-level merge with name canonicalization ──
+        if "progression" in patch and patch["progression"] is not None:
+            current_prog = dict(cast(dict[str, Any], existing.get("progression", ({}, 0))[0]))
+            prog_patch = dict(patch["progression"])
+            if "active_quests" in prog_patch and prog_patch["active_quests"] is not None:
+                try:
+                    all_quests = await _all_quests()
+                except ToolError as err:
+                    return err.payload()
+                quest_canon = {
+                    _norm(str(q.get("name") or "")): str(q.get("name")) for q in all_quests
+                }
+                resolved_q, missing_q = [], []
+                for qname in prog_patch["active_quests"]:
+                    canonical = quest_canon.get(_norm(str(qname)))
+                    (resolved_q.append(canonical) if canonical else missing_q.append(str(qname)))
+                prog_patch["active_quests"] = resolved_q
+                if missing_q:
+                    unresolved["quests"] = missing_q
+            if "active_projects" in prog_patch and prog_patch["active_projects"] is not None:
+                try:
+                    all_projects = await _all_projects()
+                except ToolError as err:
+                    return err.payload()
+                proj_canon = {
+                    _norm(str((p.get("name") or {}).get("en") or p.get("id"))): str(
+                        (p.get("name") or {}).get("en") or p.get("id")
+                    )
+                    for p in all_projects
+                }
+                resolved_p, missing_p = {}, []
+                for pname, phase in dict(prog_patch["active_projects"]).items():
+                    canonical = proj_canon.get(_norm(str(pname)))
+                    if canonical:
+                        resolved_p[canonical] = _qty(phase)
+                    else:
+                        missing_p.append(str(pname))
+                prog_patch["active_projects"] = resolved_p
+                if missing_p:
+                    unresolved["projects"] = missing_p
+            for key, value in prog_patch.items():
+                before = current_prog.get(key)
+                if value is None:
+                    if key in current_prog:
+                        del current_prog[key]
+                        changed.append({"path": f"progression.{key}", "from": before, "to": None})
+                elif before != value:
+                    current_prog[key] = value
+                    changed.append({"path": f"progression.{key}", "from": before, "to": value})
+            await store.set_state_section(season_now, "progression", current_prog)
+
+        # ── loadout: free-form key-level merge ──
+        if "loadout" in patch and patch["loadout"] is not None:
+            current_load = dict(cast(dict[str, Any], existing.get("loadout", ({}, 0))[0]))
+            for key, value in dict(patch["loadout"]).items():
+                before = current_load.get(key)
+                if value is None:
+                    if key in current_load:
+                        del current_load[key]
+                        changed.append({"path": f"loadout.{key}", "from": before, "to": None})
+                elif before != value:
+                    current_load[key] = value
+                    changed.append({"path": f"loadout.{key}", "from": before, "to": value})
+            await store.set_state_section(season_now, "loadout", current_load)
+
+        # ── stash: REPLACE by default (a merged stash is the staleness
+        # bug in disguise); mode='merge' for deliberate top-ups ──
+        if "stash" in patch and patch["stash"] is not None:
+            try:
+                resolved_stash, unresolved_stash = await _resolve_stash_names(dict(patch["stash"]))
+            except ToolError as err:
+                return err.payload()
+            if unresolved_stash:
+                unresolved["stash"] = unresolved_stash
+            before_stash = dict(cast(dict[str, Any], existing.get("stash", ({}, 0))[0]))
+            if mode == "merge":
+                merged = dict(before_stash)
+                for name, count in resolved_stash.items():
+                    changed.append({"path": f"stash.{name}", "from": merged.get(name), "to": count})
+                    merged[name] = count
+                new_stash = merged
+            else:
+                new_stash = resolved_stash
+                changed.append(
+                    {
+                        "path": "stash",
+                        "op": "replace",
+                        "keys_before": len(before_stash),
+                        "keys_after": len(new_stash),
+                    }
+                )
+            await store.set_state_section(season_now, "stash", new_stash)
+
+        # ── notes: plain overwrite ──
+        if "notes" in patch and patch["notes"] is not None:
+            before_notes = existing.get("notes", (None, 0))[0]
+            if before_notes != patch["notes"]:
+                changed.append({"path": "notes", "from": before_notes, "to": patch["notes"]})
+            await store.set_state_section(season_now, "notes", str(patch["notes"]))
+
+        return {
+            "changed": changed,
+            "unresolved": unresolved,
+            "state": await _state_blob(season_now),
         }
 
     # ── patch diff ──────────────────────────────────────────────────

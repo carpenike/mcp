@@ -47,8 +47,8 @@ class CapturingMCP:
 # The only arc tools allowed to write, and the only one allowed to be
 # destructive (the confirm-gated raid-log correction path). Everything
 # else in the category must stay read-only.
-_EXPECTED_WRITERS = {"arc_log_raid", "arc_delete_raid"}
-_EXPECTED_DESTRUCTIVE = {"arc_delete_raid"}
+_EXPECTED_WRITERS = {"arc_log_raid", "arc_delete_raid", "arc_set_state"}
+_EXPECTED_DESTRUCTIVE = {"arc_delete_raid", "arc_set_state"}
 
 
 def test_tool_annotation_posture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1036,6 +1036,163 @@ async def test_patch_diff_reports_changes(
     out = await mcp.tools["arc_patch_diff"](since_days=7)
     assert {"item": "Kettle", "field": "stats.damage", "old": 30, "new": 35} in out["changes"]
     assert out["truncated"] is False
+
+
+# ── player state (cross-device continuity) ───────────────────────────
+
+
+def _mock_state_world(httpx_mock: HTTPXMock) -> None:
+    """Planner world + quests + projects, for state validation paths."""
+    _mock_planner_world(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/quests?limit=100&page=1",
+        json={
+            "data": [{"name": "The Trifecta", "required_items": []}],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/projects.json",
+        json=[
+            {
+                "id": "converging_paths",
+                "disabled": False,
+                "endDate": 2524521600,
+                "name": {"en": "Converging Paths"},
+                "phases": [
+                    {"phase": 4, "requirementItemIds": [{"itemId": "fabric", "quantity": 3}]}
+                ],
+            }
+        ],
+    )
+
+
+async def test_state_roundtrip_with_diff_and_canonicalization(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    out = await tools["arc_set_state"](
+        patch={
+            "modules": {"medical lab": 1},
+            "progression": {
+                "raider_level": 10,
+                "active_quests": ["the trifecta", "Ghost Quest"],
+                "active_projects": {"converging paths": 4},
+            },
+            "loadout": {"primary": "Ferro I"},
+            "stash": {"fabrics": 12, "xyzzy": 5},
+            "notes": "scratch",
+        }
+    )
+    # Diff reports every change; names come back canonicalized.
+    paths = {c["path"] for c in out["changed"]}
+    assert "modules.Medical Lab" in paths
+    assert "progression.raider_level" in paths
+    assert "stash" in paths  # replace op
+    # Unresolvable names are returned, never guessed or silently dropped.
+    assert out["unresolved"]["quests"] == ["Ghost Quest"]
+    assert out["unresolved"]["stash"] == [{"key": "xyzzy", "candidates": []}]
+    state = out["state"]
+    assert state["modules"] == {"Medical Lab": 1}
+    assert state["progression"]["active_quests"] == ["The Trifecta"]
+    assert state["progression"]["active_projects"] == {"Converging Paths": 4}
+    assert state["stash"] == {"Fabric": 12}  # plural fuzzy-resolved, xyzzy excluded
+    assert state["_meta"]["stash"]["stale"] is False
+    assert state["_meta"]["stash"]["age_hours"] == 0.0
+
+    got = await tools["arc_get_state"](section="modules")
+    assert got["modules"] == {"Medical Lab": 1}
+
+
+async def test_state_stash_replaces_by_default_merges_on_request(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](patch={"stash": {"Fabric": 12, "ARC Alloy": 3}})
+    # Default: replace — the omitted ARC Alloy must NOT survive.
+    out = await tools["arc_set_state"](patch={"stash": {"Fabric": 4}})
+    assert out["state"]["stash"] == {"Fabric": 4}
+    replace_op = next(c for c in out["changed"] if c["path"] == "stash")
+    assert (replace_op["keys_before"], replace_op["keys_after"]) == (2, 1)
+    # Explicit merge: incremental top-up keeps other keys.
+    out2 = await tools["arc_set_state"](patch={"stash": {"ARC Alloy": 7}}, mode="merge")
+    assert out2["state"]["stash"] == {"Fabric": 4, "ARC Alloy": 7}
+
+
+async def test_state_null_deletes_and_unknown_module_rejected(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](patch={"modules": {"Medical Lab": 2}})
+    out = await tools["arc_set_state"](patch={"modules": {"Medical Lab": None}})
+    assert out["state"].get("modules") == {}
+    bad = await tools["arc_set_state"](patch={"modules": {"Bogus": 1}})
+    assert bad["error"]["code"] == "arcraiders_unknown_module"
+
+
+async def test_state_cas_rejects_concurrent_write(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    first = await tools["arc_set_state"](patch={"notes": "from desktop"})
+    good_ts = first["state"]["_meta"]["notes"]["updated_at"]
+    conflict = await tools["arc_set_state"](
+        patch={"notes": "from phone"}, expected_updated_at="2020-01-01T00:00:00Z"
+    )
+    assert conflict["error"]["code"] == "arcraiders_state_conflict"
+    ok = await tools["arc_set_state"](patch={"notes": "from phone"}, expected_updated_at=good_ts)
+    assert ok["state"]["notes"] == "from phone"
+
+
+async def test_state_season_reset_archives_and_reads_back(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](patch={"modules": {"Medical Lab": 3}})
+    out = await tools["arc_set_state"](patch={"season": "s2"}, mode="reset")
+    assert {"path": "season", "op": "reset", "from": "s1", "to": "s2"} in out["changed"]
+    # Fresh season starts clean...
+    assert "modules" not in out["state"]
+    # ...and last season stays readable for prestige comparisons.
+    old = await tools["arc_get_state"](season="s1")
+    assert old["modules"] == {"Medical Lab": 3}
+
+
+async def test_plan_upgrades_use_state_one_call(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """The payoff: state -> arc_plan_upgrades(use_state=true) with no other
+    params, echoing which sections were used; explicit params still win."""
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](
+        patch={
+            "modules": {"Medical Lab": 1},
+            "stash": {"Fabric": 10},
+            "progression": {"active_projects": {"Converging Paths": 4}},
+        }
+    )
+    out = await tools["arc_plan_upgrades"](use_state=True)
+    (plan,) = out["modules"]
+    assert plan["module"] == "Medical Lab"
+    by_item = {r["item"]: r for r in plan["requirements"]}
+    assert by_item["Fabric"]["pool"] == 10  # stash came from state
+    assert out["state_used"]["modules"]["source"] == "state"
+    assert out["state_used"]["stash"]["stale"] is False
+    # Stored active_projects folded in (phase 4 -> +3 Fabric demand).
+    fabric_line = next(s for s in out["shopping_list"] if s["item"] == "Fabric")
+    assert "project Converging Paths phase 4" in fabric_line["required_by"]
+    # Explicit params beat state, and the response says so.
+    out2 = await tools["arc_plan_upgrades"](use_state=True, current_levels={"Medical Lab": 2})
+    assert out2["modules"][0]["from"] == 2
+    assert out2["state_used"]["modules"] == {"source": "param"}
+
+
+async def test_plan_upgrades_use_state_without_stored_levels_errors(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](use_state=True)
+    assert out["error"]["code"] == "arcraiders_missing_levels"
 
 
 # ── events ───────────────────────────────────────────────────────────

@@ -56,7 +56,20 @@ CREATE TABLE IF NOT EXISTS snapshot (
     content_hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS snapshot_kind_ts ON snapshot (kind, ts);
+CREATE TABLE IF NOT EXISTS player_state (
+    season     TEXT NOT NULL,
+    section    TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (season, section)
+);
+CREATE TABLE IF NOT EXISTS state_meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
 """
+
+DEFAULT_SEASON = "s1"
 
 RAID_OUTCOMES = ("extracted", "died", "disconnected")
 
@@ -205,3 +218,62 @@ class ArcState:
                 "SELECT COUNT(*) AS n FROM snapshot WHERE kind = ?", (kind,)
             ).fetchone()
             return int(row["n"])
+
+    # ── player state (cross-device continuity) ───────────────────────
+    # Sections are stored per-season, so a season reset is just moving
+    # the current-season pointer — old seasons stay readable for
+    # prestige comparisons, never deleted.
+
+    async def current_season(self) -> str:
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT v FROM state_meta WHERE k = 'current_season'"
+            ).fetchone()
+            return str(row["v"]) if row else DEFAULT_SEASON
+
+    async def set_current_season(self, season: str) -> None:
+        async with self._lock:
+            self._conn.execute(
+                "INSERT INTO state_meta (k, v) VALUES ('current_season', ?)"
+                " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (season,),
+            )
+            self._conn.commit()
+
+    async def state_sections(self, season: str) -> dict[str, tuple[dict[str, Any] | str, float]]:
+        """All stored sections for a season: name -> (content, updated_at)."""
+        async with self._lock:
+            rows = self._conn.execute(
+                "SELECT section, content, updated_at FROM player_state WHERE season = ?",
+                (season,),
+            ).fetchall()
+            return {r["section"]: (json.loads(r["content"]), r["updated_at"]) for r in rows}
+
+    async def set_state_section(self, season: str, section: str, content: Any) -> float:
+        """Upsert one section; returns the write timestamp."""
+        now = time.time()
+        async with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_state (season, section, content, updated_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(season, section) DO UPDATE SET"
+                " content = excluded.content, updated_at = excluded.updated_at",
+                (season, section, json.dumps(content, sort_keys=True), now),
+            )
+            self._conn.commit()
+            return now
+
+    async def delete_state_section(self, season: str, section: str) -> None:
+        async with self._lock:
+            self._conn.execute(
+                "DELETE FROM player_state WHERE season = ? AND section = ?",
+                (season, section),
+            )
+            self._conn.commit()
+
+    async def known_seasons(self) -> list[str]:
+        async with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT season FROM player_state ORDER BY season"
+            ).fetchall()
+            return [str(r["season"]) for r in rows]

@@ -30,6 +30,8 @@ LOCAL_ARC_TOOLS = {
     "arc_delete_raid",
     "arc_raid_stats",
     "arc_patch_diff",
+    "arc_get_state",
+    "arc_set_state",
 }
 EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     # ── arc (public game data, pure lookups) ─────────────────────────
@@ -48,6 +50,10 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "arc_delete_raid": (False, True, True),
     "arc_raid_stats": (True, False, True),
     "arc_patch_diff": (True, False, True),
+    # cross-device state: reads are safe; the writer overwrites sections
+    # (stash replace, key merges) — destructive, repeat-safe
+    "arc_get_state": (True, False, True),
+    "arc_set_state": (False, True, True),
     "arc_get_event_schedule": (True, False, True),
     "arc_list_maps": (True, False, True),
     "arc_search_wiki": (True, False, True),
