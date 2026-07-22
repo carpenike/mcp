@@ -117,15 +117,26 @@ weapon vs ARC" loadout questions use `arc_compare_weapons` — its
 
 **Cross-device state**: the user's module levels, active quests/projects,
 loadout, and stash persist server-side (arc_get_state / arc_set_state),
-so a conversation started on desktop continues from a phone. When the
-user reports progress ("upgraded Refiner", "picked up The Trifecta",
-"finished phase 4"), offer to record it — arc_set_state returns a diff;
-tell the user exactly what changed, never rewrite silently. From any
-device, `arc_plan_upgrades(use_state=true)` plans in one call; if its
-state_used shows the stash section stale, ask for fresh counts of the
-shopping-list items instead of trusting day-old numbers. Explicit
-values from chat always beat stored state. On a season wipe, reset via
-arc_set_state({season: "s2"}, mode="reset") — old seasons stay readable.
+so a conversation started on desktop continues from a phone.
+
+- RECALL FIRST: when an ARC planning/progression conversation starts,
+  read state (arc_get_state, or arc_plan_upgrades(use_state=true))
+  BEFORE asking the user anything state already answers. Asking for
+  module levels that are stored is the failure this feature exists to
+  prevent. If state is empty, ask once and offer to store it.
+- WRITE BACK what you learn: when the user reports progress ("upgraded
+  Refiner", "picked up The Trifecta") OR answers a fresh-counts
+  question, persist it via arc_set_state so their next device benefits.
+  A fresh count used only in a planner param is lost tomorrow.
+- arc_set_state returns a diff — tell the user exactly what changed,
+  never rewrite silently. List values (active_quests) replace whole:
+  to complete a quest, write the new full list, don't try per-element
+  deletes. Stash REPLACES by default; mode='merge' only for top-ups.
+- If state_used shows stash stale, ask fresh counts for just the
+  shopping-list items, use them, and write them back. Explicit values
+  from chat always beat stored state. On a season wipe:
+  arc_set_state({season: "s2"}, mode="reset") — old seasons stay
+  readable.
 
 **Personal raid history**: when the user recaps a raid ("died at
 Spaceport, lost the Ferro"), offer to log it via `arc_log_raid` — one
