@@ -412,6 +412,15 @@ class Settings(BaseSettings):
             "fallback, so no token is needed."
         ),
     )
+    arcraiders_ardb_base_url: str = Field(
+        default="https://ardb.app/api",
+        description=(
+            "Base URL of the ardb.app REST API — the only structured source "
+            "with weapon armor-penetration, crafting-usage indexes, and "
+            "enemy drop links. Keyless; attribution with a link back to "
+            "ardb.app is requested, so responses carry a source field."
+        ),
+    )
     arcraiders_wiki_api_url: str = Field(
         default="https://arcraiders.wiki/w/api.php",
         description=(
