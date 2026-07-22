@@ -166,6 +166,8 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_delete_raid` | Remove a mislogged raid; previews unless `confirm=true` |
 | ARC Raiders | `arc_raid_stats` | Personal analytics: extraction rate overall/per-map/per-loadout, death spots, loot totals |
 | ARC Raiders | `arc_patch_diff` | Item/weapon changes since N days ago, from auto-accumulated local snapshots |
+| ARC Raiders | `arc_get_state` | Cross-device player state (modules, progression, loadout, stash, notes) with per-section age + staleness |
+| ARC Raiders | `arc_set_state` | Update state with merge semantics (stash replaces by default), name validation, a returned diff, CAS, and season resets |
 | ARC Raiders | `arc_get_trader_stock` | Live trader inventories with prices, optionally one trader; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_get_event_schedule` | Rotating in-raid event schedule with UTC times + active/upcoming status, optional map filter; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
