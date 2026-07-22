@@ -114,6 +114,16 @@ this loadout work for me" / "where do I keep dying" from
 claims, check `arc_patch_diff` before hedging — if it shows no change
 in the window, say so with the snapshot dates.
 
+**Coverage semantics** (the `coverage` field on triage/planner responses):
+`complete` = axis folded into this response; `not_included` = modeled but
+the caller opted out (e.g. include_quests=false); `unavailable` = modeled
+but no data for this call or item; `not_modeled` = the server has no data
+source for the axis. Currently not modeled: merit-track EVENTS — e.g.
+'Forgotten Relics' is the in-game front of the 'Converging Paths' project
+(project turn-ins ARE modeled; the merit/extraction track is not). When
+the user names an event you don't recognize, arc_search_wiki it before
+declaring it nonexistent — in-game names and data names differ.
+
 Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki,
 ardb.app) and may lag the newest game patch; responses carry `source`
 fields — keep that attribution when presenting data publicly. For lore
@@ -218,6 +228,35 @@ MAPGENIE_SLUGS = {
 def _pretty_map(map_id: str) -> str:
     """Display name for a RaidTheory snake_case map id ('the_spaceport' -> 'The Spaceport')."""
     return _norm(map_id).title().replace("Arc", "ARC")
+
+
+# Coverage vocabulary — the trust contract on every response (v2 feedback:
+# per-tool literals contradicted each other, and 'unavailable' was
+# undefined). Exactly four states, derived from ONE base here:
+#   complete     — axis modeled AND folded into this response; fetch OK
+#   not_included — axis modeled by the server but not folded into this
+#                  response (caller opted out, e.g. include_quests=false)
+#   unavailable  — axis modeled, but no data for THIS request (upstream
+#                  fetch failed, or no record exists for this item)
+#   not_modeled  — the server has no data source for this axis at all
+#                  (currently: merit-track events like Forgotten Relics)
+_COVERAGE_BASE = {
+    "quests": "complete",
+    "hideout": "complete",
+    "projects": "complete",
+    "crafting_recipes": "complete",
+    "events": "not_modeled",
+}
+_COVERAGE_STATES = {"complete", "not_included", "unavailable", "not_modeled"}
+
+
+def _coverage(**overrides: str) -> dict[str, str]:
+    """The shared coverage dict; tools may only downgrade defined axes."""
+    unknown = set(overrides) - set(_COVERAGE_BASE)
+    bad_states = set(overrides.values()) - _COVERAGE_STATES
+    if unknown or bad_states:  # programmer error, not runtime input
+        raise ValueError(f"bad coverage override: axes={unknown} states={bad_states}")
+    return {**_COVERAGE_BASE, **overrides}
 
 
 def _strip_tags(fragment: str) -> str:
@@ -684,6 +723,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             if isinstance(end, (int, float)) and end < now:
                 continue
             proj_name = (proj.get("name") or {}).get("en") or proj.get("id")
+            # In-game names can differ from data names (the 'Forgotten
+            # Relics' event fronts the 'Converging Paths' project), so
+            # carry the description — it's how a player connects the two.
+            desc = (proj.get("description") or {}).get("en") or ""
             for phase in proj.get("phases") or []:
                 for req in phase.get("requirementItemIds") or []:
                     if _norm(str(req.get("itemId") or "")) not in keys:
@@ -691,6 +734,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     rows.append(
                         {
                             "project": proj_name,
+                            "description": (desc[:140] or None),
                             "phase": phase.get("phase"),
                             "quantity": req.get("quantity"),
                             "ends_utc": (
@@ -953,13 +997,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         keys = {_norm(best.get("name") or ""), _norm(best.get("id") or "")} - {""}
 
         notes: list[str] = []
-        coverage = {
-            "quests": "complete",
-            "hideout": "complete",
-            "projects": "complete",
-            "crafting_recipes": "not_modeled",
-            "events": "not_modeled",
-        }
+        coverage = _coverage()
 
         # Quest turn-ins requiring it. Each cross-reference degrades to
         # None + a note on failure instead of failing the whole call.
@@ -1211,6 +1249,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             verdict_reason += f"; note: used to craft {shown_uses}" + (
                 f" +{len(crafting_uses) - 3} more" if len(crafting_uses) > 3 else ""
             )
+        # A sell recommendation is irreversible — name the axes this tool
+        # simply cannot see (merit-track events like Forgotten Relics),
+        # every time, so the hedge can't be forgotten.
+        if verdict == "sell":
+            not_modeled = [k for k, v in coverage.items() if v == "not_modeled"]
+            if not_modeled:
+                verdict_reason += f"; not checked: {', '.join(not_modeled)} (not modeled)"
 
         sources = [METAFORGE_SOURCE, RAIDTHEORY_SOURCE]
         if ardb_item is not None:
@@ -1255,9 +1300,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "`contention` array flags items multiple upgrades are counting "
             "on; pass `priority` to greedily allocate in that order), "
             "target levels for multi-level jumps (cumulative bill with "
-            "per-level breakdown), and include_quests=true to fold quest "
-            "turn-ins into the totals. Do the math from this tool's output "
-            "— never sum requirements by hand."
+            "per-level breakdown), include_quests=true to fold quest "
+            "turn-ins into totals (scope with active_quests=[names] — the "
+            "user's ACCEPTED quests — or every quest in the game is "
+            "folded), and include_projects=true for active expedition/"
+            "project phases. Every shopping_list line carries required_by "
+            "provenance. Do the math from this tool's output — never sum "
+            "requirements by hand."
         ),
     )
     async def plan_upgrades(
@@ -1275,6 +1324,18 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ] = None,
         include_quests: Annotated[
             bool, Field(description="Also fold quest turn-in demand into totals.")
+        ] = False,
+        active_quests: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "With include_quests: restrict folding to these quest names "
+                    "(the user's accepted quests). Default: every quest in the game."
+                )
+            ),
+        ] = None,
+        include_projects: Annotated[
+            bool, Field(description="Also fold active expedition/project phase demand into totals.")
         ] = False,
         priority: Annotated[
             list[str] | None,
@@ -1384,6 +1445,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "module": en,
                 "from": cur,
                 "to": min(target, max_level),
+                "max_level": max_level,
                 "action": "upgrade" if cur > 0 else "build",
                 "level_known": True,
             }
@@ -1440,10 +1502,22 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             )
             planned.append(plan)
 
-        # Optional quest demand fold-in (affects totals, not per-module plans).
+        # Optional quest demand fold-in (affects totals, not per-module
+        # plans). With active_quests, only the user's accepted quests are
+        # folded — an unscoped fold pulls every quest in the game into the
+        # shopping list. Unmatched names are RETURNED, never dropped.
+        quests_coverage = "complete" if include_quests else "not_included"
+        unresolved_quest_names: list[str] = []
         if include_quests:
+            wanted = {_norm(q) for q in active_quests} if active_quests else None
+            matched: set[str] = set()
             try:
                 for quest in await _all_quests():
+                    quest_norm = _norm(str(quest.get("name") or ""))
+                    if wanted is not None:
+                        if quest_norm not in wanted:
+                            continue
+                        matched.add(quest_norm)
                     for req in quest.get("required_items") or []:
                         req_item = req.get("item") or {}
                         display = req_item.get("name") or str(req.get("item_id"))
@@ -1454,7 +1528,34 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                             f"quest {quest.get('name')}",
                         )
             except ToolError:
-                pass
+                quests_coverage = "unavailable"
+            if wanted is not None:
+                unresolved_quest_names = [q for q in active_quests or [] if _norm(q) not in matched]
+
+        # Optional active-project demand fold-in (same shape as quests).
+        projects_coverage = "complete" if include_projects else "not_included"
+        if include_projects:
+            try:
+                now_s = time.time()
+                for proj in await _all_projects():
+                    if proj.get("disabled"):
+                        continue
+                    proj_end = proj.get("endDate")
+                    if isinstance(proj_end, (int, float)) and proj_end < now_s:
+                        continue
+                    proj_name = (proj.get("name") or {}).get("en") or proj.get("id")
+                    for phase in proj.get("phases") or []:
+                        for req in phase.get("requirementItemIds") or []:
+                            item_id = str(req.get("itemId") or "")
+                            display, _info = _display(item_id)
+                            _add_demand(
+                                _norm(display),
+                                display,
+                                _qty(req.get("quantity")),
+                                f"project {proj_name} phase {phase.get('phase')}",
+                            )
+            except ToolError:
+                projects_coverage = "unavailable"
 
         # Greedy allocation only on explicit priority (per-module `short`
         # then reflects what's left after higher-priority modules take
@@ -1540,6 +1641,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     "short": short,
                     "rarity": info.get("rarity"),
                     "loot_area": info.get("loot_area"),
+                    # Provenance: why this line exists, so a caller can
+                    # explain (or challenge) any entry on the list.
+                    "required_by": row["demanded_by"],
                     "traders_selling": sorted(set(traders_by_item.get(item_norm, []))),
                 }
             )
@@ -1571,17 +1675,31 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "contention": contention,
             "shopping_list": shopping_list,
             "unresolved_stash_keys": unresolved_stash_keys,
+            "unresolved_quest_names": unresolved_quest_names,
+            # Non-upgradable modules (no levels in the data, e.g. the
+            # Workbench) are excluded — a module that CANNOT be upgraded
+            # is not 'unknown', there is simply nothing to plan for it.
             "modules_with_unknown_level": sorted(
                 name
                 for name in valid_names
                 if all(_module_for(k) is not by_key.get(_norm(name)) for k in current_levels)
+                and (
+                    _qty((by_key.get(_norm(name)) or {}).get("maxLevel"))
+                    or max(
+                        (
+                            _qty(lv.get("level"))
+                            for lv in (by_key.get(_norm(name)) or {}).get("levels") or []
+                        ),
+                        default=0,
+                    )
+                )
+                > 0
             ),
-            "coverage": {
-                "hideout": "complete",
-                "quests": "complete" if include_quests else "not_included",
-                "projects": "not_modeled",
-                "events": "not_modeled",
-            },
+            "coverage": _coverage(
+                quests=quests_coverage,
+                projects=projects_coverage,
+                crafting_recipes="not_included",
+            ),
             "sources": [RAIDTHEORY_SOURCE, METAFORGE_SOURCE],
         }
 
