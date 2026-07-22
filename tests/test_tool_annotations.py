@@ -29,6 +29,7 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "arc_search_quests": (True, False, True),
     "arc_get_trader_stock": (True, False, True),
     "arc_check_item_keep": (True, False, True),
+    "arc_plan_upgrades": (True, False, True),
     "arc_get_event_schedule": (True, False, True),
     "arc_list_maps": (True, False, True),
     "arc_search_wiki": (True, False, True),

@@ -57,11 +57,22 @@ Game-data lookups for ARC Raiders (items, quests, traders, events, maps, wiki).
 
 **Keep/sell/recycle questions** ("is X worth keeping?"): call
 `arc_check_item_keep` first — it cross-references quest turn-ins, hideout
-upgrade needs, and trader offers in one call. If `match` is "closest",
-the named item wasn't an exact hit: tell the user what you matched and
-list `other_candidates` (tiered families like 'Extended Light Mag I/II/III'
-are distinct items with different answers). An item required by quests or
-hideout upgrades is usually worth keeping regardless of sell value.
+upgrades, expedition/seasonal project phases, recycle/salvage outputs, and
+trader offers, then ships a `verdict` with `verdict_reason` and
+`keep_quantity` (the summed demand — use it verbatim, never re-add the
+arrays yourself). Honor `coverage`: axes marked not_modeled/unavailable
+are invisible to the tool, and selling is irreversible — hedge before
+advising a sale. If `match` is "closest", say what you matched and list
+`other_candidates`. Check `variants` for damaged/intact siblings — which
+form is required comes from data, not naming (Damaged Heat Sink IS the
+required form).
+
+**"What should I build next?"**: call `arc_plan_upgrades` with the user's
+module levels (omit unknown ones — never guess), and their stash counts
+when known. It returns per-module shortfalls, `nearest_completion`,
+shared-item `contention`, and a deduped shopping list. Trust its
+arithmetic over your own; `have`/`short` null means stash unknown, 0
+means known-empty — don't conflate them.
 
 **Time-sensitive data**: `arc_get_event_schedule` (in-raid event rotation)
 and `arc_get_trader_stock` change hourly-ish; timestamps are UTC. Compare
@@ -175,6 +186,33 @@ def _norm(name: str) -> str:
     return _NORM_RE.sub(" ", name.lower()).strip()
 
 
+def _snake(name: str) -> str:
+    """RaidTheory per-item file slug for a display name ('ARC Alloy' -> 'arc_alloy')."""
+    return _norm(name).replace(" ", "_")
+
+
+def _qty(value: Any) -> int:
+    """Coerce a quantity that may arrive as int or numeric string; 0 if unparseable."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Worst-first tiebreak for nearest_completion sorting; unknown rarities
+# sort as worst so they never make a module look closer than it is.
+RARITY_ORDER = {"Common": 0, "Uncommon": 1, "Rare": 2, "Epic": 3, "Legendary": 4}
+
+# Damaged/intact (and similar) sibling prefixes. The relation labels are
+# (variant_with_prefix, variant_without): 'Damaged Wasp Driver' is the
+# degraded form of 'Wasp Driver'; the reverse relation is 'intact'.
+_VARIANT_PREFIXES = {
+    "damaged": ("degraded", "intact"),
+    "broken": ("degraded", "intact"),
+    "advanced": ("advanced", "standard"),
+}
+
+
 def _mapgenie_url(map_name: str | None, search: str | None = None) -> str | None:
     """Interactive-map deep link for a map name/id, or None if unknown.
 
@@ -244,13 +282,21 @@ def _project_item(raw: dict[str, Any]) -> dict[str, Any]:
     found_on_maps = sorted(
         {str(loc.get("map")) for loc in raw.get("locations") or [] if loc.get("map")}
     )
+    # subcategory almost always duplicates item_type — only keep a real refinement.
+    subcategory = raw.get("subcategory") or None
+    if subcategory == raw.get("item_type"):
+        subcategory = None
+    # MetaForge emits value 0 for unknown (e.g. Tellurion, a 7000-coin Epic).
+    # Never pass 0 through — it reads as "worthless, sell it". Callers fall
+    # back to the RaidTheory per-item value, then to null + a note.
+    value = raw.get("value") or None
     return {
         "id": raw.get("id"),
         "name": raw.get("name"),
         "type": raw.get("item_type"),
-        "subcategory": raw.get("subcategory"),
+        "subcategory": subcategory,
         "rarity": raw.get("rarity"),
-        "value": raw.get("value"),
+        "value": value,
         "description": raw.get("description"),
         "workbench": raw.get("workbench"),
         "loot_area": raw.get("loot_area"),
@@ -408,6 +454,104 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "exact" if best[0] <= 1 else "closest",
             [name for _, name, _ in scored[1:7]],
         )
+
+    async def _all_projects() -> list[dict[str, Any]]:
+        """Expedition/seasonal projects (Trophy Display, Expeditions, ...), cached.
+
+        Feedback-driven: these were invisible to arc_check_item_keep, so an
+        empty result read as "safe to sell" for items a live project wanted.
+        """
+        raw = await _cached_json(
+            f"{data_base}/projects.json",
+            service="arcraiders_data",
+            ttl=TTL_STATIC,
+            hint="raw.githubusercontent.com may be unreachable; try again shortly.",
+        )
+        return raw if isinstance(raw, list) else []
+
+    async def _item_detail(*name_candidates: str | None) -> dict[str, Any] | None:
+        """RaidTheory per-item file (recyclesInto/salvagesInto/value/tip), or None.
+
+        File slugs are snake_case of the display name; MetaForge ids are
+        kebab and occasionally suffixed ('wires-recipe'), so try each
+        candidate. A miss is common and quiet — not every item has a file
+        under the guessed slug (upstream even has typo'd slugs).
+        """
+        for cand in name_candidates:
+            if not cand:
+                continue
+            url = f"{data_base}/items/{_snake(cand)}.json"
+            cached = cache.get(url)
+            if cached is not None:
+                return cast(dict[str, Any], cached)
+            try:
+                raw = await request_json(client, "GET", url, service="arcraiders_data")
+            except ToolError:
+                continue
+            detail = raw[0] if isinstance(raw, list) and raw else raw
+            if isinstance(detail, dict):
+                cache.put(url, detail, TTL_STATIC)
+                return detail
+        return None
+
+    def _project_demand(
+        keys: set[str], projects: list[dict[str, Any]], now: float
+    ) -> list[dict[str, Any]]:
+        """Active-project phase requirements matching an item's identity keys."""
+        rows: list[dict[str, Any]] = []
+        for proj in projects:
+            if proj.get("disabled"):
+                continue
+            end = proj.get("endDate")
+            if isinstance(end, (int, float)) and end < now:
+                continue
+            proj_name = (proj.get("name") or {}).get("en") or proj.get("id")
+            for phase in proj.get("phases") or []:
+                for req in phase.get("requirementItemIds") or []:
+                    if _norm(str(req.get("itemId") or "")) not in keys:
+                        continue
+                    rows.append(
+                        {
+                            "project": proj_name,
+                            "phase": phase.get("phase"),
+                            "quantity": req.get("quantity"),
+                            "ends_utc": (
+                                _iso_utc(end * 1000) if isinstance(end, (int, float)) else None
+                            ),
+                        }
+                    )
+        return rows
+
+    def _hideout_demand(keys: set[str], modules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Hideout upgrade-level requirements matching an item's identity keys."""
+        return [
+            {
+                "module": (mod.get("name") or {}).get("en") or mod.get("id"),
+                "level": lvl.get("level"),
+                "quantity": req.get("quantity"),
+            }
+            for mod in modules
+            for lvl in mod.get("levels") or []
+            for req in lvl.get("requirementItemIds") or []
+            if _norm(str(req.get("itemId") or "")) in keys
+        ]
+
+    def _quest_demand(keys: set[str], quests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Quest turn-in requirements matching an item's identity keys."""
+        rows: list[dict[str, Any]] = []
+        for quest in quests:
+            for req in quest.get("required_items") or []:
+                req_item = req.get("item") or {}
+                req_keys = {_norm(req_item.get("name") or ""), _norm(req.get("item_id") or "")}
+                if req_keys & keys:
+                    rows.append(
+                        {
+                            "quest": quest.get("name"),
+                            "trader": quest.get("trader_name"),
+                            "quantity": req.get("quantity"),
+                        }
+                    )
+        return rows
 
     async def _hideout_modules() -> list[dict[str, Any]]:
         """All hideout module definitions, aggregated and cached as one unit.
@@ -602,13 +746,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         description=(
             "Keep/sell/recycle helper — the one call for 'is this ARC "
             "Raiders item worth keeping?'. Resolves the item (value, "
-            "rarity, weight), then cross-references every quest turn-in "
-            "that requires it, every hideout module upgrade level that "
-            "needs it (with quantities), and which traders sell it. An "
-            "item needed for quests or hideout upgrades is usually worth "
-            "keeping regardless of sell value. Crafting/recycling uses "
-            "are not covered — check the item's wiki page via "
-            "arc_get_wiki_page for those."
+            "rarity, weight), then cross-references every quest turn-in, "
+            "hideout upgrade level, AND expedition/seasonal project phase "
+            "that requires it, plus recycle/salvage outputs and trader "
+            "offers — and ships a verdict (keep/recycle/sell) with the "
+            "total keep_quantity. Check the `coverage` field before "
+            "advising a sale: axes marked not_modeled are invisible to "
+            "this tool, and selling is irreversible."
         ),
     )
     async def check_item_keep(
@@ -631,46 +775,48 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         keys = {_norm(best.get("name") or ""), _norm(best.get("id") or "")} - {""}
 
         notes: list[str] = []
+        coverage = {
+            "quests": "complete",
+            "hideout": "complete",
+            "projects": "complete",
+            "crafting_recipes": "not_modeled",
+            "events": "not_modeled",
+        }
 
         # Quest turn-ins requiring it. Each cross-reference degrades to
         # None + a note on failure instead of failing the whole call.
         quests_requiring: list[dict[str, Any]] | None
+        all_quests: list[dict[str, Any]] = []
         try:
-            quests_requiring = [
-                {
-                    "quest": quest.get("name"),
-                    "trader": quest.get("trader_name"),
-                    "quantity": req.get("quantity"),
-                }
-                for quest in await _all_quests()
-                for req in quest.get("required_items") or []
-                if {
-                    _norm(((req.get("item") or {}).get("name")) or ""),
-                    _norm(req.get("item_id") or ""),
-                }
-                & keys
-            ]
+            all_quests = await _all_quests()
+            quests_requiring = _quest_demand(keys, all_quests)
         except ToolError:
             quests_requiring = None
+            coverage["quests"] = "unavailable"
             notes.append("Quest data unavailable (MetaForge fetch failed).")
 
         # Hideout upgrade levels requiring it.
         hideout_requiring: list[dict[str, Any]] | None = None
         modules = await _hideout_modules()
         if modules:
-            hideout_requiring = [
-                {
-                    "module": (mod.get("name") or {}).get("en") or mod.get("id"),
-                    "level": lvl.get("level"),
-                    "quantity": req.get("quantity"),
-                }
-                for mod in modules
-                for lvl in mod.get("levels") or []
-                for req in lvl.get("requirementItemIds") or []
-                if _norm(str(req.get("itemId") or "")) in keys
-            ]
+            hideout_requiring = _hideout_demand(keys, modules)
         else:
+            coverage["hideout"] = "unavailable"
             notes.append("Hideout data unavailable (RaidTheory fetch failed).")
+
+        # Expedition/seasonal project phases requiring it (Trophy Display,
+        # Expeditions, Converging Paths, ...). Feedback-driven: an item a
+        # live project wants must never come back looking safe to sell.
+        projects_requiring: list[dict[str, Any]] | None
+        all_projects: list[dict[str, Any]] = []
+        now_s = time.time()
+        try:
+            all_projects = await _all_projects()
+            projects_requiring = _project_demand(keys, all_projects, now_s)
+        except ToolError:
+            projects_requiring = None
+            coverage["projects"] = "unavailable"
+            notes.append("Project data unavailable (RaidTheory fetch failed).")
 
         # Trader offers (who sells it, at what price).
         trader_offers: list[dict[str, Any]] | None
@@ -721,17 +867,498 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             for m in best.get("found_on_maps") or []
             if (url := _mapgenie_url(m, search=item_name))
         }
+
+        # RaidTheory per-item detail: recycle/salvage outputs, a value
+        # fallback for MetaForge's value-0-means-unknown rows, and the
+        # community tip line.
+        detail = await _item_detail(best.get("name"), best.get("id"))
+        if best.get("value") is None and detail and detail.get("value"):
+            best["value"] = detail["value"]
+            notes.append("Sell value taken from RaidTheory (MetaForge reports 0/unknown).")
+        if best.get("value") is None:
+            notes.append("value_unknown: no source reports a sell value for this item.")
+        if detail and detail.get("tip"):
+            best["tip"] = detail["tip"]
+
+        async def _outputs(field: str) -> list[dict[str, Any]] | None:
+            if detail is None:
+                return None
+            raw_map = detail.get(field)
+            if not isinstance(raw_map, dict):
+                return []
+            out = []
+            for out_id, qty in raw_map.items():
+                out_item, _, _ = await _resolve_item(str(out_id))
+                out.append(
+                    {
+                        "item": (out_item or {}).get("name") or str(out_id),
+                        "quantity": qty,
+                        "value_each": (out_item or {}).get("value"),
+                    }
+                )
+            return out
+
+        recycles_to = await _outputs("recyclesInto")
+        salvages_to = await _outputs("salvagesInto")
+        if recycles_to is None:
+            notes.append("Recycle/salvage data unavailable (no RaidTheory item file found).")
+
+        # recycle output value minus sell value: positive means recycling
+        # beats selling on raw coins. None when any value is unknown.
+        recycle_value_delta: int | None = None
+        if recycles_to and best.get("value") is not None:
+            values = [_qty(o.get("value_each")) * _qty(o.get("quantity")) for o in recycles_to]
+            if all(o.get("value_each") is not None for o in recycles_to):
+                recycle_value_delta = sum(values) - _qty(best.get("value"))
+
+        # Sibling variants (Damaged X vs X, Advanced X, ...) with the flag
+        # that matters: is THAT variant itself required by anything? The
+        # data must answer this — heuristics get Damaged Heat Sink wrong
+        # (the damaged form IS the Utility Station II requirement).
+        def _required(variant_keys: set[str]) -> bool:
+            return bool(
+                _quest_demand(variant_keys, all_quests)
+                or _hideout_demand(variant_keys, modules)
+                or _project_demand(variant_keys, all_projects, now_s)
+            )
+
+        variants: list[dict[str, Any]] = []
+        best_norm = _norm(item_name)
+        try:
+            everything = await _all_items()
+        except ToolError:
+            everything = []
+        for other in everything:
+            other_name = other.get("name") or ""
+            other_norm = _norm(other_name)
+            if other_norm == best_norm:
+                continue
+            relation = None
+            for prefix, (with_rel, without_rel) in _VARIANT_PREFIXES.items():
+                if other_norm == f"{prefix} {best_norm}":
+                    relation = with_rel
+                elif best_norm == f"{prefix} {other_norm}":
+                    relation = without_rel
+                if relation:
+                    break
+            if relation:
+                other_keys = {other_norm, _norm(other.get("id") or "")} - {""}
+                variants.append(
+                    {
+                        "name": other_name,
+                        "relation": relation,
+                        "required": _required(other_keys),
+                    }
+                )
+
+        # Verdict. keep_quantity sums every known demand so the caller
+        # never re-does the arithmetic (the reported field failure: "farm
+        # 23 Tick Pods" vs an actual requirement of 8).
+        demand_bits: list[str] = []
+        keep_quantity = 0
+        for row in hideout_requiring or []:
+            keep_quantity += _qty(row.get("quantity"))
+            demand_bits.append(f"{row['module']} L{row['level']} ({_qty(row.get('quantity'))})")
+        for row in quests_requiring or []:
+            keep_quantity += _qty(row.get("quantity"))
+            demand_bits.append(f"quest {row['quest']} ({_qty(row.get('quantity'))})")
+        for row in projects_requiring or []:
+            keep_quantity += _qty(row.get("quantity"))
+            demand_bits.append(
+                f"project {row['project']} phase {row['phase']} ({_qty(row.get('quantity'))})"
+            )
+
+        if keep_quantity > 0:
+            verdict = "keep"
+            shown = demand_bits[:4]
+            more = len(demand_bits) - len(shown)
+            verdict_reason = (
+                "Required for " + "; ".join(shown) + (f"; +{more} more" if more > 0 else "")
+            )
+        elif recycles_to and any(_required({_norm(o["item"])}) for o in recycles_to):
+            verdict = "recycle"
+            needed = [o["item"] for o in recycles_to if _required({_norm(o["item"])})]
+            verdict_reason = f"Recycles into {', '.join(needed)}, which upgrades/quests need"
+        elif recycle_value_delta is not None and recycle_value_delta > 0:
+            verdict = "recycle"
+            verdict_reason = f"Recycle output is worth {recycle_value_delta} more than selling"
+        else:
+            unavailable = [k for k, v in coverage.items() if v == "unavailable"]
+            verdict = "sell"
+            verdict_reason = (
+                "No known quest/hideout/project demand"
+                + (
+                    f" (caveat: {', '.join(unavailable)} data unavailable this call)"
+                    if unavailable
+                    else ""
+                )
+                + ("; sell value unknown" if best.get("value") is None else "")
+            )
+
         return {
             "item": best,
             "match": match_kind,
             "other_candidates": other_candidates,
+            "verdict": verdict,
+            "verdict_reason": verdict_reason,
+            "keep_quantity": keep_quantity,
+            "variants": variants,
+            "recycles_to": recycles_to,
+            "salvages_to": salvages_to,
+            "recycle_value_delta": recycle_value_delta,
             "wiki_location": wiki_location,
             "map_links": map_links,
             "quests_requiring": quests_requiring,
             "hideout_requiring": hideout_requiring,
+            "projects_requiring": projects_requiring,
             "trader_offers": trader_offers,
+            "coverage": coverage,
             "notes": notes,
             "sources": [METAFORGE_SOURCE, RAIDTHEORY_SOURCE],
+        }
+
+    # ── upgrade planner ─────────────────────────────────────────────
+    @mcp.tool(
+        annotations=READ_ONLY,
+        name="arc_plan_upgrades",
+        description=(
+            "Hideout upgrade planner — answers 'what should I build next' "
+            "and 'what am I N items away from' deterministically. Pass your "
+            "current module levels (0 = not built; OMIT unknown modules — "
+            "they are flagged, never assumed); optionally your stash counts "
+            "(then have/short are computed — the stash is treated as a "
+            "SHARED pool: per-module shortfalls do NOT allocate it, and the "
+            "`contention` array flags items multiple upgrades are counting "
+            "on; pass `priority` to greedily allocate in that order), "
+            "target levels for multi-level jumps (cumulative bill with "
+            "per-level breakdown), and include_quests=true to fold quest "
+            "turn-ins into the totals. Do the math from this tool's output "
+            "— never sum requirements by hand."
+        ),
+    )
+    async def plan_upgrades(
+        current_levels: Annotated[
+            dict[str, int],
+            Field(description="Module name -> current level. 0 = not built. Omit if unknown."),
+        ],
+        stash: Annotated[
+            dict[str, int] | None,
+            Field(description="Item name -> count on hand. Omit entirely if unknown."),
+        ] = None,
+        targets: Annotated[
+            dict[str, int] | None,
+            Field(description="Module name -> target level. Default: next level for each."),
+        ] = None,
+        include_quests: Annotated[
+            bool, Field(description="Also fold quest turn-in demand into totals.")
+        ] = False,
+        priority: Annotated[
+            list[str] | None,
+            Field(description="Module order for greedy stash allocation. Default: no allocation."),
+        ] = None,
+    ) -> dict[str, Any]:
+        modules_db = await _hideout_modules()
+        if not modules_db:
+            return ToolError(
+                "arcraiders_data_unreachable",
+                "Hideout module data is unavailable.",
+                "raw.githubusercontent.com may be unreachable; try again shortly.",
+            ).payload()
+
+        by_key: dict[str, dict[str, Any]] = {}
+        for mod in modules_db:
+            en = (mod.get("name") or {}).get("en") or str(mod.get("id"))
+            by_key[_norm(en)] = mod
+            by_key[_norm(str(mod.get("id") or ""))] = mod
+        valid_names = sorted(
+            {(m.get("name") or {}).get("en") or str(m.get("id")) for m in modules_db}
+        )
+
+        def _module_for(key: str) -> dict[str, Any] | None:
+            return by_key.get(_norm(key))
+
+        for source in (current_levels, targets or {}, {p: 0 for p in priority or []}):
+            for key in source:
+                if _module_for(key) is None:
+                    return ToolError(
+                        "arcraiders_unknown_module",
+                        f"Unknown hideout module {key!r}.",
+                        f"Valid modules: {', '.join(valid_names)}.",
+                    ).payload()
+
+        try:
+            all_items = await _all_items()
+        except ToolError:
+            all_items = []
+        items_by_norm = {_norm(i.get("name") or ""): i for i in all_items}
+        for i in all_items:
+            items_by_norm.setdefault(_norm(i.get("id") or ""), i)
+
+        def _display(item_id: str) -> tuple[str, dict[str, Any]]:
+            info = items_by_norm.get(_norm(item_id)) or {}
+            return info.get("name") or item_id, info
+
+        # Stash resolution: exact normalized match wins; a unique squash
+        # match resolves; anything ambiguous or unmatched is RETURNED,
+        # never dropped (a silently dropped key inflates `short`) and
+        # never guessed ('Wasp Driver' vs 'Damaged Wasp Driver').
+        pool: dict[str, int] = {}
+        unresolved_stash_keys: list[dict[str, Any]] = []
+        for raw_key, count in (stash or {}).items():
+            key_norm = _norm(raw_key)
+            if key_norm in items_by_norm:
+                pool[_norm(items_by_norm[key_norm].get("name") or raw_key)] = pool.get(
+                    _norm(items_by_norm[key_norm].get("name") or raw_key), 0
+                ) + _qty(count)
+                continue
+            squash = key_norm.replace(" ", "")
+            matches = sorted(
+                {
+                    str(i.get("name"))
+                    for n, i in items_by_norm.items()
+                    if i.get("name")
+                    and (
+                        n.replace(" ", "") == squash
+                        or (len(squash) > 3 and n.replace(" ", "") == squash.rstrip("s"))
+                    )
+                }
+            )
+            if len(matches) == 1 and matches[0]:
+                pool[_norm(matches[0])] = pool.get(_norm(matches[0]), 0) + _qty(count)
+            else:
+                unresolved_stash_keys.append({"key": raw_key, "candidates": matches[:6]})
+        have_stash = stash is not None
+
+        # Per-module plans.
+        planned: list[dict[str, Any]] = []
+        demand_by_item: dict[str, dict[str, Any]] = {}
+
+        def _add_demand(item_norm: str, display: str, qty: int, consumer: str) -> None:
+            row = demand_by_item.setdefault(
+                item_norm, {"item": display, "total_demand": 0, "demanded_by": []}
+            )
+            row["total_demand"] += qty
+            row["demanded_by"].append(consumer)
+
+        for key, cur_raw in current_levels.items():
+            plan_mod = _module_for(key)
+            if plan_mod is None:  # unreachable — validated above; satisfies mypy
+                continue
+            en = (plan_mod.get("name") or {}).get("en") or str(plan_mod.get("id"))
+            max_level = _qty(plan_mod.get("maxLevel")) or max(
+                (_qty(lv.get("level")) for lv in plan_mod.get("levels") or []), default=0
+            )
+            cur = _qty(cur_raw)
+            target = _qty((targets or {}).get(key, min(cur + 1, max_level)))
+            if target < cur:
+                return ToolError(
+                    "arcraiders_invalid_target",
+                    f"{en}: target level {target} is below current level {cur}.",
+                    "Downgrades aren't a thing.",
+                ).payload()
+            plan: dict[str, Any] = {
+                "module": en,
+                "from": cur,
+                "to": min(target, max_level),
+                "action": "upgrade" if cur > 0 else "build",
+                "level_known": True,
+            }
+            if target > max_level:
+                plan["note"] = f"target clamped to max level {max_level}"
+            if cur >= max_level:
+                plan.update(
+                    {
+                        "action": "complete",
+                        "requirements": [],
+                        "per_level": [],
+                        "units_outstanding": 0,
+                        "items_outstanding": 0,
+                    }
+                )
+                planned.append(plan)
+                continue
+
+            need_by_item: dict[str, int] = {}
+            per_level: list[dict[str, Any]] = []
+            for lvl in plan_mod.get("levels") or []:
+                lnum = _qty(lvl.get("level"))
+                if not (cur < lnum <= min(target, max_level)):
+                    continue
+                lvl_rows = []
+                for req in lvl.get("requirementItemIds") or []:
+                    item_id = str(req.get("itemId") or "")
+                    qty = _qty(req.get("quantity"))
+                    display, _info = _display(item_id)
+                    need_by_item[_norm(display)] = need_by_item.get(_norm(display), 0) + qty
+                    lvl_rows.append({"item": display, "quantity": qty})
+                    _add_demand(_norm(display), display, qty, f"{en} L{lnum}")
+                per_level.append({"level": lnum, "requirements": lvl_rows})
+
+            rows: list[dict[str, Any]] = []
+            for item_norm, need in need_by_item.items():
+                display, info = _display(item_norm)
+                rows.append(
+                    {
+                        "item": info.get("name") or display,
+                        "need": need,
+                        "pool": pool.get(item_norm, 0) if have_stash else None,
+                        "short": max(0, need - pool.get(item_norm, 0)) if have_stash else None,
+                        "rarity": info.get("rarity"),
+                    }
+                )
+            plan["requirements"] = rows
+            plan["per_level"] = per_level
+            plan["units_outstanding"] = sum(
+                _qty(r["short"] if have_stash else r["need"]) for r in rows
+            )
+            plan["items_outstanding"] = sum(
+                1 for r in rows if _qty(r["short"] if have_stash else r["need"]) > 0
+            )
+            planned.append(plan)
+
+        # Optional quest demand fold-in (affects totals, not per-module plans).
+        if include_quests:
+            try:
+                for quest in await _all_quests():
+                    for req in quest.get("required_items") or []:
+                        req_item = req.get("item") or {}
+                        display = req_item.get("name") or str(req.get("item_id"))
+                        _add_demand(
+                            _norm(display),
+                            display,
+                            _qty(req.get("quantity")),
+                            f"quest {quest.get('name')}",
+                        )
+            except ToolError:
+                pass
+
+        # Greedy allocation only on explicit priority (per-module `short`
+        # then reflects what's left after higher-priority modules take
+        # theirs). Default: no allocation — contention flags the overlap.
+        if priority and have_stash:
+            remaining = dict(pool)
+            order = {
+                _norm((_module_for(p) or {}).get("name", {}).get("en") or p): i
+                for i, p in enumerate(priority)
+            }
+            for plan in sorted(
+                planned,
+                key=lambda pl: order.get(_norm(str(pl["module"])), len(order)),
+            ):
+                for row in plan.get("requirements") or []:
+                    item_norm = _norm(str(row["item"]))
+                    take = min(remaining.get(item_norm, 0), _qty(row["need"]))
+                    remaining[item_norm] = remaining.get(item_norm, 0) - take
+                    row["short"] = max(0, _qty(row["need"]) - take)
+                plan["units_outstanding"] = sum(
+                    _qty(r["short"]) for r in plan.get("requirements") or []
+                )
+                plan["items_outstanding"] = sum(
+                    1 for r in plan.get("requirements") or [] if _qty(r["short"]) > 0
+                )
+
+        # Contention: items multiple consumers are counting on, or where
+        # total demand exceeds the shared pool.
+        contention = []
+        for item_norm, row in demand_by_item.items():
+            item_pool = pool.get(item_norm, 0) if have_stash else None
+            over_pool = have_stash and row["total_demand"] > (item_pool or 0)
+            shared = len(row["demanded_by"]) >= 2
+            if over_pool or (shared and (not have_stash or over_pool)):
+                contention.append(
+                    {
+                        "item": row["item"],
+                        "total_demand": row["total_demand"],
+                        "pool": item_pool,
+                        "deficit": (
+                            max(0, row["total_demand"] - (item_pool or 0)) if have_stash else None
+                        ),
+                        "demanded_by": row["demanded_by"],
+                    }
+                )
+            elif shared and not have_stash:
+                contention.append(
+                    {
+                        "item": row["item"],
+                        "total_demand": row["total_demand"],
+                        "pool": None,
+                        "deficit": None,
+                        "demanded_by": row["demanded_by"],
+                    }
+                )
+        contention.sort(key=lambda c: -_qty(c["total_demand"]))
+
+        # Deduped shopping list with acquisition signals.
+        traders_by_item: dict[str, list[str]] = {}
+        try:
+            traders_raw = await _cached_json(
+                f"{metaforge}/traders", service="metaforge", ttl=TTL_LIVE
+            )
+            for trader_name, stock_rows in (traders_raw.get("data") or {}).items():
+                for entry in stock_rows or []:
+                    traders_by_item.setdefault(_norm(entry.get("name") or ""), []).append(
+                        trader_name
+                    )
+        except ToolError:
+            pass
+        shopping_list = []
+        for item_norm, row in demand_by_item.items():
+            info = items_by_norm.get(item_norm) or {}
+            item_pool = pool.get(item_norm, 0) if have_stash else None
+            short = max(0, row["total_demand"] - (item_pool or 0)) if have_stash else None
+            if have_stash and short == 0:
+                continue
+            shopping_list.append(
+                {
+                    "item": row["item"],
+                    "total_need": row["total_demand"],
+                    "pool": item_pool,
+                    "short": short,
+                    "rarity": info.get("rarity"),
+                    "loot_area": info.get("loot_area"),
+                    "traders_selling": sorted(set(traders_by_item.get(item_norm, []))),
+                }
+            )
+        shopping_list.sort(key=lambda s: -_qty(s["total_need"]))
+
+        # Nearest completion: fewest outstanding units, then fewest distinct
+        # items, then best worst-rarity (a Legendary short is further from
+        # done than three Commons).
+        def _worst_rarity(plan: dict[str, Any]) -> int:
+            ranks = [
+                RARITY_ORDER.get(str(r.get("rarity")), len(RARITY_ORDER))
+                for r in plan.get("requirements") or []
+                if _qty(r["short"] if have_stash else r["need"]) > 0
+            ]
+            return max(ranks, default=-1)
+
+        incomplete = [p for p in planned if p["action"] != "complete"]
+        nearest_completion = [
+            p["module"]
+            for p in sorted(
+                incomplete,
+                key=lambda p: (p["units_outstanding"], p["items_outstanding"], _worst_rarity(p)),
+            )
+        ]
+
+        return {
+            "modules": planned,
+            "nearest_completion": nearest_completion,
+            "contention": contention,
+            "shopping_list": shopping_list,
+            "unresolved_stash_keys": unresolved_stash_keys,
+            "modules_with_unknown_level": sorted(
+                name
+                for name in valid_names
+                if all(_module_for(k) is not by_key.get(_norm(name)) for k in current_levels)
+            ),
+            "coverage": {
+                "hideout": "complete",
+                "quests": "complete" if include_quests else "not_included",
+                "projects": "not_modeled",
+                "events": "not_modeled",
+            },
+            "sources": [RAIDTHEORY_SOURCE, METAFORGE_SOURCE],
         }
 
     # ── event schedule ──────────────────────────────────────────────
