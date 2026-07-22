@@ -97,10 +97,16 @@ return: `map_links` open pre-filtered to the item (`?search=`), while
 `map_url`/`mapgenie_url` open the plain map. These tools cannot serve
 MapGenie's marker data directly — link, don't ingest.
 
-Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki)
-and may lag the newest game patch; responses carry `source` fields — keep
-that attribution when presenting data publicly. For lore, strategies, and
-weapon-tier stats not in the structured data, use `arc_search_wiki` then
+**ARC-sourced items & combat**: when loot_area is just "ARC", the real
+answer is an enemy to kill — `arc_who_drops(item)` names it, then
+`arc_get_enemy` gives threat, weakness, and kill tactics. For "which
+weapon vs ARC" loadout questions use `arc_compare_weapons` — its
+`armor_penetration` field is the deciding stat (item search lacks it).
+
+Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki,
+ardb.app) and may lag the newest game patch; responses carry `source`
+fields — keep that attribution when presenting data publicly. For lore
+and strategies beyond the structured data, use `arc_search_wiki` then
 `arc_get_wiki_page` (infobox stats live in the returned `wikitext`).
 """
 
@@ -110,6 +116,7 @@ RAIDTHEORY_SOURCE = (
     "https://github.com/RaidTheory/arcraiders-data · https://arctracker.io"
 )
 WIKI_SOURCE = "ARC Raiders Wiki (CC BY-SA 4.0) — https://arcraiders.wiki"
+ARDB_SOURCE = "ardb.app — https://ardb.app"
 
 # Cache TTLs (seconds). Live data (trader stock, event rotation) turns over
 # on the order of hours; map metadata changes only on game patches.
@@ -167,8 +174,16 @@ MAPGENIE_SLUGS = {
     "blue gate": "the-blue-gate",
     "the blue gate": "the-blue-gate",
     "stella montis": "stella-montis",
+    # bots.json splits Stella Montis into lower/upper — one MapGenie map.
+    "stella montis lower": "stella-montis",
+    "stella montis upper": "stella-montis",
     "riven tides": "riven-tides",
 }
+
+
+def _pretty_map(map_id: str) -> str:
+    """Display name for a RaidTheory snake_case map id ('the_spaceport' -> 'The Spaceport')."""
+    return _norm(map_id).title().replace("Arc", "ARC")
 
 
 def _strip_tags(fragment: str) -> str:
@@ -338,6 +353,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     metaforge = settings.arcraiders_metaforge_base_url.rstrip("/")
     data_base = settings.arcraiders_data_base_url.rstrip("/")
     data_listing = settings.arcraiders_data_listing_url.rstrip("/")
+    ardb = settings.arcraiders_ardb_base_url.rstrip("/")
     wiki_api = settings.arcraiders_wiki_api_url
     # One pooled client for the lifetime of the process (see _http.make_client).
     # Three upstream hosts, so no base_url; MetaForge can be slow on cold cache.
@@ -493,6 +509,97 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 cache.put(url, detail, TTL_STATIC)
                 return detail
         return None
+
+    async def _all_bots() -> list[dict[str, Any]]:
+        """ARC enemy bestiary (RaidTheory bots.json): threat, weakness, drops, maps."""
+        raw = await _cached_json(
+            f"{data_base}/bots.json",
+            service="arcraiders_data",
+            ttl=TTL_STATIC,
+            hint="raw.githubusercontent.com may be unreachable; try again shortly.",
+        )
+        return raw if isinstance(raw, list) else []
+
+    async def _ardb_index() -> dict[str, str]:
+        """ardb.app id lookup: normalized name/id -> ardb item id, cached."""
+        cache_key = f"{ardb}/items#index"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cast(dict[str, str], cached)
+        raw = await request_json(
+            client,
+            "GET",
+            f"{ardb}/items",
+            service="ardb",
+            unreachable_hint="ardb.app may be down; try again shortly.",
+        )
+        rows = raw if isinstance(raw, list) else []
+        index: dict[str, str] = {}
+        for row in rows:
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
+            index[_norm(row.get("name") or "")] = row_id
+            index.setdefault(_norm(row_id), row_id)
+        if index:
+            cache.put(cache_key, index, TTL_STATIC)
+        return index
+
+    async def _ardb_detail(*name_candidates: str | None) -> dict[str, Any] | None:
+        """Full ardb.app item record (weaponSpecs, usedInCraft, droppedBy), or None."""
+        try:
+            index = await _ardb_index()
+        except ToolError:
+            return None
+        item_id = None
+        for cand in name_candidates:
+            if cand and _norm(cand) in index:
+                item_id = index[_norm(cand)]
+                break
+        if item_id is None:
+            # Squash fallback: 'Ferro I' listed as 'ferro', spacing variants.
+            for cand in name_candidates:
+                if not cand:
+                    continue
+                squash = _norm(cand).replace(" ", "")
+                hits = {v for k, v in index.items() if k.replace(" ", "") == squash}
+                if len(hits) == 1:
+                    item_id = hits.pop()
+                    break
+        if item_id is None:
+            return None
+        url = f"{ardb}/items/{enc(item_id)}"
+        cached = cache.get(url)
+        if cached is not None:
+            return cast(dict[str, Any], cached)
+        try:
+            detail = await request_json(client, "GET", url, service="ardb")
+        except ToolError:
+            return None
+        if isinstance(detail, dict):
+            cache.put(url, detail, TTL_STATIC)
+            return detail
+        return None
+
+    def _weapon_specs(ardb_item: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Normalize ardb weaponSpecs — flat, consistent across tiers, with
+        armor_penetration (the ARC-effectiveness stat MetaForge lacks)."""
+        specs = (ardb_item or {}).get("weaponSpecs")
+        if not isinstance(specs, dict):
+            return None
+        stats = specs.get("stats") or {}
+        return {
+            "armor_penetration": specs.get("armorPenetration"),
+            "ammo": specs.get("ammoType"),
+            "firing_mode": specs.get("firingMode"),
+            "mag_size": specs.get("magSize"),
+            "damage": stats.get("damage"),
+            "range": stats.get("range"),
+            "fire_rate": stats.get("fireRate"),
+            "stability": stats.get("stability"),
+            "agility": stats.get("agility"),
+            "stealth": stats.get("stealth"),
+        }
 
     def _project_demand(
         keys: set[str], projects: list[dict[str, Any]], now: float
@@ -875,10 +982,44 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         if best.get("value") is None and detail and detail.get("value"):
             best["value"] = detail["value"]
             notes.append("Sell value taken from RaidTheory (MetaForge reports 0/unknown).")
-        if best.get("value") is None:
-            notes.append("value_unknown: no source reports a sell value for this item.")
         if detail and detail.get("tip"):
             best["tip"] = detail["tip"]
+
+        # ardb.app record: weapon specs (incl. armor penetration), the
+        # crafting-usage index, the item's own recipe, and enemy drops.
+        ardb_item = await _ardb_detail(best.get("name"), best.get("id"))
+        weapon_specs = _weapon_specs(ardb_item)
+        crafting_uses: list[str] | None = None
+        craft_recipe: dict[str, Any] | None = None
+        dropped_by: list[str] | None = None
+        if ardb_item is not None:
+            coverage["crafting_recipes"] = "complete"
+            crafting_uses = [
+                str(u.get("name") or u.get("id")) for u in ardb_item.get("usedInCraft") or []
+            ]
+            recipe_raw = ardb_item.get("craftingRequirement")
+            if isinstance(recipe_raw, dict):
+                craft_recipe = {
+                    "output_amount": recipe_raw.get("outputAmount"),
+                    "inputs": [
+                        {
+                            "item": (r.get("item") or {}).get("name")
+                            or (r.get("item") or {}).get("id"),
+                            "quantity": r.get("amount") or r.get("quantity"),
+                        }
+                        for r in recipe_raw.get("requiredItems") or []
+                    ],
+                }
+            dropped_by = [
+                str(e.get("name") or e.get("id")) for e in ardb_item.get("droppedBy") or []
+            ]
+            if best.get("value") is None and ardb_item.get("value"):
+                best["value"] = ardb_item["value"]
+                notes.append("Sell value taken from ardb.app (other sources report 0/unknown).")
+        else:
+            coverage["crafting_recipes"] = "unavailable"
+        if best.get("value") is None:
+            notes.append("value_unknown: no source reports a sell value for this item.")
 
         async def _outputs(field: str) -> list[dict[str, Any]] | None:
             if detail is None:
@@ -994,7 +1135,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 )
                 + ("; sell value unknown" if best.get("value") is None else "")
             )
+        if verdict != "keep" and crafting_uses:
+            shown_uses = ", ".join(crafting_uses[:3])
+            verdict_reason += f"; note: used to craft {shown_uses}" + (
+                f" +{len(crafting_uses) - 3} more" if len(crafting_uses) > 3 else ""
+            )
 
+        sources = [METAFORGE_SOURCE, RAIDTHEORY_SOURCE]
+        if ardb_item is not None:
+            sources.append(ARDB_SOURCE)
         return {
             "item": best,
             "match": match_kind,
@@ -1003,6 +1152,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "verdict_reason": verdict_reason,
             "keep_quantity": keep_quantity,
             "variants": variants,
+            "weapon_specs": weapon_specs,
+            "crafting_uses": crafting_uses,
+            "craft_recipe": craft_recipe,
+            "dropped_by": dropped_by,
             "recycles_to": recycles_to,
             "salvages_to": salvages_to,
             "recycle_value_delta": recycle_value_delta,
@@ -1014,7 +1167,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "trader_offers": trader_offers,
             "coverage": coverage,
             "notes": notes,
-            "sources": [METAFORGE_SOURCE, RAIDTHEORY_SOURCE],
+            "sources": sources,
         }
 
     # ── upgrade planner ─────────────────────────────────────────────
@@ -1359,6 +1512,182 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "events": "not_modeled",
             },
             "sources": [RAIDTHEORY_SOURCE, METAFORGE_SOURCE],
+        }
+
+    # ── bestiary ────────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=READ_ONLY,
+        name="arc_get_enemy",
+        description=(
+            "ARC enemy bestiary: threat rating, weakness/kill tactics, "
+            "which maps it appears on, what it drops, and destroy/loot XP. "
+            "Use for 'how do I kill a Bastion' or 'what does a Wasp drop' "
+            "questions. Enemy names: Bastion, Bombardier, Fireball, "
+            "Hornet, Leaper, Matriarch, Pop, Rocketeer, Sentinel, "
+            "Shredder, Snitch, Spotter, Tick, Wasp, ..."
+        ),
+    )
+    async def get_enemy(
+        name: Annotated[str, Field(min_length=1, description="Enemy name, e.g. 'Bastion'.")],
+    ) -> dict[str, Any]:
+        try:
+            bots = await _all_bots()
+        except ToolError as err:
+            return err.payload()
+
+        def _bot_display(b: dict[str, Any]) -> str:
+            raw_name = b.get("name")
+            en = raw_name.get("en") if isinstance(raw_name, dict) else raw_name
+            return str(en or b.get("id") or "")
+
+        want = _norm(name)
+        bot = None
+        for b in bots:
+            bot_norms = {_norm(_bot_display(b)), _norm(str(b.get("id") or ""))}
+            # ids are prefixed ('arc_bastion'); accept the bare form too.
+            bot_norms |= {n.removeprefix("arc ") for n in bot_norms}
+            if want in bot_norms:
+                bot = b
+                break
+        if bot is None:
+            known = sorted(_bot_display(b) for b in bots)
+            return ToolError(
+                "arcraiders_unknown_enemy",
+                f"No ARC enemy matching {name!r}.",
+                f"Known enemies: {', '.join(known)}.",
+            ).payload()
+        display = _bot_display(bot)
+        try:
+            items = await _all_items()
+        except ToolError:
+            items = []
+        names_by_norm = {_norm(i.get("id") or ""): i.get("name") for i in items}
+        names_by_norm.update({_norm(i.get("name") or ""): i.get("name") for i in items})
+        maps = [_pretty_map(str(m)) for m in bot.get("maps") or []]
+        return {
+            "name": display,
+            "type": bot.get("type"),
+            "threat": bot.get("threat"),
+            "weakness": bot.get("weakness"),
+            "description": (
+                (bot.get("description") or {}).get("en")
+                if isinstance(bot.get("description"), dict)
+                else bot.get("description")
+            ),
+            "maps": maps,
+            "map_links": {m: url for m in maps if (url := _mapgenie_url(m))},
+            "drops": [
+                names_by_norm.get(_norm(str(d))) or _pretty_map(str(d))
+                for d in bot.get("drops") or []
+            ],
+            "destroy_xp": bot.get("destroyXp"),
+            "loot_xp": bot.get("lootXp"),
+            "image": bot.get("image"),
+            "source": RAIDTHEORY_SOURCE,
+        }
+
+    @mcp.tool(
+        annotations=READ_ONLY,
+        name="arc_who_drops",
+        description=(
+            "Inverse drop index: which ARC enemies drop a given item, with "
+            "threat ratings and maps. The actionable answer to 'where do I "
+            "get Wasp Drivers' when the loot_area is just 'ARC' — the "
+            "answer is an enemy to kill, not a zone. Follow up with "
+            "arc_get_enemy for kill tactics."
+        ),
+    )
+    async def who_drops(
+        item: Annotated[str, Field(min_length=1, description="Item name, e.g. 'ARC Alloy'.")],
+    ) -> dict[str, Any]:
+        try:
+            best, match_kind, _others = await _resolve_item(item)
+        except ToolError as err:
+            return err.payload()
+        target_keys = {_norm(item)}
+        display = item
+        if best is not None:
+            display = best.get("name") or item
+            target_keys |= {_norm(best.get("name") or ""), _norm(best.get("id") or "")}
+        target_keys -= {""}
+        try:
+            bots = await _all_bots()
+        except ToolError as err:
+            return err.payload()
+        droppers = []
+        for bot in bots:
+            drop_norms = {_norm(str(d)) for d in bot.get("drops") or []}
+            if drop_norms & target_keys:
+                bot_name = (
+                    (bot.get("name") or {}).get("en")
+                    if isinstance(bot.get("name"), dict)
+                    else str(bot.get("name"))
+                ) or str(bot.get("id"))
+                droppers.append(
+                    {
+                        "enemy": bot_name,
+                        "threat": bot.get("threat"),
+                        "maps": [_pretty_map(str(m)) for m in bot.get("maps") or []],
+                    }
+                )
+        # Cross-check ardb's droppedBy for enemies bots.json misses.
+        ardb_item = await _ardb_detail(display, (best or {}).get("id"))
+        seen = {_norm(str(d["enemy"])) for d in droppers}
+        for extra in (ardb_item or {}).get("droppedBy") or []:
+            extra_name = str(extra.get("name") or extra.get("id") or "")
+            if extra_name and _norm(extra_name) not in seen:
+                droppers.append({"enemy": extra_name, "threat": None, "maps": []})
+        return {
+            "item": display,
+            "match": match_kind if best is not None else "unresolved",
+            "dropped_by": droppers,
+            "returned": len(droppers),
+            "sources": [RAIDTHEORY_SOURCE, ARDB_SOURCE],
+        }
+
+    # ── weapon comparison ───────────────────────────────────────────
+    @mcp.tool(
+        annotations=READ_ONLY,
+        name="arc_compare_weapons",
+        description=(
+            "Side-by-side weapon comparison with normalized stats INCLUDING "
+            "armor_penetration — the stat that decides ARC-vs-player "
+            "effectiveness and that item search lacks. Pass 2-6 weapon "
+            "names (tiers are distinct: 'Ferro I' vs 'Ferro IV'). Use for "
+            "'which weapon is better vs ARC' loadout questions."
+        ),
+    )
+    async def compare_weapons(
+        weapons: Annotated[
+            list[str],
+            Field(min_length=2, max_length=6, description="Weapon names to compare."),
+        ],
+    ) -> dict[str, Any]:
+        rows = []
+        notes: list[str] = []
+        for w in weapons:
+            ardb_item = await _ardb_detail(w)
+            specs = _weapon_specs(ardb_item)
+            if ardb_item is None:
+                notes.append(f"{w!r}: not found in ardb.app.")
+                continue
+            if specs is None:
+                notes.append(f"{ardb_item.get('name') or w!r} has no weapon specs (not a weapon?).")
+                continue
+            rows.append(
+                {
+                    "name": ardb_item.get("name") or w,
+                    "rarity": ardb_item.get("rarity"),
+                    "value": ardb_item.get("value"),
+                    "weight": ardb_item.get("weight"),
+                    **specs,
+                }
+            )
+        return {
+            "weapons": rows,
+            "returned": len(rows),
+            "notes": notes,
+            "source": ARDB_SOURCE,
         }
 
     # ── event schedule ──────────────────────────────────────────────

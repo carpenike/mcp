@@ -20,6 +20,7 @@ from homelab_mcp.tools.arcraiders import register
 METAFORGE = "https://metaforge.test/api/arc-raiders"
 DATA = "https://data.test/main"
 DATA_LISTING = "https://ghapi.test/contents"
+ARDB = "https://ardb.test/api"
 WIKI = "https://wiki.test/w/api.php"
 
 pytestmark = pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
@@ -63,6 +64,7 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_METAFORGE_BASE_URL", METAFORGE)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DATA_BASE_URL", DATA)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DATA_LISTING_URL", DATA_LISTING)
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_ARDB_BASE_URL", ARDB)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_WIKI_API_URL", WIKI)
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
@@ -288,6 +290,21 @@ async def test_check_item_keep_aggregates_all_sources(
         },
     )
     httpx_mock.add_response(
+        url=f"{ARDB}/items",
+        json=[{"id": "arc_alloy", "name": "ARC Alloy"}],
+    )
+    httpx_mock.add_response(
+        url=f"{ARDB}/items/arc_alloy",
+        json={
+            "id": "arc_alloy",
+            "name": "ARC Alloy",
+            "value": 200,
+            "usedInCraft": [{"id": "light_shield", "name": "Light Shield"}],
+            "droppedBy": [{"id": "wasp", "name": "Wasp"}],
+            "craftingRequirement": None,
+        },
+    )
+    httpx_mock.add_response(
         url=f"{METAFORGE}/quests?limit=100&page=1",
         json={
             "data": [
@@ -398,9 +415,13 @@ async def test_check_item_keep_aggregates_all_sources(
         "quests": "complete",
         "hideout": "complete",
         "projects": "complete",
-        "crafting_recipes": "not_modeled",
+        "crafting_recipes": "complete",
         "events": "not_modeled",
     }
+    assert out["weapon_specs"] is None
+    assert out["crafting_uses"] == ["Light Shield"]
+    assert out["dropped_by"] == ["Wasp"]
+    assert any("ardb.app" in src for src in out["sources"])
     assert out["notes"] == []
 
 
@@ -431,6 +452,8 @@ async def test_check_item_keep_degrades_per_source(
     assert out["coverage"]["quests"] == "unavailable"
     assert out["coverage"]["hideout"] == "unavailable"
     assert out["coverage"]["projects"] == "unavailable"
+    assert out["coverage"]["crafting_recipes"] == "unavailable"
+    assert out["weapon_specs"] is None and out["crafting_uses"] is None
     # The verdict must hedge when whole axes were unavailable.
     assert out["verdict"] == "sell"
     assert "unavailable" in out["verdict_reason"]
@@ -623,6 +646,128 @@ async def test_plan_upgrades_level_zero_is_build(
     (plan,) = out["modules"]
     assert plan["action"] == "build"
     assert {r["item"]: r["need"] for r in plan["requirements"]} == {"Fabric": 50}
+
+
+# ── bestiary & weapons ───────────────────────────────────────────────
+
+
+def _bots_body() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "arc_wasp",
+            "name": {"en": "Wasp"},
+            "type": "Scout",
+            "threat": "Moderate",
+            "weakness": "Shoot the thruster.",
+            "description": {"en": "A flying scout."},
+            "maps": ["dam_battlegrounds", "the_spaceport"],
+            "destroyXp": 100,
+            "lootXp": 50,
+            "drops": ["arc_alloy", "wasp_driver"],
+            "image": "https://cdn.test/wasp.png",
+        }
+    ]
+
+
+async def test_get_enemy_resolves_and_projects(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{DATA}/bots.json", json=_bots_body())
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [_item("ARC Alloy", id="arc-alloy"), _item("Wasp Driver", id="wasp-driver")],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    out = await tools["arc_get_enemy"](name="wasp")
+    assert out["name"] == "Wasp"
+    assert out["threat"] == "Moderate"
+    assert out["weakness"] == "Shoot the thruster."
+    # snake_case drop ids resolve to display names via the item table.
+    assert out["drops"] == ["ARC Alloy", "Wasp Driver"]
+    assert out["maps"] == ["Dam Battlegrounds", "The Spaceport"]
+    assert "dam-battlegrounds" in out["map_links"]["Dam Battlegrounds"]
+
+
+async def test_get_enemy_unknown_lists_known(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{DATA}/bots.json", json=_bots_body())
+    out = await tools["arc_get_enemy"](name="gundam")
+    assert out["error"]["code"] == "arcraiders_unknown_enemy"
+    assert "Wasp" in out["error"]["hint"]
+
+
+async def test_who_drops_merges_bots_and_ardb(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [_item("ARC Alloy", id="arc-alloy")],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(url=f"{DATA}/bots.json", json=_bots_body())
+    httpx_mock.add_response(url=f"{ARDB}/items", json=[{"id": "arc_alloy", "name": "ARC Alloy"}])
+    httpx_mock.add_response(
+        url=f"{ARDB}/items/arc_alloy",
+        json={
+            "id": "arc_alloy",
+            "name": "ARC Alloy",
+            # Wasp duplicates bots.json (must dedupe); Hornet is ardb-only.
+            "droppedBy": [{"id": "wasp", "name": "Wasp"}, {"id": "hornet", "name": "Hornet"}],
+        },
+    )
+    out = await tools["arc_who_drops"](item="arc alloy")
+    assert out["item"] == "ARC Alloy"
+    enemies = {d["enemy"]: d for d in out["dropped_by"]}
+    assert set(enemies) == {"Wasp", "Hornet"}
+    assert enemies["Wasp"]["threat"] == "Moderate"  # from bots.json, not the bare ardb row
+
+
+async def test_compare_weapons_normalizes_and_flags_non_weapons(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=f"{ARDB}/items",
+        json=[
+            {"id": "ferro", "name": "Ferro I"},
+            {"id": "osprey", "name": "Osprey I"},
+            {"id": "arc_alloy", "name": "ARC Alloy"},
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{ARDB}/items/ferro",
+        json={
+            "id": "ferro",
+            "name": "Ferro I",
+            "rarity": "common",
+            "value": 475,
+            "weight": 8,
+            "weaponSpecs": {
+                "armorPenetration": "strong",
+                "ammoType": "heavy",
+                "firingMode": "break-action",
+                "magSize": 1,
+                "stats": {"damage": 40, "range": 53.1, "fireRate": 6.6},
+            },
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{ARDB}/items/arc_alloy",
+        json={"id": "arc_alloy", "name": "ARC Alloy", "value": 200},
+    )
+    out = await tools["arc_compare_weapons"](weapons=["Ferro I", "ARC Alloy"])
+    assert out["returned"] == 1
+    row = out["weapons"][0]
+    assert row["name"] == "Ferro I"
+    assert row["armor_penetration"] == "strong"
+    assert row["damage"] == 40
+    assert row["mag_size"] == 1
+    # The non-weapon is flagged, not silently dropped.
+    assert any("no weapon specs" in n for n in out["notes"])
 
 
 # ── events ───────────────────────────────────────────────────────────
