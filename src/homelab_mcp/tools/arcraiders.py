@@ -70,11 +70,14 @@ form is required comes from data, not naming (Damaged Heat Sink IS the
 required form).
 
 **"What should I build next?"**: call `arc_plan_upgrades` with the user's
-module levels (omit unknown ones — never guess), and their stash counts
-when known. It returns per-module shortfalls, `nearest_completion`,
-shared-item `contention`, and a deduped shopping list. Trust its
-arithmetic over your own; `have`/`short` null means stash unknown, 0
-means known-empty — don't conflate them.
+module levels (omit unknown ones — never guess). It returns per-module
+shortfalls, `nearest_completion`, shared-item `contention`, and a deduped
+shopping list with `required_by` provenance. Never ask the user to
+enumerate their whole stash: run the planner FIRST, then ask counts for
+only the shopping-list items ("how many Rusted Tools and Wasp Drivers do
+you have?") and re-run with that scoped `stash`. Trust its arithmetic
+over your own; `have`/`short` null means stash unknown, 0 means
+known-empty — don't conflate them.
 
 **Time-sensitive data**: `arc_get_event_schedule` (in-raid event rotation)
 and `arc_get_trader_stock` change hourly-ish; timestamps are UTC. Compare
@@ -98,6 +101,13 @@ screenshot). For pixel-level markers, share the MapGenie links the tools
 return: `map_links` open pre-filtered to the item (`?search=`), while
 `map_url`/`mapgenie_url` open the plain map. These tools cannot serve
 MapGenie's marker data directly — link, don't ingest.
+
+`loot_area: "Exodus"` is a loot POOL, not a HUD zone: high-value
+components (Magnetic Accelerator, Exodus Modules) from special
+containers on all maps, craftable at Refiner L3, and dropped by
+Queens/Matriarchs. For POI-level farming spots ("Rocket Assembly red
+lockers"), no structured source exists — share an item's `guide_links`
+when present, or search the web.
 
 **ARC-sourced items & combat**: when loot_area is just "ARC", the real
 answer is an enemy to kill — `arc_who_drops(item)` names it, then
@@ -228,6 +238,17 @@ MAPGENIE_SLUGS = {
 def _pretty_map(map_id: str) -> str:
     """Display name for a RaidTheory snake_case map id ('the_spaceport' -> 'The Spaceport')."""
     return _norm(map_id).title().replace("Arc", "ARC")
+
+
+def _truncate(text: str, limit: int = 140) -> str | None:
+    """Trim prose on a word boundary with an ellipsis; None for empty."""
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return f"{cut}…"
 
 
 # Coverage vocabulary — the trust contract on every response (v2 feedback:
@@ -370,28 +391,31 @@ def _project_item(raw: dict[str, Any]) -> dict[str, Any]:
     found_on_maps = sorted(
         {str(loc.get("map")) for loc in raw.get("locations") or [] if loc.get("map")}
     )
-    # subcategory almost always duplicates item_type — only keep a real refinement.
-    subcategory = raw.get("subcategory") or None
-    if subcategory == raw.get("item_type"):
-        subcategory = None
     # MetaForge emits value 0 for unknown (e.g. Tellurion, a 7000-coin Epic).
     # Never pass 0 through — it reads as "worthless, sell it". Callers fall
     # back to the RaidTheory per-item value, then to null + a note.
     value = raw.get("value") or None
-    return {
+    projected = {
         "id": raw.get("id"),
         "name": raw.get("name"),
         "type": raw.get("item_type"),
-        "subcategory": subcategory,
         "rarity": raw.get("rarity"),
         "value": value,
         "description": raw.get("description"),
         "workbench": raw.get("workbench"),
         "loot_area": raw.get("loot_area"),
-        "found_on_maps": found_on_maps,
         "stats": stats,
         "updated_at": raw.get("updated_at"),
     }
+    # Populate-or-drop (field feedback): sparse fields appear only when
+    # they carry data — presence IS the signal. subcategory is gone
+    # entirely (it duplicated item_type on every observed row).
+    if found_on_maps:
+        projected["found_on_maps"] = found_on_maps
+    guides = [g for g in raw.get("guide_links") or [] if g]
+    if guides:
+        projected["guide_links"] = guides
+    return projected
 
 
 def _project_quest_items(raw: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -734,7 +758,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     rows.append(
                         {
                             "project": proj_name,
-                            "description": (desc[:140] or None),
+                            "description": _truncate(desc),
                             "phase": phase.get("phase"),
                             "quantity": req.get("quantity"),
                             "ends_utc": (
@@ -971,10 +995,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "rarity, weight), then cross-references every quest turn-in, "
             "hideout upgrade level, AND expedition/seasonal project phase "
             "that requires it, plus recycle/salvage outputs and trader "
-            "offers — and ships a verdict (keep/recycle/sell) with the "
-            "total keep_quantity. Check the `coverage` field before "
-            "advising a sale: axes marked not_modeled are invisible to "
-            "this tool, and selling is irreversible."
+            "offers — and ships a verdict (keep/recycle/sell/"
+            "probably_sell) with the total keep_quantity. probably_sell "
+            "means an Epic+ item with an unmodeled axis in play — verify "
+            "in-game first. coverage values per axis: complete (folded "
+            "in) | not_included (caller opted out) | unavailable (no "
+            "data this call/item) | not_modeled (no source exists). "
+            "Selling is irreversible — honor the hedges."
         ),
     )
     async def check_item_keep(
@@ -1251,11 +1278,21 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             )
         # A sell recommendation is irreversible — name the axes this tool
         # simply cannot see (merit-track events like Forgotten Relics),
-        # every time, so the hedge can't be forgotten.
+        # every time. For Epic+ items the verdict itself degrades: callers
+        # act on `verdict` and skip metadata, so the hedge must live in
+        # the field they read (v3 feedback).
         if verdict == "sell":
             not_modeled = [k for k, v in coverage.items() if v == "not_modeled"]
             if not_modeled:
-                verdict_reason += f"; not checked: {', '.join(not_modeled)} (not modeled)"
+                high_rarity = RARITY_ORDER.get(str(best.get("rarity")), -1) >= RARITY_ORDER["Epic"]
+                if high_rarity:
+                    verdict = "probably_sell"
+                    verdict_reason += (
+                        f"; {best.get('rarity')} item and {', '.join(not_modeled)} "
+                        "not modeled — verify no active event wants it before selling"
+                    )
+                else:
+                    verdict_reason += f"; not checked: {', '.join(not_modeled)} (not modeled)"
 
         sources = [METAFORGE_SOURCE, RAIDTHEORY_SOURCE]
         if ardb_item is not None:
@@ -1275,8 +1312,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "recycles_to": recycles_to,
             "salvages_to": salvages_to,
             "recycle_value_delta": recycle_value_delta,
-            "wiki_location": wiki_location,
-            "map_links": map_links,
+            **({"wiki_location": wiki_location} if wiki_location else {}),
+            **({"map_links": map_links} if map_links else {}),
             "quests_requiring": quests_requiring,
             "hideout_requiring": hideout_requiring,
             "projects_requiring": projects_requiring,
@@ -1305,8 +1342,11 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "user's ACCEPTED quests — or every quest in the game is "
             "folded), and include_projects=true for active expedition/"
             "project phases. Every shopping_list line carries required_by "
-            "provenance. Do the math from this tool's output — never sum "
-            "requirements by hand."
+            "provenance; scope projects with active_projects={name: "
+            "current_phase} (only that phase folds — later phases aren't "
+            "actionable yet). coverage values: complete | not_included | "
+            "unavailable | not_modeled. Do the math from this tool's "
+            "output — never sum requirements by hand."
         ),
     )
     async def plan_upgrades(
@@ -1337,6 +1377,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         include_projects: Annotated[
             bool, Field(description="Also fold active expedition/project phase demand into totals.")
         ] = False,
+        active_projects: Annotated[
+            dict[str, int] | None,
+            Field(
+                description=(
+                    "With include_projects: project name -> the phase the user is "
+                    "ON; only that phase is folded (projects are sequential — "
+                    "phase-5 demand isn't actionable during phase 1). Default: "
+                    "every phase of every active project."
+                )
+            ),
+        ] = None,
         priority: Annotated[
             list[str] | None,
             Field(description="Module order for greedy stash allocation. Default: no allocation."),
@@ -1381,7 +1432,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
         def _display(item_id: str) -> tuple[str, dict[str, Any]]:
             info = items_by_norm.get(_norm(item_id)) or {}
-            return info.get("name") or item_id, info
+            # Unmatched ids (cosmetics like colorful_shoes_red) render as
+            # readable names, never raw snake_case (v3-3).
+            return info.get("name") or _pretty_map(item_id), info
 
         # Stash resolution: exact normalized match wins; a unique squash
         # match resolves; anything ambiguous or unmatched is RETURNED,
@@ -1532,9 +1585,20 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             if wanted is not None:
                 unresolved_quest_names = [q for q in active_quests or [] if _norm(q) not in matched]
 
-        # Optional active-project demand fold-in (same shape as quests).
+        # Optional active-project demand fold-in. With active_projects,
+        # only the phase the user is ON is folded — projects are
+        # sequential, so later-phase demand isn't actionable yet (v3-1:
+        # same firehose class as unscoped quests). Unmatched names are
+        # RETURNED, never dropped.
         projects_coverage = "complete" if include_projects else "not_included"
+        unresolved_project_names: list[str] = []
         if include_projects:
+            wanted_projects = (
+                {_norm(name): phase for name, phase in active_projects.items()}
+                if active_projects
+                else None
+            )
+            matched_projects: set[str] = set()
             try:
                 now_s = time.time()
                 for proj in await _all_projects():
@@ -1544,7 +1608,16 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     if isinstance(proj_end, (int, float)) and proj_end < now_s:
                         continue
                     proj_name = (proj.get("name") or {}).get("en") or proj.get("id")
+                    proj_norm = _norm(str(proj_name))
+                    only_phase: int | None = None
+                    if wanted_projects is not None:
+                        if proj_norm not in wanted_projects:
+                            continue
+                        matched_projects.add(proj_norm)
+                        only_phase = _qty(wanted_projects[proj_norm])
                     for phase in proj.get("phases") or []:
+                        if only_phase is not None and _qty(phase.get("phase")) != only_phase:
+                            continue
                         for req in phase.get("requirementItemIds") or []:
                             item_id = str(req.get("itemId") or "")
                             display, _info = _display(item_id)
@@ -1556,6 +1629,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                             )
             except ToolError:
                 projects_coverage = "unavailable"
+            if wanted_projects is not None:
+                unresolved_project_names = [
+                    name for name in (active_projects or {}) if _norm(name) not in matched_projects
+                ]
 
         # Greedy allocation only on explicit priority (per-module `short`
         # then reflects what's left after higher-priority modules take
@@ -1676,6 +1753,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "shopping_list": shopping_list,
             "unresolved_stash_keys": unresolved_stash_keys,
             "unresolved_quest_names": unresolved_quest_names,
+            "unresolved_project_names": unresolved_project_names,
             # Non-upgradable modules (no levels in the data, e.g. the
             # Workbench) are excluded — a module that CANNOT be upgraded
             # is not 'unknown', there is simply nothing to plan for it.
