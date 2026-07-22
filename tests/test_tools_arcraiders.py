@@ -44,18 +44,26 @@ class CapturingMCP:
         return deco
 
 
-def test_all_tools_annotated_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every arc_* tool must declare read-only annotations — claude.ai's
-    permission UI groups by these hints and dumps unannotated tools into
-    an individually-approved 'Other tools' bucket."""
+# The only arc tools allowed to write, and the only one allowed to be
+# destructive (the confirm-gated raid-log correction path). Everything
+# else in the category must stay read-only.
+_EXPECTED_WRITERS = {"arc_log_raid", "arc_delete_raid"}
+_EXPECTED_DESTRUCTIVE = {"arc_delete_raid"}
+
+
+def test_tool_annotation_posture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every arc_* tool must declare annotations, and only the raid-log
+    writers may deviate from read-only — claude.ai's permission UI groups
+    by these hints."""
     monkeypatch.setenv("HOMELAB_MCP_OAUTH_REQUIRED", "false")
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DB_PATH", ":memory:")
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
     assert mcp.tools, "no tools registered"
     for name, ann in mcp.annotations.items():
         assert ann is not None, f"{name} has no annotations"
-        assert ann.readOnlyHint is True, f"{name} not marked read-only"
-        assert ann.destructiveHint is False, f"{name} marked destructive"
+        assert ann.readOnlyHint is (name not in _EXPECTED_WRITERS), f"{name} readOnlyHint"
+        assert ann.destructiveHint is (name in _EXPECTED_DESTRUCTIVE), f"{name} destructiveHint"
 
 
 @pytest.fixture
@@ -66,6 +74,7 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DATA_LISTING_URL", DATA_LISTING)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_ARDB_BASE_URL", ARDB)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_WIKI_API_URL", WIKI)
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DB_PATH", ":memory:")
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
     return mcp.tools
@@ -768,6 +777,97 @@ async def test_compare_weapons_normalizes_and_flags_non_weapons(
     assert row["mag_size"] == 1
     # The non-weapon is flagged, not silently dropped.
     assert any("no weapon specs" in n for n in out["notes"])
+
+
+# ── raid log & patch diff ────────────────────────────────────────────
+
+
+async def test_raid_log_roundtrip_and_stats(tools: dict[str, Callable[..., Any]]) -> None:
+    """Log -> list -> stats over the in-memory store; no upstream HTTP."""
+    for kwargs in (
+        {"map_name": "dam", "outcome": "extracted", "loadout": "Ferro IV", "loot_value": 12000},
+        {"map_name": "dam", "outcome": "died", "loadout": "Ferro IV", "died_at": "Scrapyard"},
+        {"map_name": "Spaceport", "outcome": "extracted", "loadout": "Osprey I"},
+    ):
+        out = await tools["arc_log_raid"](**kwargs)
+        assert out["logged"] is True
+    # 'dam' normalized to the display name via the alias table.
+    assert out["logged"] is True
+    listed = await tools["arc_list_raids"](limit=10)
+    assert listed["returned"] == 3
+    assert listed["raids"][0]["map"] == "The Spaceport" or listed["raids"][0]["map"] == "Spaceport"
+    stats = await tools["arc_raid_stats"](days=30)
+    assert stats["overall"] == {"raids": 3, "extracted": 2, "extraction_rate": 0.67}
+    assert stats["by_map"]["Dam Battlegrounds"]["raids"] == 2
+    assert stats["by_loadout"]["Ferro IV"]["extraction_rate"] == 0.5
+    assert stats["death_spots"] == {"Scrapyard": 1}
+    assert stats["loot"]["total"] == 12000
+
+
+async def test_raid_log_invalid_outcome(tools: dict[str, Callable[..., Any]]) -> None:
+    out = await tools["arc_log_raid"](map_name="dam", outcome="rage_quit")
+    assert out["error"]["code"] == "arcraiders_invalid_outcome"
+
+
+async def test_delete_raid_previews_without_confirm(
+    tools: dict[str, Callable[..., Any]],
+) -> None:
+    logged = await tools["arc_log_raid"](map_name="dam", outcome="died")
+    preview = await tools["arc_delete_raid"](raid_id=logged["id"])
+    assert preview["deleted"] is False
+    assert preview["preview"]["outcome"] == "died"
+    done = await tools["arc_delete_raid"](raid_id=logged["id"], confirm=True)
+    assert done["deleted"] is True
+    assert (await tools["arc_list_raids"]())["returned"] == 0
+
+
+async def test_patch_diff_reports_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A backdated baseline snapshot + fresh fetch -> concrete stat diffs."""
+    from homelab_mcp.arcraiders_state import ArcState
+
+    db = str(tmp_path / "arc.db")
+    seed = ArcState(db)
+    import asyncio as _asyncio
+
+    _asyncio.get_event_loop()  # ensure a loop exists for the sync seed below
+    # Seed a 10-day-old baseline directly.
+    seed._conn.execute(
+        "INSERT INTO snapshot (ts, kind, content, content_hash) VALUES (?, ?, ?, ?)",
+        (
+            time.time() - 10 * 86400,
+            "items",
+            '{"Kettle": {"value": 100, "rarity": "Rare", "type": "AR", "stats": {"damage": 30}}}',
+            "seedhash",
+        ),
+    )
+    seed._conn.commit()
+
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_REQUIRED", "false")
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_METAFORGE_BASE_URL", METAFORGE)
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DB_PATH", db)
+    mcp = CapturingMCP()
+    register(mcp, Settings())  # type: ignore[arg-type]
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [
+                _item(
+                    "Kettle",
+                    id="kettle",
+                    value=100,
+                    rarity="Rare",
+                    item_type="AR",
+                    stat_block={"damage": 35},
+                ),
+            ],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    out = await mcp.tools["arc_patch_diff"](since_days=7)
+    assert {"item": "Kettle", "field": "stats.damage", "old": 30, "new": 35} in out["changes"]
+    assert out["truncated"] is False
 
 
 # ── events ───────────────────────────────────────────────────────────
