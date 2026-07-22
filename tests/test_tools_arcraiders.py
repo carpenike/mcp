@@ -250,8 +250,41 @@ async def test_check_item_keep_aggregates_all_sources(
                     loot_area="ARC",
                     locations=[{"id": "m1", "map": "dam"}, {"id": "m2", "map": "spaceport"}],
                 ),
+                _item("Metal Parts", id="metal-parts", value=75),
             ],
             "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/projects.json",
+        json=[
+            {
+                "id": "trophy_display",
+                "disabled": False,
+                "endDate": 2524521600,
+                "name": {"en": "Trophy Display"},
+                "phases": [
+                    {"phase": 1, "requirementItemIds": [{"itemId": "arc_alloy", "quantity": 4}]}
+                ],
+            },
+            {
+                "id": "expired_project",
+                "disabled": False,
+                "endDate": 1,
+                "name": {"en": "Expired"},
+                "phases": [
+                    {"phase": 1, "requirementItemIds": [{"itemId": "arc_alloy", "quantity": 99}]}
+                ],
+            },
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/items/arc_alloy.json",
+        json={
+            "value": 200,
+            "recyclesInto": {"metal_parts": 2},
+            "salvagesInto": {},
+            "tip": "Dropped by ARC units.",
         },
     )
     httpx_mock.add_response(
@@ -344,6 +377,30 @@ async def test_check_item_keep_aggregates_all_sources(
         "spaceport": "https://mapgenie.io/arc-raiders/maps/spaceport?search=ARC%20Alloy",
     }
     assert out["wiki_location"] == "West of Olive Grove"
+    # Projects axis: active project counted, expired project excluded.
+    assert out["projects_requiring"] == [
+        {
+            "project": "Trophy Display",
+            "phase": 1,
+            "quantity": 4,
+            "ends_utc": "2049-12-31T00:00:00Z",
+        }
+    ]
+    # Verdict sums all three axes: hideout 12 + quest 6 + project 4.
+    assert out["verdict"] == "keep"
+    assert out["keep_quantity"] == 22
+    assert "Trophy Display" in out["verdict_reason"]
+    assert out["recycles_to"] == [{"item": "Metal Parts", "quantity": 2, "value_each": 75}]
+    assert out["salvages_to"] == []
+    assert out["recycle_value_delta"] == 150 - 90
+    assert out["item"]["tip"] == "Dropped by ARC units."
+    assert out["coverage"] == {
+        "quests": "complete",
+        "hideout": "complete",
+        "projects": "complete",
+        "crafting_recipes": "not_modeled",
+        "events": "not_modeled",
+    }
     assert out["notes"] == []
 
 
@@ -365,10 +422,18 @@ async def test_check_item_keep_degrades_per_source(
     assert out["item"]["name"] == "Wires"
     assert out["quests_requiring"] is None
     assert out["hideout_requiring"] is None
+    assert out["projects_requiring"] is None
     assert out["trader_offers"] is None
-    # Wiki lookup failure is silent (many items have no page) — no fourth note.
+    # Wiki lookup failure is silent (many items have no page) — no extra note.
     assert out["wiki_location"] is None
-    assert len(out["notes"]) == 3
+    # quests + hideout + projects + traders + recycle-detail = 5 notes.
+    assert len(out["notes"]) == 5
+    assert out["coverage"]["quests"] == "unavailable"
+    assert out["coverage"]["hideout"] == "unavailable"
+    assert out["coverage"]["projects"] == "unavailable"
+    # The verdict must hedge when whole axes were unavailable.
+    assert out["verdict"] == "sell"
+    assert "unavailable" in out["verdict_reason"]
 
 
 async def test_check_item_keep_unknown_item(
@@ -420,6 +485,144 @@ async def test_search_items_falls_back_to_local_fuzzy(
     assert out["returned"] == 1
     assert out["items"][0]["name"] == "Light Bulb"
     assert "locally" in out["note"]
+
+
+# ── upgrade planner ──────────────────────────────────────────────────
+
+
+def _mock_planner_world(httpx_mock: HTTPXMock) -> None:
+    """One hideout module (Medical Lab, max L3) + the item table + traders."""
+    httpx_mock.add_response(
+        url=f"{DATA_LISTING}/hideout",
+        json=[{"name": "med_station.json", "type": "file"}],
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/hideout/med_station.json",
+        json={
+            "id": "med_station",
+            "name": {"en": "Medical Lab"},
+            "maxLevel": 3,
+            "levels": [
+                {"level": 1, "requirementItemIds": [{"itemId": "fabric", "quantity": 50}]},
+                {
+                    "level": 2,
+                    "requirementItemIds": [
+                        {"itemId": "fabric", "quantity": 20},
+                        {"itemId": "arc_alloy", "quantity": 6},
+                    ],
+                },
+                {"level": 3, "requirementItemIds": [{"itemId": "arc_alloy", "quantity": 12}]},
+            ],
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [
+                _item("Fabric", id="fabric", value=10, rarity="Common"),
+                _item("ARC Alloy", id="arc-alloy", value=200, rarity="Uncommon"),
+            ],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(url=f"{METAFORGE}/traders", json={"success": True, "data": {}})
+
+
+async def test_plan_upgrades_without_stash_uses_nulls(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """No stash -> pool/short are null (unknown), never fabricated zeros."""
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](current_levels={"Medical Lab": 1})
+    (plan,) = out["modules"]
+    assert (plan["module"], plan["from"], plan["to"], plan["action"]) == (
+        "Medical Lab",
+        1,
+        2,
+        "upgrade",
+    )
+    by_item = {r["item"]: r for r in plan["requirements"]}
+    assert by_item["Fabric"] == {
+        "item": "Fabric",
+        "need": 20,
+        "pool": None,
+        "short": None,
+        "rarity": "Common",
+    }
+    assert plan["units_outstanding"] == 26  # falls back to total need
+    assert out["modules_with_unknown_level"] == []
+    assert out["coverage"]["quests"] == "not_included"
+
+
+async def test_plan_upgrades_multi_level_with_stash(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """Target jumps are cumulative with per-level breakdown; stash is a
+    shared pool with fuzzy-but-safe key resolution."""
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](
+        current_levels={"Medical Lab": 1},
+        targets={"Medical Lab": 3},
+        stash={"Fabric": 60, "arc alloys": 3, "xyzzy": 5},
+    )
+    (plan,) = out["modules"]
+    assert plan["to"] == 3
+    assert [lv["level"] for lv in plan["per_level"]] == [2, 3]
+    by_item = {r["item"]: r for r in plan["requirements"]}
+    # Cumulative: arc_alloy 6 (L2) + 12 (L3) = 18; plural 'arc alloys' resolved.
+    assert by_item["ARC Alloy"] == {
+        "item": "ARC Alloy",
+        "need": 18,
+        "pool": 3,
+        "short": 15,
+        "rarity": "Uncommon",
+    }
+    assert by_item["Fabric"]["short"] == 0
+    # Shopping list drops satisfied items, keeps shortfalls.
+    items_listed = [s["item"] for s in out["shopping_list"]]
+    assert "ARC Alloy" in items_listed and "Fabric" not in items_listed
+    # Unresolvable key is returned, never silently dropped.
+    assert out["unresolved_stash_keys"] == [{"key": "xyzzy", "candidates": []}]
+
+
+async def test_plan_upgrades_unknown_module_is_error(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](current_levels={"Bogus Station": 1})
+    assert out["error"]["code"] == "arcraiders_unknown_module"
+    assert "Medical Lab" in out["error"]["hint"]
+
+
+async def test_plan_upgrades_target_below_current_is_error(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](
+        current_levels={"Medical Lab": 2}, targets={"Medical Lab": 1}
+    )
+    assert out["error"]["code"] == "arcraiders_invalid_target"
+
+
+async def test_plan_upgrades_at_max_is_complete_not_error(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](current_levels={"Medical Lab": 3})
+    (plan,) = out["modules"]
+    assert plan["action"] == "complete"
+    assert plan["requirements"] == []
+    assert out["nearest_completion"] == []
+
+
+async def test_plan_upgrades_level_zero_is_build(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_planner_world(httpx_mock)
+    out = await tools["arc_plan_upgrades"](current_levels={"Medical Lab": 0})
+    (plan,) = out["modules"]
+    assert plan["action"] == "build"
+    assert {r["item"]: r["need"] for r in plan["requirements"]} == {"Fabric": 50}
 
 
 # ── events ───────────────────────────────────────────────────────────
