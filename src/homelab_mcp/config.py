@@ -402,6 +402,16 @@ class Settings(BaseSettings):
             "Pin a commit SHA instead of 'main' to freeze the dataset."
         ),
     )
+    arcraiders_data_listing_url: str = Field(
+        default="https://api.github.com/repos/RaidTheory/arcraiders-data/contents",
+        description=(
+            "GitHub contents-API base for listing directories of the "
+            "RaidTheory dataset (used to discover hideout module files). "
+            "Unauthenticated calls are rate-limited (60/h) but responses "
+            "are cached in-process and a hardcoded module list is the "
+            "fallback, so no token is needed."
+        ),
+    )
     arcraiders_wiki_api_url: str = Field(
         default="https://arcraiders.wiki/w/api.php",
         description=(

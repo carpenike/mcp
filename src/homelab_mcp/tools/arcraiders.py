@@ -33,7 +33,7 @@ import html
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from pydantic import Field
 
@@ -63,11 +63,38 @@ TTL_STATIC = 21600
 WIKI_TEXT_MAX = 8000
 
 _TAG_RE = re.compile(r"<[^>]+>")
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+# Known hideout module files in RaidTheory/arcraiders-data. Used as a
+# fallback when the GitHub directory-listing API is unavailable (e.g.
+# unauthenticated rate limit) so arc_check_item_keep degrades to the
+# known set instead of losing hideout data entirely.
+FALLBACK_HIDEOUT_MODULES = [
+    "equipment_bench.json",
+    "explosives_bench.json",
+    "med_station.json",
+    "refiner.json",
+    "scrappy.json",
+    "stash.json",
+    "utility_bench.json",
+    "weapon_bench.json",
+    "workbench.json",
+]
 
 
 def _strip_tags(fragment: str) -> str:
     """Drop HTML tags and unescape entities from a wiki search snippet."""
     return html.unescape(_TAG_RE.sub("", fragment))
+
+
+def _norm(name: str) -> str:
+    """Normalize an item name/slug for cross-dataset matching.
+
+    RaidTheory uses snake_case ids ('arc_alloy'), MetaForge uses kebab ids
+    ('metal-parts') and display names ('ARC Alloy'); all collapse to the
+    same token string ('arc alloy') under this normalization.
+    """
+    return _NORM_RE.sub(" ", name.lower()).strip()
 
 
 def _iso_utc(epoch_ms: Any) -> str | None:
@@ -114,16 +141,20 @@ def _project_item(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _project_quest(raw: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a MetaForge quest to objectives, giver, and reward names."""
-    rewards = [
+def _project_quest_items(raw: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """Reduce a MetaForge quest item list (rewards / required_items) to names."""
+    return [
         {
             "item": (r.get("item") or {}).get("name") or r.get("item_id"),
             "rarity": (r.get("item") or {}).get("rarity"),
             "quantity": r.get("quantity"),
         }
-        for r in raw.get("rewards") or []
+        for r in raw.get(key) or []
     ]
+
+
+def _project_quest(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a MetaForge quest to objectives, giver, turn-ins, and rewards."""
     guide = raw.get("guide_url")
     return {
         "id": raw.get("id"),
@@ -131,7 +162,8 @@ def _project_quest(raw: dict[str, Any]) -> dict[str, Any]:
         "trader": raw.get("trader_name"),
         "objectives": raw.get("objectives") or [],
         "xp": raw.get("xp"),
-        "rewards": rewards,
+        "required_items": _project_quest_items(raw, "required_items"),
+        "rewards": _project_quest_items(raw, "rewards"),
         "guide_url": f"https://metaforge.app{guide}" if guide else None,
     }
 
@@ -140,6 +172,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     """Register arc_* ARC Raiders game-data tools on the given MCP server."""
     metaforge = settings.arcraiders_metaforge_base_url.rstrip("/")
     data_base = settings.arcraiders_data_base_url.rstrip("/")
+    data_listing = settings.arcraiders_data_listing_url.rstrip("/")
     wiki_api = settings.arcraiders_wiki_api_url
     # One pooled client for the lifetime of the process (see _http.make_client).
     # Three upstream hosts, so no base_url; MetaForge can be slow on cold cache.
@@ -153,6 +186,69 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         fresh = await request_json(client, "GET", url, service=service, unreachable_hint=hint)
         cache.put(url, fresh, ttl)
         return fresh
+
+    async def _all_quests() -> list[dict[str, Any]]:
+        """Every quest, aggregated across pages and cached as one unit."""
+        cache_key = f"{metaforge}/quests#all"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cast(list[dict[str, Any]], cached)
+        quests: list[dict[str, Any]] = []
+        page = 1
+        while page <= 10:  # backstop: 1000 quests, far above the real count
+            raw = await request_json(
+                client,
+                "GET",
+                f"{metaforge}/quests",
+                service="metaforge",
+                params={"limit": 100, "page": page},
+                unreachable_hint="MetaForge may be down; try again shortly.",
+            )
+            quests.extend(raw.get("data") or [])
+            if not (raw.get("pagination") or {}).get("hasNextPage"):
+                break
+            page += 1
+        cache.put(cache_key, quests, TTL_STATIC)
+        return quests
+
+    async def _hideout_modules() -> list[dict[str, Any]]:
+        """All hideout module definitions, aggregated and cached as one unit.
+
+        The file list comes from the GitHub contents API when reachable
+        (so new modules appear without a code change) and falls back to
+        the known set when it isn't (e.g. unauthenticated rate limit).
+        """
+        cache_key = f"{data_base}/hideout#all"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cast(list[dict[str, Any]], cached)
+        try:
+            listing = await request_json(
+                client, "GET", f"{data_listing}/hideout", service="arcraiders_data"
+            )
+            files = [
+                str(e["name"])
+                for e in listing
+                if isinstance(e, dict) and str(e.get("name", "")).endswith(".json")
+            ]
+        except ToolError:
+            log.warning("hideout dir listing failed; using fallback module list")
+            files = list(FALLBACK_HIDEOUT_MODULES)
+        modules: list[dict[str, Any]] = []
+        for fname in files:
+            try:
+                mod = await request_json(
+                    client, "GET", f"{data_base}/hideout/{fname}", service="arcraiders_data"
+                )
+            except ToolError:
+                log.warning("hideout module %s fetch failed; skipping", fname)
+                continue
+            modules.extend(mod if isinstance(mod, list) else [mod])
+        if modules:
+            # Don't cache an empty aggregate — a transient outage would
+            # otherwise pin "no hideout data" for the whole TTL.
+            cache.put(cache_key, modules, TTL_STATIC)
+        return modules
 
     # ── items ───────────────────────────────────────────────────────
     @mcp.tool(
@@ -281,6 +377,118 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             for name, items in stock.items()
         }
         return {"traders": traders, "source": METAFORGE_SOURCE}
+
+    # ── keep-or-sell ────────────────────────────────────────────────
+    @mcp.tool(
+        name="arc_check_item_keep",
+        description=(
+            "Keep/sell/recycle helper — the one call for 'is this ARC "
+            "Raiders item worth keeping?'. Resolves the item (value, "
+            "rarity, weight), then cross-references every quest turn-in "
+            "that requires it, every hideout module upgrade level that "
+            "needs it (with quantities), and which traders sell it. An "
+            "item needed for quests or hideout upgrades is usually worth "
+            "keeping regardless of sell value. Crafting/recycling uses "
+            "are not covered — check the item's wiki page via "
+            "arc_get_wiki_page for those."
+        ),
+    )
+    async def check_item_keep(
+        item: Annotated[str, Field(min_length=1, description="Item name, e.g. 'ARC Alloy'.")],
+    ) -> dict[str, Any]:
+        # Resolve the item via MetaForge search; prefer an exact
+        # normalized-name match over the first fuzzy hit.
+        try:
+            raw = await request_json(
+                client,
+                "GET",
+                f"{metaforge}/items",
+                service="metaforge",
+                params={"search": item, "limit": 25},
+                unreachable_hint="MetaForge may be down; try again shortly.",
+            )
+        except ToolError as err:
+            return err.payload()
+        candidates = raw.get("data") or []
+        if not candidates:
+            return ToolError(
+                "metaforge_item_not_found",
+                f"No item matching {item!r}.",
+                "Check the spelling with arc_search_items.",
+            ).payload()
+        want = _norm(item)
+        best = next((c for c in candidates if _norm(c.get("name") or "") == want), candidates[0])
+        # Every identity this item goes by across the datasets.
+        keys = {_norm(best.get("name") or ""), _norm(best.get("id") or "")} - {""}
+
+        notes: list[str] = []
+
+        # Quest turn-ins requiring it. Each cross-reference degrades to
+        # None + a note on failure instead of failing the whole call.
+        quests_requiring: list[dict[str, Any]] | None
+        try:
+            quests_requiring = [
+                {
+                    "quest": quest.get("name"),
+                    "trader": quest.get("trader_name"),
+                    "quantity": req.get("quantity"),
+                }
+                for quest in await _all_quests()
+                for req in quest.get("required_items") or []
+                if {
+                    _norm(((req.get("item") or {}).get("name")) or ""),
+                    _norm(req.get("item_id") or ""),
+                }
+                & keys
+            ]
+        except ToolError:
+            quests_requiring = None
+            notes.append("Quest data unavailable (MetaForge fetch failed).")
+
+        # Hideout upgrade levels requiring it.
+        hideout_requiring: list[dict[str, Any]] | None = None
+        modules = await _hideout_modules()
+        if modules:
+            hideout_requiring = [
+                {
+                    "module": (mod.get("name") or {}).get("en") or mod.get("id"),
+                    "level": lvl.get("level"),
+                    "quantity": req.get("quantity"),
+                }
+                for mod in modules
+                for lvl in mod.get("levels") or []
+                for req in lvl.get("requirementItemIds") or []
+                if _norm(str(req.get("itemId") or "")) in keys
+            ]
+        else:
+            notes.append("Hideout data unavailable (RaidTheory fetch failed).")
+
+        # Trader offers (who sells it, at what price).
+        trader_offers: list[dict[str, Any]] | None
+        try:
+            traders_raw = await _cached_json(
+                f"{metaforge}/traders", service="metaforge", ttl=TTL_LIVE
+            )
+            trader_offers = [
+                {"trader": trader_name, "price": entry.get("trader_price")}
+                for trader_name, stock in (traders_raw.get("data") or {}).items()
+                for entry in stock or []
+                if {_norm(entry.get("name") or ""), _norm(entry.get("id") or "")} & keys
+            ]
+        except ToolError:
+            trader_offers = None
+            notes.append("Trader data unavailable (MetaForge fetch failed).")
+
+        return {
+            "item": _project_item(best),
+            "match": "exact" if _norm(best.get("name") or "") == want else "closest",
+            "other_candidates": [c.get("name") for c in candidates[:6] if c is not best],
+            "quests_requiring": quests_requiring,
+            "hideout_requiring": hideout_requiring,
+            "trader_offers": trader_offers,
+            "notes": notes,
+            "sources": [METAFORGE_SOURCE, RAIDTHEORY_SOURCE],
+        }
 
     # ── event schedule ──────────────────────────────────────────────
     @mcp.tool(

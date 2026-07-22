@@ -19,6 +19,7 @@ from homelab_mcp.tools.arcraiders import register
 
 METAFORGE = "https://metaforge.test/api/arc-raiders"
 DATA = "https://data.test/main"
+DATA_LISTING = "https://ghapi.test/contents"
 WIKI = "https://wiki.test/w/api.php"
 
 pytestmark = pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
@@ -43,6 +44,7 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
     monkeypatch.setenv("HOMELAB_MCP_OAUTH_REQUIRED", "false")
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_METAFORGE_BASE_URL", METAFORGE)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DATA_BASE_URL", DATA)
+    monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_DATA_LISTING_URL", DATA_LISTING)
     monkeypatch.setenv("HOMELAB_MCP_ARCRAIDERS_WIKI_API_URL", WIKI)
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
@@ -118,6 +120,13 @@ async def test_search_quests_projects_rewards(
                     "objectives": ["Find and search any ARC Probe"],
                     "xp": 0,
                     "guide_url": "/arc-raiders/a-bad-feeling",
+                    "required_items": [
+                        {
+                            "item": {"id": "wires", "name": "Wires", "rarity": "Common"},
+                            "item_id": "wires",
+                            "quantity": 5,
+                        }
+                    ],
                     "rewards": [
                         {
                             "item": {"id": "spring", "name": "Steel Spring", "rarity": "Uncommon"},
@@ -134,6 +143,7 @@ async def test_search_quests_projects_rewards(
     quest = out["quests"][0]
     assert quest["trader"] == "Celeste"
     assert quest["rewards"] == [{"item": "Steel Spring", "rarity": "Uncommon", "quantity": "5"}]
+    assert quest["required_items"] == [{"item": "Wires", "rarity": "Common", "quantity": 5}]
     assert quest["guide_url"] == "https://metaforge.app/arc-raiders/a-bad-feeling"
     assert out["truncated"] is False
 
@@ -185,6 +195,117 @@ async def test_trader_stock_second_call_served_from_cache(
     await tools["arc_get_trader_stock"]()
     await tools["arc_get_trader_stock"]()
     assert len(httpx_mock.get_requests()) == 1
+
+
+# ── keep-or-sell ─────────────────────────────────────────────────────
+
+
+async def test_check_item_keep_aggregates_all_sources(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    # Fuzzy hit first, exact-normalized second: the tool must pick the exact one.
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?search=ARC%20Alloy&limit=25",
+        json={
+            "data": [
+                _item("ARC Alloy Cluster", id="arc-alloy-cluster"),
+                _item("ARC Alloy", id="arc-alloy", value=90),
+            ]
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/quests?limit=100&page=1",
+        json={
+            "data": [
+                {
+                    "name": "Supply Run",
+                    "trader_name": "Celeste",
+                    "required_items": [
+                        {"item": {"name": "ARC Alloy"}, "item_id": "arc-alloy", "quantity": 6}
+                    ],
+                },
+                {
+                    "name": "Unrelated",
+                    "trader_name": "Apollo",
+                    "required_items": [
+                        {"item": {"name": "Wires"}, "item_id": "wires", "quantity": 5}
+                    ],
+                },
+            ],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{DATA_LISTING}/hideout",
+        json=[{"name": "med_station.json", "type": "file"}],
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/hideout/med_station.json",
+        json={
+            "id": "med_station",
+            "name": {"en": "Medical Lab"},
+            "levels": [
+                {
+                    "level": 2,
+                    "requirementItemIds": [
+                        {"itemId": "arc_alloy", "quantity": 12},
+                        {"itemId": "fabric", "quantity": 50},
+                    ],
+                }
+            ],
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/traders",
+        json={
+            "success": True,
+            "data": {
+                "Apollo": [
+                    {"id": "arc-alloy", "name": "ARC Alloy", "trader_price": 270},
+                    {"id": "wires", "name": "Wires", "trader_price": 30},
+                ]
+            },
+        },
+    )
+    out = await tools["arc_check_item_keep"](item="ARC Alloy")
+    assert out["match"] == "exact"
+    assert out["item"]["name"] == "ARC Alloy"
+    assert out["other_candidates"] == ["ARC Alloy Cluster"]
+    assert out["quests_requiring"] == [{"quest": "Supply Run", "trader": "Celeste", "quantity": 6}]
+    # Snake_case RaidTheory id matched against the MetaForge display name.
+    assert out["hideout_requiring"] == [{"module": "Medical Lab", "level": 2, "quantity": 12}]
+    assert out["trader_offers"] == [{"trader": "Apollo", "price": 270}]
+    assert out["notes"] == []
+
+
+@pytest.mark.httpx_mock(
+    assert_all_responses_were_requested=False, assert_all_requests_were_expected=False
+)
+async def test_check_item_keep_degrades_per_source(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """Failures in quests/hideout/traders must degrade to None + note, not error."""
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?search=wires&limit=25",
+        json={"data": [_item("Wires", id="wires")]},
+    )
+    httpx_mock.add_response(url=f"{METAFORGE}/quests?limit=100&page=1", status_code=503)
+    # Hideout listing and all fallback module fetches are unmatched → httpx
+    # timeouts → skipped; traders unmatched → timeout → note.
+    out = await tools["arc_check_item_keep"](item="wires")
+    assert out["item"]["name"] == "Wires"
+    assert out["quests_requiring"] is None
+    assert out["hideout_requiring"] is None
+    assert out["trader_offers"] is None
+    assert len(out["notes"]) == 3
+
+
+async def test_check_item_keep_unknown_item(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{METAFORGE}/items?search=nope&limit=25", json={"data": []})
+    out = await tools["arc_check_item_keep"](item="nope")
+    assert out["error"]["code"] == "metaforge_item_not_found"
 
 
 # ── events ───────────────────────────────────────────────────────────

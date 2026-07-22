@@ -155,7 +155,8 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Home Assistant | `ha_check_config` | HA's own full configuration check (Developer Tools → Check configuration) |
 | Home Assistant | `ha_health` | Connectivity + HA version check |
 | ARC Raiders | `arc_search_items` | Search the item database (weapons, ammo, gear, materials) by name — type, rarity, value, workbench, non-zero stats (MetaForge) |
-| ARC Raiders | `arc_search_quests` | Search quests by name — giver, objectives, XP, item rewards, guide link (MetaForge) |
+| ARC Raiders | `arc_search_quests` | Search quests by name — giver, objectives, XP, required turn-in items, rewards, guide link (MetaForge) |
+| ARC Raiders | `arc_check_item_keep` | Keep/sell/recycle helper: item value/weight + every quest turn-in and hideout upgrade level that needs it + trader offers, in one call (MetaForge + RaidTheory) |
 | ARC Raiders | `arc_get_trader_stock` | Live trader inventories with prices, optionally one trader; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_get_event_schedule` | Rotating in-raid event schedule with UTC times + active/upcoming status, optional map filter; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
