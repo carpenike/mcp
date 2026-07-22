@@ -46,6 +46,43 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Server-level guidance sent to MCP clients at connection time (see
+# _registry.collect_instructions). Loaded into every client context —
+# keep it tight and workflow-shaped, not a restatement of tool schemas.
+INSTRUCTIONS = """\
+## ARC Raiders tools (arc_*)
+
+Game-data lookups for ARC Raiders (items, quests, traders, events, maps, wiki).
+
+**Keep/sell/recycle questions** ("is X worth keeping?"): call
+`arc_check_item_keep` first — it cross-references quest turn-ins, hideout
+upgrade needs, and trader offers in one call. If `match` is "closest",
+the named item wasn't an exact hit: tell the user what you matched and
+list `other_candidates` (tiered families like 'Extended Light Mag I/II/III'
+are distinct items with different answers). An item required by quests or
+hideout upgrades is usually worth keeping regardless of sell value.
+
+**Time-sensitive data**: `arc_get_event_schedule` (in-raid event rotation)
+and `arc_get_trader_stock` change hourly-ish; timestamps are UTC. Compare
+against the current time and lead with what's active now or starting soon
+("Matriarch on Blue Gate for another 40 min"). In long conversations,
+re-call these tools rather than reusing results fetched earlier — a
+schedule fetched an hour ago is wrong now. When the user says they're
+about to raid a specific map, proactively check that map's events.
+
+These tools are pull-only: you cannot watch the schedule in the
+background or alert the user when an event starts. If the user asks for
+that, say so and suggest they either ask again when they want a fresh
+check, or set up a client-side scheduled task/automation that calls
+these tools on an interval.
+
+Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki)
+and may lag the newest game patch; responses carry `source` fields — keep
+that attribution when presenting data publicly. For lore, strategies, and
+weapon-tier stats not in the structured data, use `arc_search_wiki` then
+`arc_get_wiki_page` (infobox stats live in the returned `wikitext`).
+"""
+
 METAFORGE_SOURCE = "MetaForge — https://metaforge.app/arc-raiders"
 RAIDTHEORY_SOURCE = (
     "RaidTheory/arcraiders-data (MIT) — "

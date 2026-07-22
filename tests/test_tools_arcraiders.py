@@ -69,6 +69,20 @@ def _item(name: str, **overrides: Any) -> dict[str, Any]:
     return base
 
 
+# ── client instructions ──────────────────────────────────────────────
+
+
+def test_instructions_are_collected_for_clients() -> None:
+    """The module's INSTRUCTIONS must reach FastMCP via the registry collector."""
+    from homelab_mcp.tools import collect_instructions
+
+    text = collect_instructions()
+    assert text is not None
+    # Workflow guidance and the honest pull-only caveat must both survive.
+    assert "arc_check_item_keep" in text
+    assert "pull-only" in text
+
+
 # ── items ────────────────────────────────────────────────────────────
 
 

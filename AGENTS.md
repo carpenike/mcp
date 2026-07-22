@@ -112,6 +112,14 @@ def register(mcp, settings):
 6. List-shaped outputs report truncation explicitly:
    `{"returned": n, "total": m, "truncated": bool}`. Never silently drop
    rows — a confident partial answer is worse than a flagged one.
+7. A module MAY export a top-level `INSTRUCTIONS` string: server-level
+   usage guidance MCP clients receive at connection time (assembled by
+   `_registry.collect_instructions()` into FastMCP's `instructions`).
+   Use it for what per-tool descriptions can't express — cross-tool
+   workflows ("call X before Y"), freshness/staleness caveats ("re-call,
+   don't reuse"), and honest capability limits ("pull-only, no background
+   watching"). It loads into EVERY client context on EVERY connection:
+   keep it tight, and don't restate tool schemas.
 
 ## Adding a new tool category (the happy path)
 
@@ -122,7 +130,8 @@ def register(mcp, settings):
 4. Add the URL to `services.homelab-mcp.settings` in the host file
    in `carpenike/nix-config`.
 5. Write the `register(mcp, settings)` function with one or more
-   `@mcp.tool(...)` definitions.
+   `@mcp.tool(...)` definitions. Optionally export an `INSTRUCTIONS`
+   string for cross-tool usage guidance (rule 7 above).
 6. Add a smoke test under `tests/test_tools_<category>.py`.
 7. Update `README.md`'s tool table.
 8. PR.

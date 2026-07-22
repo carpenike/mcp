@@ -31,7 +31,7 @@ from homelab_mcp.auth import JWTAuthMiddleware
 from homelab_mcp.buildinfo import build_revision
 from homelab_mcp.config import Settings
 from homelab_mcp.oauth_state import OAuthState
-from homelab_mcp.tools import register_all
+from homelab_mcp.tools import collect_instructions, register_all
 
 log = logging.getLogger("homelab_mcp")
 
@@ -120,7 +120,18 @@ def build_app(settings: Settings) -> Starlette:
     # app-declared; the RFC 9728 §3.3 path-suffixed PRM and its `resource`
     # byte-match are derived from the same setting, so the transport URL
     # and the advertised resource can never drift apart.
-    mcp = FastMCP("Holthome", streamable_http_path=settings.mcp_path)
+    #
+    # `instructions` is server-level usage guidance MCP clients receive at
+    # connection time (workflows and freshness caveats that span tools,
+    # which per-tool descriptions can't express). It is assembled from the
+    # optional module-level INSTRUCTIONS strings of the tool categories —
+    # same auto-discovery as register_all, so new categories still need no
+    # edits here.
+    mcp = FastMCP(
+        "Holthome",
+        streamable_http_path=settings.mcp_path,
+        instructions=collect_instructions(),
+    )
 
     # Load the signing key BEFORE tool registration so tools that need
     # to mint per-call JWTs for downstream resource calls (the HOF-004
