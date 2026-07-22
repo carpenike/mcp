@@ -47,6 +47,36 @@ log = logging.getLogger(__name__)
 MintTokenFn = Callable[..., str]
 
 
+def collect_instructions() -> str | None:
+    """Concatenate the optional module-level `INSTRUCTIONS` strings.
+
+    The result is passed to FastMCP's `instructions` parameter, which MCP
+    clients receive at connection time — server-level usage guidance that
+    spans tools (workflows, freshness caveats), where per-tool
+    descriptions can't reach. Same isolation semantics as register_all:
+    a module that fails to import contributes nothing rather than
+    aborting the rest. Must run BEFORE FastMCP construction, so it walks
+    the package independently.
+    """
+    import homelab_mcp.tools as tools_pkg
+
+    sections: list[str] = []
+    for _finder, modname, _ispkg in iter_modules(tools_pkg.__path__):
+        if modname.startswith("_"):
+            continue
+        try:
+            mod = import_module(f"{tools_pkg.__name__}.{modname}")
+        except Exception:
+            # register_all logs the same failure loudly; debug here avoids
+            # double-reporting while keeping a trace for this code path.
+            log.debug("collect_instructions: %s failed to import — skipping", modname)
+            continue
+        text = getattr(mod, "INSTRUCTIONS", None)
+        if isinstance(text, str) and text.strip():
+            sections.append(text.strip())
+    return "\n\n".join(sections) or None
+
+
 def register_all(
     mcp: FastMCP,
     settings: Settings,
