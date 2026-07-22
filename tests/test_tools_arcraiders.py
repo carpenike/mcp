@@ -30,13 +30,31 @@ class CapturingMCP:
 
     def __init__(self) -> None:
         self.tools: dict[str, Callable[..., Any]] = {}
+        self.annotations: dict[str, Any] = {}
 
-    def tool(self, *, name: str, description: str = "") -> Callable[..., Any]:
+    def tool(
+        self, *, name: str, description: str = "", annotations: Any = None
+    ) -> Callable[..., Any]:
         def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[name] = fn
+            self.annotations[name] = annotations
             return fn
 
         return deco
+
+
+def test_all_tools_annotated_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every arc_* tool must declare read-only annotations — claude.ai's
+    permission UI groups by these hints and dumps unannotated tools into
+    an individually-approved 'Other tools' bucket."""
+    monkeypatch.setenv("HOMELAB_MCP_OAUTH_REQUIRED", "false")
+    mcp = CapturingMCP()
+    register(mcp, Settings())  # type: ignore[arg-type]
+    assert mcp.tools, "no tools registered"
+    for name, ann in mcp.annotations.items():
+        assert ann is not None, f"{name} has no annotations"
+        assert ann.readOnlyHint is True, f"{name} not marked read-only"
+        assert ann.destructiveHint is False, f"{name} marked destructive"
 
 
 @pytest.fixture
