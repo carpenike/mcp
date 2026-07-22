@@ -43,6 +43,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
@@ -53,6 +54,21 @@ if TYPE_CHECKING:
     from homelab_mcp.config import Settings
 
 log = logging.getLogger(__name__)
+
+# Annotation hints: claude.ai's permission UI groups a connector's tools
+# by these ("Read-only tools" vs "Write/delete tools"); unannotated tools
+# land in an individually-approved "Other tools" bucket. Be truthful —
+# security signal first, display grouping second (AGENTS.md). All
+# upstreams here are fixed internal homelab services: openWorldHint=False.
+_RO = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_OVERWRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
+_MUTATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
 
 # Dedicated audit trail for actuations. RequestLogMiddleware only sees
 # `POST /mcp`, so tool-level writes must self-report to be reconstructable.
@@ -168,6 +184,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── health ───────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_health",
         description=(
             "Check connectivity to Home Assistant and report its version and "
@@ -198,6 +215,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── list entities ────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_list_entities",
         description=(
             "List Home Assistant entities with their current state, filtered "
@@ -260,6 +278,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── get one entity ───────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_get_state",
         description=(
             "Get one Home Assistant entity's full current state, including "
@@ -297,6 +316,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── entity history ───────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_get_history",
         description=(
             "Get one entity's recent state history (state + timestamp per "
@@ -351,6 +371,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── call a service (closed loop) ─────────────────────────────────
     @mcp.tool(
+        annotations=_MUTATE,
         name="ha_call_service",
         description=(
             "Call a Home Assistant service on ONE entity (e.g. domain='light', "
@@ -531,6 +552,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── automations: list ────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_list_automations",
         description=(
             "List Home Assistant automations with enabled state, last-"
@@ -575,6 +597,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── automations: read one ────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_get_automation",
         description=(
             "Fetch one automation's full configuration (triggers, conditions, "
@@ -612,6 +635,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── automations: create/update ───────────────────────────────────
     @mcp.tool(
+        annotations=_OVERWRITE,
         name="ha_upsert_automation",
         description=(
             "Create or update ONE automation through Home Assistant's config "
@@ -710,6 +734,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── config check ─────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="ha_check_config",
         description=(
             "Ask Home Assistant to validate its full configuration "

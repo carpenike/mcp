@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "homelab-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "Homelab MCP server: cooklang + gatus tools exposed via Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.12"

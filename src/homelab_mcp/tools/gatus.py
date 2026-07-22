@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Annotated, Any
 
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
@@ -23,6 +24,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Annotation hints: claude.ai's permission UI groups a connector's tools
+# by these ("Read-only tools" vs "Write/delete tools"); unannotated tools
+# land in an individually-approved "Other tools" bucket. Be truthful —
+# security signal first, display grouping second (AGENTS.md). All
+# upstreams here are fixed internal homelab services: openWorldHint=False.
+_RO = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+
 
 def register(mcp: FastMCP, settings: Settings) -> None:
     """Register homelab_* gatus-backed tools on the given MCP server."""
@@ -32,6 +42,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── list endpoints + their current status ───────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="homelab_list_status",
         description=(
             "List every monitored homelab endpoint with its current health. "
@@ -91,6 +102,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── history of one endpoint ─────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="homelab_get_endpoint_history",
         description=(
             "Get the recent check history for one specific monitored "

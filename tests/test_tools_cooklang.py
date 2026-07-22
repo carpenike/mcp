@@ -323,7 +323,7 @@ class CapturingMCP:
     def __init__(self) -> None:
         self.tools: dict[str, Any] = {}
 
-    def tool(self, *, name: str, description: str) -> Any:
+    def tool(self, *, name: str, description: str, annotations: Any = None) -> Any:
         def deco(fn: Any) -> Any:
             self.tools[name] = fn
             return fn

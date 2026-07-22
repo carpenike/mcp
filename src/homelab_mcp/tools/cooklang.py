@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
 import httpx
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError, make_client, request_json
@@ -66,6 +67,21 @@ if TYPE_CHECKING:
     from homelab_mcp.config import Settings
 
 log = logging.getLogger(__name__)
+
+# Annotation hints: claude.ai's permission UI groups a connector's tools
+# by these ("Read-only tools" vs "Write/delete tools"); unannotated tools
+# land in an individually-approved "Other tools" bucket. Be truthful —
+# security signal first, display grouping second (AGENTS.md). All
+# upstreams here are fixed internal homelab services: openWorldHint=False.
+_RO = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_OVERWRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
+_MUTATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
 
 # Slug / created-filename regex — strict kebab-safe set. Deliberately
 # narrow: it is the filename we hand to the CookLang server's PUT, so it
@@ -476,6 +492,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── list / search (merged) ──────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="cooklang_list_recipes",
         description=(
             "List and search YOUR canonical cookbook on cook.holthome.net — the "
@@ -574,6 +591,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── get one recipe ──────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="cooklang_get_recipe",
         description=(
             "Fetch one recipe's full contents from cook.holthome.net: normalized "
@@ -631,6 +649,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── create ──────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_MUTATE,
         name="cooklang_create_recipe",
         description=(
             "Author a NEW recipe and write it to cook.holthome.net as a valid "
@@ -768,6 +787,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── update ──────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_OVERWRITE,
         name="cooklang_update_recipe",
         description=(
             "Amend an EXISTING recipe on cook.holthome.net, identified by slug "
@@ -955,6 +975,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── delete ──────────────────────────────────────────────────────
     @mcp.tool(
+        annotations=_OVERWRITE,
         name="cooklang_delete_recipe",
         description=(
             "Delete an EXISTING recipe from cook.holthome.net, identified by slug "
@@ -1035,6 +1056,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── federation search (distinct: ~60 community feeds) ───────────
     @mcp.tool(
+        annotations=_RO,
         name="cooklang_search_federation",
         description=(
             "Search the federated recipe index (~60 community feeds plus your "
@@ -1064,6 +1086,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     # ── shopping list ───────────────────────────────────────────────
     @mcp.tool(
+        annotations=_RO,
         name="cooklang_build_shopping_list",
         description=(
             "Generate a shopping list by combining ingredients from one or more "
