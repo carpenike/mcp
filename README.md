@@ -161,6 +161,11 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_get_enemy` | ARC bestiary: threat, weakness/kill tactics, maps, drops, XP (RaidTheory) |
 | ARC Raiders | `arc_who_drops` | Inverse drop index: which enemies drop an item, with threat + maps (RaidTheory + ardb.app) |
 | ARC Raiders | `arc_compare_weapons` | Side-by-side weapon stats incl. armor_penetration — the ARC-effectiveness stat (ardb.app) |
+| ARC Raiders | `arc_log_raid` | Append a raid to the personal log: map, outcome, loadout, intent, death spot, loot value (local SQLite) |
+| ARC Raiders | `arc_list_raids` | Recent raids from the personal log, newest first |
+| ARC Raiders | `arc_delete_raid` | Remove a mislogged raid; previews unless `confirm=true` |
+| ARC Raiders | `arc_raid_stats` | Personal analytics: extraction rate overall/per-map/per-loadout, death spots, loot totals |
+| ARC Raiders | `arc_patch_diff` | Item/weapon changes since N days ago, from auto-accumulated local snapshots |
 | ARC Raiders | `arc_get_trader_stock` | Live trader inventories with prices, optionally one trader; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_get_event_schedule` | Rotating in-raid event schedule with UTC times + active/upcoming status, optional map filter; 15-min cache (MetaForge) |
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |

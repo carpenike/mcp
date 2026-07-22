@@ -21,8 +21,16 @@ from homelab_mcp.config import Settings
 from homelab_mcp.tools import register_all
 
 # name -> (readOnlyHint, destructiveHint, idempotentHint)
-# openWorld is asserted separately: True for arc_* (public internet
-# upstreams), False everywhere else (fixed internal homelab services).
+# openWorld is asserted separately: True for arc_* tools that reach the
+# public internet, False for LOCAL_ARC_TOOLS (personal SQLite state only)
+# and everything else (fixed internal homelab services).
+LOCAL_ARC_TOOLS = {
+    "arc_log_raid",
+    "arc_list_raids",
+    "arc_delete_raid",
+    "arc_raid_stats",
+    "arc_patch_diff",
+}
 EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     # ── arc (public game data, pure lookups) ─────────────────────────
     "arc_search_items": (True, False, True),
@@ -33,6 +41,13 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "arc_get_enemy": (True, False, True),
     "arc_who_drops": (True, False, True),
     "arc_compare_weapons": (True, False, True),
+    # personal state: append-only log (each call records a distinct raid),
+    # confirm-gated delete as the correction path, local-only readers
+    "arc_log_raid": (False, False, False),
+    "arc_list_raids": (True, False, True),
+    "arc_delete_raid": (False, True, True),
+    "arc_raid_stats": (True, False, True),
+    "arc_patch_diff": (True, False, True),
     "arc_get_event_schedule": (True, False, True),
     "arc_list_maps": (True, False, True),
     "arc_search_wiki": (True, False, True),
@@ -105,7 +120,7 @@ def test_every_tool_is_annotated_as_reviewed(served_tools: dict[str, object]) ->
         assert ann.readOnlyHint is read_only, f"{name} readOnlyHint"
         assert ann.destructiveHint is destructive, f"{name} destructiveHint"
         assert ann.idempotentHint is idempotent, f"{name} idempotentHint"
-        expected_open_world = name.startswith("arc_")
+        expected_open_world = name.startswith("arc_") and name not in LOCAL_ARC_TOOLS
         assert ann.openWorldHint is expected_open_world, f"{name} openWorldHint"
 
 

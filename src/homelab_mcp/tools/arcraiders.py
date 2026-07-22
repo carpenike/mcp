@@ -29,6 +29,7 @@ Tool name convention: `arc_<verb>_<object>`. See AGENTS.md.
 
 from __future__ import annotations
 
+import contextlib
 import html
 import logging
 import re
@@ -38,6 +39,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from homelab_mcp.arcraiders_state import RAID_OUTCOMES, ArcState
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
@@ -103,6 +105,15 @@ answer is an enemy to kill — `arc_who_drops(item)` names it, then
 weapon vs ARC" loadout questions use `arc_compare_weapons` — its
 `armor_penetration` field is the deciding stat (item search lacks it).
 
+**Personal raid history**: when the user recaps a raid ("died at
+Spaceport, lost the Ferro"), offer to log it via `arc_log_raid` — one
+sentence is enough; don't interrogate for every field. Answer "does
+this loadout work for me" / "where do I keep dying" from
+`arc_raid_stats` (their real history), not general wisdom. Mislogged?
+`arc_list_raids` then `arc_delete_raid`. For "did X get nerfed/buffed"
+claims, check `arc_patch_diff` before hedging — if it shows no change
+in the window, say so with the snapshot dates.
+
 Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki,
 ardb.app) and may lag the newest game patch; responses carry `source`
 fields — keep that attribution when presenting data publicly. For lore
@@ -140,6 +151,29 @@ READ_ONLY = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=True,
+)
+
+# Personal-state tools (raid log, patch diff) touch only the local SQLite
+# store — closed world. The log writer is additive and each call records
+# a distinct raid (not idempotent); the delete is the correction path and
+# follows the repo's destructive+confirm-gate pattern.
+READ_ONLY_LOCAL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+WRITE_LOG = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+DESTRUCTIVE_LOCAL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
 )
 
 # Known hideout module files in RaidTheory/arcraiders-data. Used as a
@@ -359,6 +393,22 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # Three upstream hosts, so no base_url; MetaForge can be slow on cold cache.
     client = make_client(timeout=20.0)
     cache = _TTLCache()
+    # Personal-state store (raid log + snapshots). A failed open (e.g. dev
+    # box without /var/lib/homelab-mcp) must not abort registration of the
+    # whole category — the state-backed tools degrade to a config error.
+    store: ArcState | None
+    try:
+        store = ArcState(settings.arcraiders_db_path)
+    except Exception:
+        log.exception("arcraiders state store unavailable — raid log/patch diff disabled")
+        store = None
+
+    def _store_error() -> dict[str, Any]:
+        return ToolError(
+            "arcraiders_state_unavailable",
+            "The ARC Raiders state store could not be opened.",
+            "Check HOMELAB_MCP_ARCRAIDERS_DB_PATH and directory permissions.",
+        ).payload()
 
     async def _cached_json(url: str, *, service: str, ttl: float, hint: str = "") -> Any:
         cached = cache.get(url)
@@ -422,6 +472,27 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             # Don't cache an empty aggregate — a transient outage would
             # otherwise pin "no items" for the whole TTL.
             cache.put(cache_key, items, TTL_STATIC)
+            if store is not None:
+                # Opportunistic patch snapshot as a side effect of the
+                # (at most once per TTL) fresh fetch. Hash-deduped and
+                # age-gated in the store, so this is nearly always a
+                # single SELECT; failures never break the fetch path.
+                try:
+                    await store.maybe_snapshot(
+                        "items",
+                        {
+                            str(i.get("name")): {
+                                "value": i.get("value"),
+                                "rarity": i.get("rarity"),
+                                "type": i.get("type"),
+                                "stats": i.get("stats") or {},
+                            }
+                            for i in items
+                            if i.get("name")
+                        },
+                    )
+                except Exception:
+                    log.exception("item snapshot failed — continuing without it")
         return items
 
     def _match_score(want: str, candidate_name: str) -> int | None:
@@ -1688,6 +1759,245 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "returned": len(rows),
             "notes": notes,
             "source": ARDB_SOURCE,
+        }
+
+    # ── raid log ────────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=WRITE_LOG,
+        name="arc_log_raid",
+        description=(
+            "Append one raid to the personal raid log: map, outcome "
+            "(extracted/died/disconnected), and optionally loadout, "
+            "intent, where you died, approximate loot value, and notes. "
+            "Quick capture is the point — log from one sentence of "
+            "post-raid recap. Feeds arc_raid_stats."
+        ),
+    )
+    async def log_raid(
+        map_name: Annotated[str, Field(min_length=1, description="Map, e.g. 'Dam'.")],
+        outcome: Annotated[str, Field(description="One of: extracted, died, disconnected.")],
+        loadout: Annotated[
+            str, Field(description="Weapon/shield summary, e.g. 'Ferro IV + medium shield'.")
+        ] = "",
+        intent: Annotated[str, Field(description="What the run was for.")] = "",
+        died_at: Annotated[str, Field(description="POI/location of death, if died.")] = "",
+        loot_value: Annotated[
+            int | None, Field(ge=0, description="Approximate extracted loot value in coins.")
+        ] = None,
+        notes: Annotated[str, Field(description="Anything worth remembering.")] = "",
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        if outcome not in RAID_OUTCOMES:
+            return ToolError(
+                "arcraiders_invalid_outcome",
+                f"Unknown outcome {outcome!r}.",
+                f"Valid outcomes: {', '.join(RAID_OUTCOMES)}.",
+            ).payload()
+        # Canonicalize the map name via the slug table ('dam' and 'Dam
+        # Battlegrounds' must aggregate together in stats), but never
+        # reject — new maps ship before our alias table learns them.
+        norm = _norm(map_name)
+        pretty = _pretty_map(MAPGENIE_SLUGS[norm]) if norm in MAPGENIE_SLUGS else map_name
+        raid_id = await store.log_raid(
+            map_name=pretty,
+            outcome=outcome,
+            loadout=loadout or None,
+            intent=intent or None,
+            died_at=died_at or None,
+            loot_value=loot_value,
+            notes=notes or None,
+        )
+        return {"logged": True, "id": raid_id, "map": pretty, "outcome": outcome}
+
+    @mcp.tool(
+        annotations=READ_ONLY_LOCAL,
+        name="arc_list_raids",
+        description=(
+            "Recent raids from the personal raid log, newest first, "
+            "optionally filtered by map. Use to review history or find a "
+            "raid id for arc_delete_raid."
+        ),
+    )
+    async def list_raids(
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+        map_name: Annotated[str, Field(description="Exact map filter.")] = "",
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        rows = await store.list_raids(limit=limit, map_name=map_name or None)
+        for row in rows:
+            row["ts_utc"] = _iso_utc(row.pop("ts") * 1000)
+        return {"raids": rows, "returned": len(rows)}
+
+    @mcp.tool(
+        annotations=DESTRUCTIVE_LOCAL,
+        name="arc_delete_raid",
+        description=(
+            "Delete one mislogged raid by id (from arc_list_raids). "
+            "Without confirm=true this returns a non-destructive preview "
+            "of the raid that WOULD be deleted."
+        ),
+    )
+    async def delete_raid(
+        raid_id: Annotated[int, Field(ge=1, description="Raid id to delete.")],
+        confirm: Annotated[bool, Field(description="Actually delete.")] = False,
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        row = await store.get_raid(raid_id)
+        if row is None:
+            return ToolError(
+                "arcraiders_raid_not_found",
+                f"No raid with id {raid_id}.",
+                "List raids with arc_list_raids.",
+            ).payload()
+        row["ts_utc"] = _iso_utc(row.pop("ts") * 1000)
+        if not confirm:
+            return {"deleted": False, "preview": row, "hint": "Pass confirm=true to delete."}
+        await store.delete_raid(raid_id)
+        return {"deleted": True, "raid": row}
+
+    @mcp.tool(
+        annotations=READ_ONLY_LOCAL,
+        name="arc_raid_stats",
+        description=(
+            "Personal raid analytics over the log: extraction rate "
+            "overall, per map, and per loadout; where you die most; loot "
+            "totals. Answers 'does Ferro actually extract more often' and "
+            "'where do I keep dying' from YOUR history, not wikis."
+        ),
+    )
+    async def raid_stats(
+        days: Annotated[int, Field(ge=1, le=365, description="Lookback window.")] = 30,
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        rows = await store.raid_rows_since(time.time() - days * 86400)
+        if not rows:
+            return {"days": days, "raids": 0, "hint": "Nothing logged yet — arc_log_raid."}
+
+        def _rate(subset: list[dict[str, Any]]) -> dict[str, Any]:
+            extracted = sum(1 for r in subset if r["outcome"] == "extracted")
+            return {
+                "raids": len(subset),
+                "extracted": extracted,
+                "extraction_rate": round(extracted / len(subset), 2),
+            }
+
+        def _grouped(key: str) -> dict[str, dict[str, Any]]:
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for r in rows:
+                if r.get(key):
+                    groups.setdefault(str(r[key]), []).append(r)
+            return {
+                name: _rate(subset)
+                for name, subset in sorted(groups.items(), key=lambda kv: -len(kv[1]))
+            }
+
+        deaths: dict[str, int] = {}
+        for r in rows:
+            if r["outcome"] == "died" and r.get("died_at"):
+                deaths[str(r["died_at"])] = deaths.get(str(r["died_at"]), 0) + 1
+        loot = [r["loot_value"] for r in rows if r.get("loot_value") is not None]
+        return {
+            "days": days,
+            "overall": _rate(rows),
+            "by_map": _grouped("map"),
+            "by_loadout": _grouped("loadout"),
+            "death_spots": dict(sorted(deaths.items(), key=lambda kv: -kv[1])),
+            "loot": {
+                "runs_with_value": len(loot),
+                "total": sum(loot),
+                "average": round(sum(loot) / len(loot)) if loot else None,
+            },
+        }
+
+    # ── patch diff ──────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=READ_ONLY_LOCAL,
+        name="arc_patch_diff",
+        description=(
+            "What changed in the item/weapon data since N days ago, from "
+            "locally stored snapshots: value, rarity, and stat changes "
+            "plus added/removed items. Turns 'balance shifts every patch' "
+            "hedging into 'Kettle damage changed on <date>'. Snapshots "
+            "accumulate automatically as the tools are used, so history "
+            "starts from first deployment."
+        ),
+    )
+    async def patch_diff(
+        since_days: Annotated[
+            int, Field(ge=1, le=180, description="Compare against ~N days ago.")
+        ] = 7,
+    ) -> dict[str, Any]:
+        if store is None:
+            return _store_error()
+        # Ensure today's snapshot exists before diffing (the fetch's
+        # side effect); a dead upstream still diffs stored history.
+        with contextlib.suppress(ToolError):
+            await _all_items()
+        latest = await store.latest_snapshot("items")
+        if latest is None:
+            return {
+                "changes": [],
+                "hint": (
+                    "No snapshots stored yet — they accumulate automatically "
+                    "as the item tools are used. Check back tomorrow."
+                ),
+            }
+        baseline = await store.snapshot_at_or_before("items", time.time() - since_days * 86400)
+        assert baseline is not None  # latest exists, so the fallback returns it
+        base_ts, base = baseline
+        new_ts, new = latest
+        if base_ts == new_ts:
+            return {
+                "changes": [],
+                "snapshots_stored": await store.snapshot_count("items"),
+                "hint": (
+                    "Only one distinct snapshot so far — no baseline older "
+                    f"than {since_days}d to compare against yet."
+                ),
+            }
+        changes: list[dict[str, Any]] = []
+        for name in sorted(set(base) | set(new)):
+            if name not in base:
+                changes.append({"item": name, "change": "added"})
+                continue
+            if name not in new:
+                changes.append({"item": name, "change": "removed"})
+                continue
+            old_row, new_row = base[name], new[name]
+            for field in ("value", "rarity", "type"):
+                if old_row.get(field) != new_row.get(field):
+                    changes.append(
+                        {
+                            "item": name,
+                            "field": field,
+                            "old": old_row.get(field),
+                            "new": new_row.get(field),
+                        }
+                    )
+            old_stats, new_stats = old_row.get("stats") or {}, new_row.get("stats") or {}
+            for stat in sorted(set(old_stats) | set(new_stats)):
+                if old_stats.get(stat) != new_stats.get(stat):
+                    changes.append(
+                        {
+                            "item": name,
+                            "field": f"stats.{stat}",
+                            "old": old_stats.get(stat),
+                            "new": new_stats.get(stat),
+                        }
+                    )
+        truncated = len(changes) > 200
+        return {
+            "baseline_utc": _iso_utc(base_ts * 1000),
+            "latest_utc": _iso_utc(new_ts * 1000),
+            "changes": changes[:200],
+            "returned": min(len(changes), 200),
+            "total": len(changes),
+            "truncated": truncated,
+            "source": METAFORGE_SOURCE,
         }
 
     # ── event schedule ──────────────────────────────────────────────

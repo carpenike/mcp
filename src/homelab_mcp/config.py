@@ -421,6 +421,17 @@ class Settings(BaseSettings):
             "ardb.app is requested, so responses carry a source field."
         ),
     )
+    arcraiders_db_path: str = Field(
+        default="/var/lib/homelab-mcp/arcraiders.db",
+        description=(
+            "SQLite file for ARC Raiders personal state: the append-only "
+            "raid log and dated item-table snapshots (arc_patch_diff). "
+            "Deliberately separate from the OAuth state.db — game data and "
+            "auth state must not share a file. Lives in the same systemd "
+            "StateDirectory, so no packaging change is needed. Set to "
+            "':memory:' (or empty) for an ephemeral store."
+        ),
+    )
     arcraiders_wiki_api_url: str = Field(
         default="https://arcraiders.wiki/w/api.php",
         description=(
