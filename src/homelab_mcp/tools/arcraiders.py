@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from pydantic import Field
 
-from homelab_mcp.tools._http import ToolError, make_client, request_json
+from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -76,12 +76,14 @@ that, say so and suggest they either ask again when they want a fresh
 check, or set up a client-side scheduled task/automation that calls
 these tools on an interval.
 
-**Where-to-find questions**: items carry coarse signals only — `loot_area`
-(which loot pool drops it) and `found_on_maps`. For precise in-raid
-navigation (spawn points, containers, exfils), share the MapGenie deep
-links the tools return (`map_links` / `map_url` / `mapgenie_url`) — that
-site is the right tool for pixel-level markers; these tools cannot serve
-its data directly.
+**Where-to-find questions**: `arc_check_item_keep` returns three levels —
+`loot_area` (which loot pool drops it), `found_on_maps`, and
+`wiki_location` (named-region prose like 'West of Olive Grove'; the
+item's wiki page via `arc_get_wiki_page` often adds an in-game location
+screenshot). For pixel-level markers, share the MapGenie links the tools
+return: `map_links` open pre-filtered to the item (`?search=`), while
+`map_url`/`mapgenie_url` open the plain map. These tools cannot serve
+MapGenie's marker data directly — link, don't ingest.
 
 Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki)
 and may lag the newest game patch; responses carry `source` fields — keep
@@ -160,12 +162,38 @@ def _norm(name: str) -> str:
     return _NORM_RE.sub(" ", name.lower()).strip()
 
 
-def _mapgenie_url(map_name: str | None) -> str | None:
-    """Interactive-map deep link for a map name/id, or None if unknown."""
+def _mapgenie_url(map_name: str | None, search: str | None = None) -> str | None:
+    """Interactive-map deep link for a map name/id, or None if unknown.
+
+    With `search`, the link opens pre-filtered: MapGenie's map app reads
+    a `?search=` query param into its initial filter state (verified in
+    their map.js: `search: t.get("search")` applied on load alongside
+    locationIds). Marker-id deep links (`?locationIds=`) exist but need
+    MapGenie's proprietary ids, which we don't ingest.
+    """
     if not map_name:
         return None
     slug = MAPGENIE_SLUGS.get(_norm(str(map_name)))
-    return f"{_MAPGENIE_BASE}{slug}" if slug else None
+    if slug is None:
+        return None
+    url = f"{_MAPGENIE_BASE}{slug}"
+    return f"{url}?search={enc(search)}" if search else url
+
+
+def _wiki_section(extract: str, heading: str) -> str | None:
+    """Pull one section's prose out of a plaintext wiki extract.
+
+    Extracts render headings as '== Location =='. Image-caption artifacts
+    ('In-Game location') survive into the plaintext and are dropped.
+    """
+    m = re.search(
+        rf"==\s*{re.escape(heading)}\s*==\n(.*?)(?:\n==|\Z)", extract, re.DOTALL | re.IGNORECASE
+    )
+    if not m:
+        return None
+    lines = [ln.strip() for ln in m.group(1).splitlines()]
+    lines = [ln for ln in lines if ln and ln.lower() != "in-game location"]
+    return "; ".join(lines) or None
 
 
 def _iso_utc(epoch_ms: Any) -> str | None:
@@ -643,11 +671,44 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             trader_offers = None
             notes.append("Trader data unavailable (MetaForge fetch failed).")
 
-        map_links = {m: url for m in best.get("found_on_maps") or [] if (url := _mapgenie_url(m))}
+        # Named-region prose from the wiki's Location section, e.g.
+        # 'West of Olive Grove'. Best-effort: many items have no wiki
+        # page or no Location section — that's a plain None, not a note.
+        wiki_location: str | None = None
+        try:
+            wiki_raw = await request_json(
+                client,
+                "GET",
+                wiki_api,
+                service="arcraiders_wiki",
+                params={
+                    "action": "query",
+                    "prop": "extracts",
+                    "titles": best.get("name") or item,
+                    "explaintext": 1,
+                    "redirects": 1,
+                    "format": "json",
+                },
+            )
+            wiki_page = next(
+                iter(((wiki_raw.get("query") or {}).get("pages") or {}).values()), None
+            )
+            if wiki_page and "missing" not in wiki_page:
+                wiki_location = _wiki_section(wiki_page.get("extract") or "", "Location")
+        except ToolError:
+            log.debug("wiki location lookup failed for %r", item)
+
+        item_name = best.get("name") or item
+        map_links = {
+            m: url
+            for m in best.get("found_on_maps") or []
+            if (url := _mapgenie_url(m, search=item_name))
+        }
         return {
             "item": best,
             "match": match_kind,
             "other_candidates": other_candidates,
+            "wiki_location": wiki_location,
             "map_links": map_links,
             "quests_requiring": quests_requiring,
             "hideout_requiring": hideout_requiring,

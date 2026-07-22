@@ -290,6 +290,26 @@ async def test_check_item_keep_aggregates_all_sources(
             },
         },
     )
+    httpx_mock.add_response(
+        url=(
+            f"{WIKI}?action=query&prop=extracts&titles=ARC%20Alloy&explaintext=1"
+            "&redirects=1&format=json"
+        ),
+        json={
+            "query": {
+                "pages": {
+                    "7": {
+                        "pageid": 7,
+                        "title": "ARC Alloy",
+                        "extract": (
+                            "Alloy prose.\n\n== Location ==\n"
+                            "West of Olive Grove\n\nIn-Game location\n\n== History =="
+                        ),
+                    }
+                }
+            }
+        },
+    )
     out = await tools["arc_check_item_keep"](item="ARC Alloy")
     assert out["match"] == "exact"
     assert out["item"]["name"] == "ARC Alloy"
@@ -300,10 +320,12 @@ async def test_check_item_keep_aggregates_all_sources(
     assert out["trader_offers"] == [{"trader": "Apollo", "price": 270}]
     assert out["item"]["loot_area"] == "ARC"
     assert out["item"]["found_on_maps"] == ["dam", "spaceport"]
+    # MapGenie links open pre-filtered to the item via ?search=.
     assert out["map_links"] == {
-        "dam": "https://mapgenie.io/arc-raiders/maps/dam-battlegrounds",
-        "spaceport": "https://mapgenie.io/arc-raiders/maps/spaceport",
+        "dam": "https://mapgenie.io/arc-raiders/maps/dam-battlegrounds?search=ARC%20Alloy",
+        "spaceport": "https://mapgenie.io/arc-raiders/maps/spaceport?search=ARC%20Alloy",
     }
+    assert out["wiki_location"] == "West of Olive Grove"
     assert out["notes"] == []
 
 
@@ -326,6 +348,8 @@ async def test_check_item_keep_degrades_per_source(
     assert out["quests_requiring"] is None
     assert out["hideout_requiring"] is None
     assert out["trader_offers"] is None
+    # Wiki lookup failure is silent (many items have no page) — no fourth note.
+    assert out["wiki_location"] is None
     assert len(out["notes"]) == 3
 
 
