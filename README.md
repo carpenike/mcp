@@ -154,6 +154,13 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Home Assistant | `ha_upsert_automation` | Create/update an automation through HA's validated + hot-reloading config API; previews the diff unless `confirm=true` |
 | Home Assistant | `ha_check_config` | HA's own full configuration check (Developer Tools → Check configuration) |
 | Home Assistant | `ha_health` | Connectivity + HA version check |
+| ARC Raiders | `arc_search_items` | Search the item database (weapons, ammo, gear, materials) by name — type, rarity, value, workbench, non-zero stats (MetaForge) |
+| ARC Raiders | `arc_search_quests` | Search quests by name — giver, objectives, XP, item rewards, guide link (MetaForge) |
+| ARC Raiders | `arc_get_trader_stock` | Live trader inventories with prices, optionally one trader; 15-min cache (MetaForge) |
+| ARC Raiders | `arc_get_event_schedule` | Rotating in-raid event schedule with UTC times + active/upcoming status, optional map filter; 15-min cache (MetaForge) |
+| ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
+| ARC Raiders | `arc_search_wiki` | Full-text search of the Embark-supported arcraiders.wiki |
+| ARC Raiders | `arc_get_wiki_page` | One wiki page as plain text + raw wikitext (infobox weapon stats); CC BY-SA 4.0 |
 
 ### Home Assistant posture
 

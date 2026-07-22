@@ -383,6 +383,33 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── ARC Raiders (public game-data upstreams, no secrets) ─────────
+    arcraiders_metaforge_base_url: str = Field(
+        default="https://metaforge.app/api/arc-raiders",
+        description=(
+            "Base URL of the MetaForge ARC Raiders REST API (items, quests, "
+            "trader stock, event schedule). Free and keyless; MetaForge's "
+            "docs require attribution and warn endpoints may change without "
+            "notice, so responses carry a `source` field and live data is "
+            "cached in-process."
+        ),
+    )
+    arcraiders_data_base_url: str = Field(
+        default="https://raw.githubusercontent.com/RaidTheory/arcraiders-data/main",
+        description=(
+            "Base URL for raw files of the RaidTheory/arcraiders-data GitHub "
+            "repo (MIT-licensed community dataset behind arctracker.io). "
+            "Pin a commit SHA instead of 'main' to freeze the dataset."
+        ),
+    )
+    arcraiders_wiki_api_url: str = Field(
+        default="https://arcraiders.wiki/w/api.php",
+        description=(
+            "MediaWiki Action API endpoint of the Embark-supported ARC "
+            "Raiders wiki. Content is CC BY-SA 4.0."
+        ),
+    )
+
     # ── Derived ──────────────────────────────────────────────────────
     @property
     def pocketid_redirect_uri(self) -> str:
