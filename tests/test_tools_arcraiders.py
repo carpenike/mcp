@@ -414,13 +414,15 @@ async def test_check_item_keep_aggregates_all_sources(
     }
     assert out["wiki_location"] == "West of Olive Grove"
     # Projects axis: active project counted, expired project excluded.
+    # 2049 is a sentinel ("no deadline"), never presented as a real date.
     assert out["projects_requiring"] == [
         {
             "project": "Trophy Display",
             "description": None,
             "phase": 1,
             "quantity": 4,
-            "ends_utc": "2049-12-31T00:00:00Z",
+            "ends_utc": None,
+            "permanent": True,
         }
     ]
     # Verdict sums all three axes: hideout 12 + quest 6 + project 4.
@@ -776,6 +778,11 @@ async def test_plan_upgrades_project_phase_scoping(
     )
     shoes = next(s for s in out_all["shopping_list"] if s["item"] == "Colorful Shoes Red")
     assert "project Trophy Display phase 5" in shoes["required_by"]
+    # Null rarity/loot_area are meaningful here — flagged, not backfilled.
+    assert shoes["unresolved"] is True
+    assert shoes["rarity"] is None
+    fabric = next(s for s in out_all["shopping_list"] if s["item"] == "Fabric")
+    assert "unresolved" not in fabric
 
 
 async def test_plan_upgrades_unknown_module_is_error(

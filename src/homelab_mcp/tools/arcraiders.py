@@ -154,6 +154,10 @@ ARDB_SOURCE = "ardb.app — https://ardb.app"
 TTL_LIVE = 900
 TTL_STATIC = 21600
 
+# Project end dates further out than this are sentinels ("no deadline"),
+# not real deadlines — surfaced as permanent: true instead of a date.
+PERMANENT_HORIZON_S = 3 * 365 * 86400
+
 # Wiki pages can be long; cap what we return so one tool call can't flood
 # the context window. Truncation is always flagged, never silent.
 WIKI_TEXT_MAX = 8000
@@ -751,6 +755,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             # Relics' event fronts the 'Converging Paths' project), so
             # carry the description — it's how a player connects the two.
             desc = (proj.get("description") or {}).get("en") or ""
+            # Sentinel far-future end dates (Trophy Display: 2049) are
+            # "no deadline", not a real date — presenting them as
+            # deadlines invites nine-thousand-day countdowns (v4-1).
+            permanent = not isinstance(end, (int, float)) or end > now + PERMANENT_HORIZON_S
             for phase in proj.get("phases") or []:
                 for req in phase.get("requirementItemIds") or []:
                     if _norm(str(req.get("itemId") or "")) not in keys:
@@ -761,9 +769,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                             "description": _truncate(desc),
                             "phase": phase.get("phase"),
                             "quantity": req.get("quantity"),
-                            "ends_utc": (
-                                _iso_utc(end * 1000) if isinstance(end, (int, float)) else None
-                            ),
+                            "ends_utc": (None if permanent else _iso_utc(cast(float, end) * 1000)),
+                            "permanent": permanent,
                         }
                     )
         return rows
@@ -1536,15 +1543,18 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             rows: list[dict[str, Any]] = []
             for item_norm, need in need_by_item.items():
                 display, info = _display(item_norm)
-                rows.append(
-                    {
-                        "item": info.get("name") or display,
-                        "need": need,
-                        "pool": pool.get(item_norm, 0) if have_stash else None,
-                        "short": max(0, need - pool.get(item_norm, 0)) if have_stash else None,
-                        "rarity": info.get("rarity"),
-                    }
-                )
+                req_row: dict[str, Any] = {
+                    "item": info.get("name") or display,
+                    "need": need,
+                    "pool": pool.get(item_norm, 0) if have_stash else None,
+                    "short": max(0, need - pool.get(item_norm, 0)) if have_stash else None,
+                    "rarity": info.get("rarity"),
+                }
+                if not info:
+                    # Not in any modeled item table — likely an event/merit
+                    # cosmetic (the events gap leaking through this axis).
+                    req_row["unresolved"] = True
+                rows.append(req_row)
             plan["requirements"] = rows
             plan["per_level"] = per_level
             plan["units_outstanding"] = sum(
@@ -1710,20 +1720,24 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             short = max(0, row["total_demand"] - (item_pool or 0)) if have_stash else None
             if have_stash and short == 0:
                 continue
-            shopping_list.append(
-                {
-                    "item": row["item"],
-                    "total_need": row["total_demand"],
-                    "pool": item_pool,
-                    "short": short,
-                    "rarity": info.get("rarity"),
-                    "loot_area": info.get("loot_area"),
-                    # Provenance: why this line exists, so a caller can
-                    # explain (or challenge) any entry on the list.
-                    "required_by": row["demanded_by"],
-                    "traders_selling": sorted(set(traders_by_item.get(item_norm, []))),
-                }
-            )
+            shop_row: dict[str, Any] = {
+                "item": row["item"],
+                "total_need": row["total_demand"],
+                "pool": item_pool,
+                "short": short,
+                "rarity": info.get("rarity"),
+                "loot_area": info.get("loot_area"),
+                # Provenance: why this line exists, so a caller can
+                # explain (or challenge) any entry on the list.
+                "required_by": row["demanded_by"],
+                "traders_selling": sorted(set(traders_by_item.get(item_norm, []))),
+            }
+            if not info:
+                # Null rarity/loot_area here are MEANINGFUL: the item isn't
+                # in any modeled table (likely event/merit cosmetics — the
+                # events: not_modeled gap surfacing through this axis).
+                shop_row["unresolved"] = True
+            shopping_list.append(shop_row)
         shopping_list.sort(key=lambda s: -_qty(s["total_need"]))
 
         # Nearest completion: fewest outstanding units, then fewest distinct
