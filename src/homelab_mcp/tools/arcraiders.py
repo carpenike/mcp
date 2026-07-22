@@ -211,6 +211,85 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         cache.put(cache_key, quests, TTL_STATIC)
         return quests
 
+    async def _all_items() -> list[dict[str, Any]]:
+        """Every item (projected), aggregated across pages and cached as one unit.
+
+        MetaForge's server-side search does word matching, so 'lightbulb'
+        finds nothing while the item is named 'Light Bulb'. Fuzzy
+        resolution needs the full list; projected, ~600 items are small.
+        """
+        cache_key = f"{metaforge}/items#all"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cast(list[dict[str, Any]], cached)
+        items: list[dict[str, Any]] = []
+        page = 1
+        while page <= 20:  # backstop: 2000 items, far above the real count
+            raw = await request_json(
+                client,
+                "GET",
+                f"{metaforge}/items",
+                service="metaforge",
+                params={"limit": 100, "page": page},
+                unreachable_hint="MetaForge may be down; try again shortly.",
+            )
+            items.extend(_project_item(i) for i in raw.get("data") or [])
+            if not (raw.get("pagination") or {}).get("hasNextPage"):
+                break
+            page += 1
+        if items:
+            # Don't cache an empty aggregate — a transient outage would
+            # otherwise pin "no items" for the whole TTL.
+            cache.put(cache_key, items, TTL_STATIC)
+        return items
+
+    def _match_score(want: str, candidate_name: str) -> int | None:
+        """Rank how well a candidate item name matches the query (lower = better).
+
+        0: same normalized name          ('Light Bulb' vs 'light bulb')
+        1: same with spaces squashed     ('Light Bulb' vs 'lightbulb')
+        2: query contained in name       ('Extended Light Mag' vs 'light mag')
+        3: squashed containment          ('Light Bulb' vs 'ightbul')
+        None: no match.
+        """
+        want_norm = _norm(want)
+        want_squash = want_norm.replace(" ", "")
+        cand_norm = _norm(candidate_name)
+        cand_squash = cand_norm.replace(" ", "")
+        if not want_norm:
+            return None
+        if cand_norm == want_norm:
+            return 0
+        if cand_squash == want_squash:
+            return 1
+        if want_norm in cand_norm:
+            return 2
+        if want_squash in cand_squash:
+            return 3
+        return None
+
+    async def _resolve_item(query: str) -> tuple[dict[str, Any] | None, str, list[str]]:
+        """Find the best item for a free-text name, spacing-insensitively.
+
+        Returns (item, match_kind, other_candidate_names). match_kind is
+        'exact' when the name matches up to normalization/spacing, else
+        'closest'. Raises ToolError if the item list is unavailable.
+        """
+        scored = []
+        for it in await _all_items():
+            score = _match_score(query, it.get("name") or "")
+            if score is not None:
+                scored.append((score, it.get("name") or "", it))
+        if not scored:
+            return None, "none", []
+        scored.sort(key=lambda entry: (entry[0], len(entry[1]), entry[1]))
+        best = scored[0]
+        return (
+            best[2],
+            "exact" if best[0] <= 1 else "closest",
+            [name for _, name, _ in scored[1:7]],
+        )
+
     async def _hideout_modules() -> list[dict[str, Any]]:
         """All hideout module definitions, aggregated and cached as one unit.
 
@@ -281,12 +360,28 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         items = [_project_item(i) for i in (raw.get("data") or [])]
         pagination = raw.get("pagination") or {}
         total = pagination.get("total", len(items))
+        note = None
+        if not items and page == 1:
+            # MetaForge's search is word-based: 'lightbulb' misses 'Light
+            # Bulb'. Fall back to spacing-insensitive local matching over
+            # the cached full item list before reporting an empty result.
+            try:
+                best, _, other_names = await _resolve_item(query)
+            except ToolError:
+                best = None
+            if best is not None:
+                all_items = await _all_items()
+                by_name = {i.get("name"): i for i in all_items}
+                items = [best] + [by_name[n] for n in other_names[: limit - 1] if n in by_name]
+                total = len(items)
+                note = "Server search had no hits; matched item names locally instead."
         return {
             "query": query,
             "items": items,
             "returned": len(items),
             "total": total,
             "truncated": bool(pagination.get("hasNextPage")),
+            **({"note": note} if note else {}),
             "source": METAFORGE_SOURCE,
         }
 
@@ -396,28 +491,19 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     async def check_item_keep(
         item: Annotated[str, Field(min_length=1, description="Item name, e.g. 'ARC Alloy'.")],
     ) -> dict[str, Any]:
-        # Resolve the item via MetaForge search; prefer an exact
-        # normalized-name match over the first fuzzy hit.
+        # Resolve the item spacing-insensitively against the full cached
+        # item list ('lightbulb' must find 'Light Bulb'), preferring an
+        # exact normalized match over fuzzier containment hits.
         try:
-            raw = await request_json(
-                client,
-                "GET",
-                f"{metaforge}/items",
-                service="metaforge",
-                params={"search": item, "limit": 25},
-                unreachable_hint="MetaForge may be down; try again shortly.",
-            )
+            best, match_kind, other_candidates = await _resolve_item(item)
         except ToolError as err:
             return err.payload()
-        candidates = raw.get("data") or []
-        if not candidates:
+        if best is None:
             return ToolError(
                 "metaforge_item_not_found",
                 f"No item matching {item!r}.",
                 "Check the spelling with arc_search_items.",
             ).payload()
-        want = _norm(item)
-        best = next((c for c in candidates if _norm(c.get("name") or "") == want), candidates[0])
         # Every identity this item goes by across the datasets.
         keys = {_norm(best.get("name") or ""), _norm(best.get("id") or "")} - {""}
 
@@ -480,9 +566,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             notes.append("Trader data unavailable (MetaForge fetch failed).")
 
         return {
-            "item": _project_item(best),
-            "match": "exact" if _norm(best.get("name") or "") == want else "closest",
-            "other_candidates": [c.get("name") for c in candidates[:6] if c is not best],
+            "item": best,
+            "match": match_kind,
+            "other_candidates": other_candidates,
             "quests_requiring": quests_requiring,
             "hideout_requiring": hideout_requiring,
             "trader_offers": trader_offers,

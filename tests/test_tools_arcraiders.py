@@ -205,12 +205,13 @@ async def test_check_item_keep_aggregates_all_sources(
 ) -> None:
     # Fuzzy hit first, exact-normalized second: the tool must pick the exact one.
     httpx_mock.add_response(
-        url=f"{METAFORGE}/items?search=ARC%20Alloy&limit=25",
+        url=f"{METAFORGE}/items?limit=100&page=1",
         json={
             "data": [
                 _item("ARC Alloy Cluster", id="arc-alloy-cluster"),
                 _item("ARC Alloy", id="arc-alloy", value=90),
-            ]
+            ],
+            "pagination": {"hasNextPage": False},
         },
     )
     httpx_mock.add_response(
@@ -286,8 +287,8 @@ async def test_check_item_keep_degrades_per_source(
 ) -> None:
     """Failures in quests/hideout/traders must degrade to None + note, not error."""
     httpx_mock.add_response(
-        url=f"{METAFORGE}/items?search=wires&limit=25",
-        json={"data": [_item("Wires", id="wires")]},
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={"data": [_item("Wires", id="wires")], "pagination": {"hasNextPage": False}},
     )
     httpx_mock.add_response(url=f"{METAFORGE}/quests?limit=100&page=1", status_code=503)
     # Hideout listing and all fallback module fetches are unmatched → httpx
@@ -303,9 +304,52 @@ async def test_check_item_keep_degrades_per_source(
 async def test_check_item_keep_unknown_item(
     tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
 ) -> None:
-    httpx_mock.add_response(url=f"{METAFORGE}/items?search=nope&limit=25", json={"data": []})
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={"data": [_item("Wires")], "pagination": {"hasNextPage": False}},
+    )
     out = await tools["arc_check_item_keep"](item="nope")
     assert out["error"]["code"] == "metaforge_item_not_found"
+
+
+@pytest.mark.httpx_mock(
+    assert_all_responses_were_requested=False, assert_all_requests_were_expected=False
+)
+async def test_check_item_keep_resolves_spacing_variants(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """'lightbulb' must resolve to 'Light Bulb' despite the spacing mismatch."""
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [_item("Blue Light Stick"), _item("Light Bulb", id="light-bulb")],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    out = await tools["arc_check_item_keep"](item="lightbulb")
+    assert out["item"]["name"] == "Light Bulb"
+    assert out["match"] == "exact"
+
+
+async def test_search_items_falls_back_to_local_fuzzy(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """Server word-search misses 'lightbulb'; the local squash-match must not."""
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?search=lightbulb&limit=10&page=1",
+        json={"data": [], "pagination": {"hasNextPage": False}},
+    )
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [_item("Light Bulb", id="light-bulb"), _item("Blue Light Stick")],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    out = await tools["arc_search_items"](query="lightbulb")
+    assert out["returned"] == 1
+    assert out["items"][0]["name"] == "Light Bulb"
+    assert "locally" in out["note"]
 
 
 # ── events ───────────────────────────────────────────────────────────
