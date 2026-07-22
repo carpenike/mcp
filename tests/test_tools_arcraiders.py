@@ -337,7 +337,14 @@ async def test_check_item_keep_aggregates_all_sources(
     )
     httpx_mock.add_response(
         url=f"{DATA_LISTING}/hideout",
-        json=[{"name": "med_station.json", "type": "file"}],
+        json=[
+            {"name": "med_station.json", "type": "file"},
+            {"name": "workbench.json", "type": "file"},
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/hideout/workbench.json",
+        json={"id": "workbench", "name": {"en": "Workbench"}, "maxLevel": 0, "levels": []},
     )
     httpx_mock.add_response(
         url=f"{DATA}/hideout/med_station.json",
@@ -407,6 +414,7 @@ async def test_check_item_keep_aggregates_all_sources(
     assert out["projects_requiring"] == [
         {
             "project": "Trophy Display",
+            "description": None,
             "phase": 1,
             "quantity": 4,
             "ends_utc": "2049-12-31T00:00:00Z",
@@ -466,6 +474,7 @@ async def test_check_item_keep_degrades_per_source(
     # The verdict must hedge when whole axes were unavailable.
     assert out["verdict"] == "sell"
     assert "unavailable" in out["verdict_reason"]
+    assert "events" in out["verdict_reason"]  # not-modeled axes named on every sell
 
 
 async def test_check_item_keep_unknown_item(
@@ -526,7 +535,14 @@ def _mock_planner_world(httpx_mock: HTTPXMock) -> None:
     """One hideout module (Medical Lab, max L3) + the item table + traders."""
     httpx_mock.add_response(
         url=f"{DATA_LISTING}/hideout",
-        json=[{"name": "med_station.json", "type": "file"}],
+        json=[
+            {"name": "med_station.json", "type": "file"},
+            {"name": "workbench.json", "type": "file"},
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{DATA}/hideout/workbench.json",
+        json={"id": "workbench", "name": {"en": "Workbench"}, "maxLevel": 0, "levels": []},
     )
     httpx_mock.add_response(
         url=f"{DATA}/hideout/med_station.json",
@@ -582,8 +598,11 @@ async def test_plan_upgrades_without_stash_uses_nulls(
         "rarity": "Common",
     }
     assert plan["units_outstanding"] == 26  # falls back to total need
+    # Workbench (maxLevel 0, nothing to plan) must NOT pollute the
+    # unknown-level list even though it wasn't in current_levels.
     assert out["modules_with_unknown_level"] == []
     assert out["coverage"]["quests"] == "not_included"
+    assert out["coverage"]["projects"] == "not_included"
 
 
 async def test_plan_upgrades_multi_level_with_stash(
@@ -615,6 +634,75 @@ async def test_plan_upgrades_multi_level_with_stash(
     assert "ARC Alloy" in items_listed and "Fabric" not in items_listed
     # Unresolvable key is returned, never silently dropped.
     assert out["unresolved_stash_keys"] == [{"key": "xyzzy", "candidates": []}]
+
+
+async def test_plan_upgrades_quest_scoping_and_provenance(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """active_quests restricts folding to accepted quests; unmatched names
+    are returned; every shopping line explains itself via required_by."""
+    _mock_planner_world(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/quests?limit=100&page=1",
+        json={
+            "data": [
+                {
+                    "name": "The Trifecta",
+                    "required_items": [
+                        {"item": {"name": "ARC Alloy"}, "item_id": "arc-alloy", "quantity": 2}
+                    ],
+                },
+                {
+                    "name": "Unrelated Quest",
+                    "required_items": [
+                        {
+                            "item": {"name": "Deflated Football"},
+                            "item_id": "deflated-football",
+                            "quantity": 1,
+                        }
+                    ],
+                },
+            ],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    out = await tools["arc_plan_upgrades"](
+        current_levels={"Medical Lab": 1},
+        include_quests=True,
+        active_quests=["the trifecta", "Ghost Quest"],
+    )
+    items = {s["item"] for s in out["shopping_list"]}
+    assert "Deflated Football" not in items  # unaccepted quest not folded
+    alloy = next(s for s in out["shopping_list"] if s["item"] == "ARC Alloy")
+    assert alloy["total_need"] == 8  # 6 hideout + 2 quest
+    assert set(alloy["required_by"]) == {"Medical Lab L2", "quest The Trifecta"}
+    assert out["unresolved_quest_names"] == ["Ghost Quest"]
+    assert out["coverage"]["quests"] == "complete"
+
+
+async def test_plan_upgrades_folds_active_projects(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_planner_world(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{DATA}/projects.json",
+        json=[
+            {
+                "id": "trophy",
+                "disabled": False,
+                "endDate": 2524521600,
+                "name": {"en": "Trophy Display"},
+                "phases": [
+                    {"phase": 1, "requirementItemIds": [{"itemId": "fabric", "quantity": 10}]}
+                ],
+            }
+        ],
+    )
+    out = await tools["arc_plan_upgrades"](current_levels={"Medical Lab": 1}, include_projects=True)
+    fabric = next(s for s in out["shopping_list"] if s["item"] == "Fabric")
+    assert fabric["total_need"] == 30  # 20 hideout + 10 project
+    assert "project Trophy Display phase 1" in fabric["required_by"]
+    assert out["coverage"]["projects"] == "complete"
 
 
 async def test_plan_upgrades_unknown_module_is_error(
