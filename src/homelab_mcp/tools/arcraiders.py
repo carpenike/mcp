@@ -76,6 +76,13 @@ that, say so and suggest they either ask again when they want a fresh
 check, or set up a client-side scheduled task/automation that calls
 these tools on an interval.
 
+**Where-to-find questions**: items carry coarse signals only — `loot_area`
+(which loot pool drops it) and `found_on_maps`. For precise in-raid
+navigation (spawn points, containers, exfils), share the MapGenie deep
+links the tools return (`map_links` / `map_url` / `mapgenie_url`) — that
+site is the right tool for pixel-level markers; these tools cannot serve
+its data directly.
+
 Data comes from community sources (MetaForge, RaidTheory, arcraiders.wiki)
 and may lag the newest game patch; responses carry `source` fields — keep
 that attribution when presenting data publicly. For lore, strategies, and
@@ -118,6 +125,25 @@ FALLBACK_HIDEOUT_MODULES = [
     "workbench.json",
 ]
 
+# Deep links into MapGenie's interactive maps (probed 2026-07: each slug
+# returns 200; note 'spaceport' but 'the-blue-gate'). Linking OUT is fine —
+# ingesting their marker data is prohibited by their ToS, so links are the
+# only integration. Keyed by _norm()-ed map name to absorb the id/display
+# variants across MetaForge ('dam', 'Blue Gate') and RaidTheory
+# ('dam_battlegrounds').
+_MAPGENIE_BASE = "https://mapgenie.io/arc-raiders/maps/"
+MAPGENIE_SLUGS = {
+    "dam": "dam-battlegrounds",
+    "dam battlegrounds": "dam-battlegrounds",
+    "spaceport": "spaceport",
+    "the spaceport": "spaceport",
+    "buried city": "buried-city",
+    "blue gate": "the-blue-gate",
+    "the blue gate": "the-blue-gate",
+    "stella montis": "stella-montis",
+    "riven tides": "riven-tides",
+}
+
 
 def _strip_tags(fragment: str) -> str:
     """Drop HTML tags and unescape entities from a wiki search snippet."""
@@ -132,6 +158,14 @@ def _norm(name: str) -> str:
     same token string ('arc alloy') under this normalization.
     """
     return _NORM_RE.sub(" ", name.lower()).strip()
+
+
+def _mapgenie_url(map_name: str | None) -> str | None:
+    """Interactive-map deep link for a map name/id, or None if unknown."""
+    if not map_name:
+        return None
+    slug = MAPGENIE_SLUGS.get(_norm(str(map_name)))
+    return f"{_MAPGENIE_BASE}{slug}" if slug else None
 
 
 def _iso_utc(epoch_ms: Any) -> str | None:
@@ -164,6 +198,11 @@ class _TTLCache:
 def _project_item(raw: dict[str, Any]) -> dict[str, Any]:
     """Reduce a MetaForge item to the fields worth showing (stat zeros dropped)."""
     stats = {k: v for k, v in (raw.get("stat_block") or {}).items() if v}
+    # Coarse "where do I find it" signals: the loot pool/area type that
+    # drops it, and any maps with known spawn locations.
+    found_on_maps = sorted(
+        {str(loc.get("map")) for loc in raw.get("locations") or [] if loc.get("map")}
+    )
     return {
         "id": raw.get("id"),
         "name": raw.get("name"),
@@ -173,6 +212,8 @@ def _project_item(raw: dict[str, Any]) -> dict[str, Any]:
         "value": raw.get("value"),
         "description": raw.get("description"),
         "workbench": raw.get("workbench"),
+        "loot_area": raw.get("loot_area"),
+        "found_on_maps": found_on_maps,
         "stats": stats,
         "updated_at": raw.get("updated_at"),
     }
@@ -602,10 +643,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             trader_offers = None
             notes.append("Trader data unavailable (MetaForge fetch failed).")
 
+        map_links = {m: url for m in best.get("found_on_maps") or [] if (url := _mapgenie_url(m))}
         return {
             "item": best,
             "match": match_kind,
             "other_candidates": other_candidates,
+            "map_links": map_links,
             "quests_requiring": quests_requiring,
             "hideout_requiring": hideout_requiring,
             "trader_offers": trader_offers,
@@ -656,6 +699,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 {
                     "name": ev.get("name"),
                     "map": ev.get("map"),
+                    "map_url": _mapgenie_url(ev.get("map")),
                     "status": status,
                     "starts_utc": _iso_utc(start),
                     "ends_utc": _iso_utc(end),
@@ -688,6 +732,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "id": m.get("id"),
                 "name": (m.get("name") or {}).get("en"),
                 "image": m.get("image"),
+                "mapgenie_url": _mapgenie_url((m.get("name") or {}).get("en") or m.get("id")),
             }
             for m in (raw if isinstance(raw, list) else [])
         ]

@@ -105,6 +105,8 @@ async def test_search_items_projects_and_drops_zero_stats(
     # Zero/empty stats and the html article blob are projected away.
     assert item["stats"] == {"weight": 0.05, "stackSize": 40}
     assert "article" not in item
+    assert item["loot_area"] is None
+    assert item["found_on_maps"] == []
     assert "MetaForge" in out["source"]
 
 
@@ -223,7 +225,13 @@ async def test_check_item_keep_aggregates_all_sources(
         json={
             "data": [
                 _item("ARC Alloy Cluster", id="arc-alloy-cluster"),
-                _item("ARC Alloy", id="arc-alloy", value=90),
+                _item(
+                    "ARC Alloy",
+                    id="arc-alloy",
+                    value=90,
+                    loot_area="ARC",
+                    locations=[{"id": "m1", "map": "dam"}, {"id": "m2", "map": "spaceport"}],
+                ),
             ],
             "pagination": {"hasNextPage": False},
         },
@@ -290,6 +298,12 @@ async def test_check_item_keep_aggregates_all_sources(
     # Snake_case RaidTheory id matched against the MetaForge display name.
     assert out["hideout_requiring"] == [{"module": "Medical Lab", "level": 2, "quantity": 12}]
     assert out["trader_offers"] == [{"trader": "Apollo", "price": 270}]
+    assert out["item"]["loot_area"] == "ARC"
+    assert out["item"]["found_on_maps"] == ["dam", "spaceport"]
+    assert out["map_links"] == {
+        "dam": "https://mapgenie.io/arc-raiders/maps/dam-battlegrounds",
+        "spaceport": "https://mapgenie.io/arc-raiders/maps/spaceport",
+    }
     assert out["notes"] == []
 
 
@@ -407,6 +421,10 @@ async def test_event_schedule_status_and_map_filter(
     filtered = await tools["arc_get_event_schedule"](map_name="dam", include_past=True)
     assert {e["name"] for e in filtered["events"]} == {"Night Raid", "Hurricane"}
     assert all(e["map"] == "Dam" for e in filtered["events"])
+    assert all(
+        e["map_url"] == "https://mapgenie.io/arc-raiders/maps/dam-battlegrounds"
+        for e in filtered["events"]
+    )
 
 
 # ── maps ─────────────────────────────────────────────────────────────
@@ -431,6 +449,7 @@ async def test_list_maps_projects_english_name(
             "id": "dam_battlegrounds",
             "name": "Dam Battlegrounds",
             "image": "https://cdn.test/dam.png",
+            "mapgenie_url": "https://mapgenie.io/arc-raiders/maps/dam-battlegrounds",
         }
     ]
     assert "RaidTheory" in out["source"]
