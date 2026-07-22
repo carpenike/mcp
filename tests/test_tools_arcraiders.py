@@ -135,7 +135,10 @@ async def test_search_items_projects_and_drops_zero_stats(
     assert item["stats"] == {"weight": 0.05, "stackSize": 40}
     assert "article" not in item
     assert item["loot_area"] is None
-    assert item["found_on_maps"] == []
+    # Populate-or-drop: sparse fields are OMITTED when empty, and
+    # subcategory (always a duplicate of type) is gone entirely.
+    assert "found_on_maps" not in item
+    assert "subcategory" not in item
     assert "MetaForge" in out["source"]
 
 
@@ -462,8 +465,9 @@ async def test_check_item_keep_degrades_per_source(
     assert out["hideout_requiring"] is None
     assert out["projects_requiring"] is None
     assert out["trader_offers"] is None
-    # Wiki lookup failure is silent (many items have no page) — no extra note.
-    assert out["wiki_location"] is None
+    # Wiki lookup failure is silent (many items have no page); the empty
+    # field is omitted, not null.
+    assert "wiki_location" not in out
     # quests + hideout + projects + traders + recycle-detail = 5 notes.
     assert len(out["notes"]) == 5
     assert out["coverage"]["quests"] == "unavailable"
@@ -472,9 +476,34 @@ async def test_check_item_keep_degrades_per_source(
     assert out["coverage"]["crafting_recipes"] == "unavailable"
     assert out["weapon_specs"] is None and out["crafting_uses"] is None
     # The verdict must hedge when whole axes were unavailable.
+    # Common item: verdict stays "sell" (degradation is Epic+ only).
     assert out["verdict"] == "sell"
     assert "unavailable" in out["verdict_reason"]
     assert "events" in out["verdict_reason"]  # not-modeled axes named on every sell
+
+
+@pytest.mark.httpx_mock(
+    assert_all_responses_were_requested=False, assert_all_requests_were_expected=False
+)
+async def test_check_item_keep_degrades_verdict_for_epic_blind_spots(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """Epic+ item, no demand, events not modeled -> probably_sell, never a
+    confident sell (v3: the hedge must live in the field callers act on)."""
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/items?limit=100&page=1",
+        json={
+            "data": [_item("Fancy Obelisk", id="fancy-obelisk", rarity="Legendary", value=9000)],
+            "pagination": {"hasNextPage": False},
+        },
+    )
+    httpx_mock.add_response(
+        url=f"{METAFORGE}/quests?limit=100&page=1", json={"data": [], "pagination": {}}
+    )
+    httpx_mock.add_response(url=f"{DATA}/projects.json", json=[])
+    out = await tools["arc_check_item_keep"](item="Fancy Obelisk")
+    assert out["verdict"] == "probably_sell"
+    assert "verify no active event" in out["verdict_reason"]
 
 
 async def test_check_item_keep_unknown_item(
@@ -703,6 +732,50 @@ async def test_plan_upgrades_folds_active_projects(
     assert fabric["total_need"] == 30  # 20 hideout + 10 project
     assert "project Trophy Display phase 1" in fabric["required_by"]
     assert out["coverage"]["projects"] == "complete"
+
+
+async def test_plan_upgrades_project_phase_scoping(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """active_projects folds ONLY the phase the user is on; unmatched
+    project names are returned; raw ids render readably (v3-1, v3-3)."""
+    _mock_planner_world(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{DATA}/projects.json",
+        json=[
+            {
+                "id": "trophy",
+                "disabled": False,
+                "endDate": 2524521600,
+                "name": {"en": "Trophy Display"},
+                "phases": [
+                    {"phase": 1, "requirementItemIds": [{"itemId": "fabric", "quantity": 10}]},
+                    {
+                        "phase": 5,
+                        "requirementItemIds": [{"itemId": "colorful_shoes_red", "quantity": 1}],
+                    },
+                ],
+            }
+        ],
+    )
+    out = await tools["arc_plan_upgrades"](
+        current_levels={"Medical Lab": 1},
+        include_projects=True,
+        active_projects={"trophy display": 1, "Ghost Project": 2},
+    )
+    items = {s["item"] for s in out["shopping_list"]}
+    # Phase 5's cosmetic is NOT folded while the user is on phase 1.
+    assert not any("shoes" in i.lower() for i in items)
+    fabric = next(s for s in out["shopping_list"] if s["item"] == "Fabric")
+    assert fabric["total_need"] == 30  # 20 hideout + 10 phase-1 project
+    assert out["unresolved_project_names"] == ["Ghost Project"]
+
+    # Unscoped fold DOES include phase 5, with the id rendered readably.
+    out_all = await tools["arc_plan_upgrades"](
+        current_levels={"Medical Lab": 1}, include_projects=True
+    )
+    shoes = next(s for s in out_all["shopping_list"] if s["item"] == "Colorful Shoes Red")
+    assert "project Trophy Display phase 5" in shoes["required_by"]
 
 
 async def test_plan_upgrades_unknown_module_is_error(
