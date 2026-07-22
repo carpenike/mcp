@@ -1415,8 +1415,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             Field(description="Module name -> target level. Default: next level for each."),
         ] = None,
         include_quests: Annotated[
-            bool, Field(description="Also fold quest turn-in demand into totals.")
-        ] = False,
+            bool | None,
+            Field(
+                description=(
+                    "Fold quest turn-in demand into totals. Default (unset): auto — "
+                    "ON when use_state finds stored active_quests, OFF otherwise. "
+                    "Explicit false always wins (the response notes ignored state)."
+                )
+            ),
+        ] = None,
         active_quests: Annotated[
             list[str] | None,
             Field(
@@ -1427,8 +1434,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             ),
         ] = None,
         include_projects: Annotated[
-            bool, Field(description="Also fold active expedition/project phase demand into totals.")
-        ] = False,
+            bool | None,
+            Field(
+                description=(
+                    "Fold active expedition/project phase demand into totals. Default "
+                    "(unset): auto — ON when use_state finds stored active_projects, "
+                    "OFF otherwise. Explicit false always wins (noted in the response)."
+                )
+            ),
+        ] = None,
         active_projects: Annotated[
             dict[str, int] | None,
             Field(
@@ -1473,14 +1487,40 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 else:
                     state_used["stash"] = {"source": "param"}
             prog = cast(dict[str, Any], sections.get("progression", ({}, 0.0))[0])
-            if active_quests is None and prog.get("active_quests"):
-                active_quests = list(prog["active_quests"])
-                include_quests = True
-                state_used["progression.active_quests"] = _used_meta("progression")
-            if active_projects is None and prog.get("active_projects"):
-                active_projects = dict(prog["active_projects"])
-                include_projects = True
-                state_used["progression.active_projects"] = _used_meta("progression")
+            stored_quests = list(prog.get("active_quests") or [])
+            stored_projects = dict(prog.get("active_projects") or {})
+            if stored_quests and active_quests is None:
+                if include_quests is False:
+                    # Explicit opt-out wins, but never silently: a phone
+                    # caller must be able to see why the list looks thin.
+                    state_used["progression.active_quests"] = {
+                        "source": "ignored",
+                        "hint": (
+                            f"state has active_quests ({', '.join(stored_quests[:3])}) "
+                            "but include_quests was false"
+                        ),
+                    }
+                else:
+                    active_quests = stored_quests
+                    include_quests = True
+                    state_used["progression.active_quests"] = _used_meta("progression")
+            if stored_projects and active_projects is None:
+                if include_projects is False:
+                    shown = ", ".join(
+                        f"{name} p{phase}" for name, phase in list(stored_projects.items())[:3]
+                    )
+                    state_used["progression.active_projects"] = {
+                        "source": "ignored",
+                        "hint": (
+                            f"state has active_projects ({shown}) but include_projects was false"
+                        ),
+                    }
+                else:
+                    active_projects = stored_projects
+                    include_projects = True
+                    state_used["progression.active_projects"] = _used_meta("progression")
+        include_quests = bool(include_quests)
+        include_projects = bool(include_projects)
         if current_levels is None:
             return ToolError(
                 "arcraiders_missing_levels",

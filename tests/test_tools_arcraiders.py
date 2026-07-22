@@ -1187,6 +1187,45 @@ async def test_plan_upgrades_use_state_one_call(
     assert out2["state_used"]["modules"] == {"source": "param"}
 
 
+async def test_plan_upgrades_use_state_coverage_is_complete_one_call(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    """v5-1: use_state alone must deliver the one-call promise — stored
+    quests/projects auto-fold, and coverage says complete, not
+    not_included."""
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](
+        patch={
+            "modules": {"Medical Lab": 1},
+            "progression": {
+                "active_quests": ["The Trifecta"],
+                "active_projects": {"Converging Paths": 4},
+            },
+        }
+    )
+    out = await tools["arc_plan_upgrades"](use_state=True)
+    assert out["coverage"]["quests"] == "complete"
+    assert out["coverage"]["projects"] == "complete"
+
+
+async def test_plan_upgrades_use_state_explicit_false_wins_but_is_named(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
+) -> None:
+    _mock_state_world(httpx_mock)
+    await tools["arc_set_state"](
+        patch={
+            "modules": {"Medical Lab": 1},
+            "progression": {"active_projects": {"Converging Paths": 4}},
+        }
+    )
+    out = await tools["arc_plan_upgrades"](use_state=True, include_projects=False)
+    assert out["coverage"]["projects"] == "not_included"
+    ignored = out["state_used"]["progression.active_projects"]
+    assert ignored["source"] == "ignored"
+    assert "Converging Paths p4" in ignored["hint"]
+    assert "include_projects was false" in ignored["hint"]
+
+
 async def test_plan_upgrades_use_state_without_stored_levels_errors(
     tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
 ) -> None:
