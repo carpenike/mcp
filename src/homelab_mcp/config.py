@@ -440,6 +440,45 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── ROM library (FileBrowser Quantum) ────────────────────────────
+    roms_base_url: str = Field(
+        default="",
+        description=(
+            "Base URL of the FileBrowser Quantum instance serving the ROM "
+            "library, e.g. 'http://10.4.0.10:8080' (no trailing slash "
+            "needed). Empty disables the roms_* tools — they return a "
+            "configuration error instead of calling out."
+        ),
+    )
+    roms_username: str = Field(
+        default="",
+        description=(
+            "FileBrowser username the roms_* tools log in as. A read-only "
+            "account is enough — the tools never write. The account's "
+            "'api' permission is NOT required: the module performs the "
+            "interactive login handshake itself and caches the session JWT."
+        ),
+    )
+    roms_password: str = Field(
+        default="",
+        description=(
+            "FileBrowser password for `roms_username`. SECRET — supply via "
+            "the sops-managed EnvironmentFile (HOMELAB_MCP_ROMS_PASSWORD), "
+            "never via the world-readable Nix `settings`. If empty, the "
+            "roms_* tools return a configuration error instead of calling "
+            "out."
+        ),
+    )
+    roms_source: str = Field(
+        default="share",
+        description=(
+            "FileBrowser 'source' (storage backend) name the ROM library "
+            "lives on. Quantum supports multiple sources per instance; "
+            "`GET /api/settings/sources` lists them. This install has "
+            "exactly one, named 'share'."
+        ),
+    )
+
     # ── Derived ──────────────────────────────────────────────────────
     @property
     def pocketid_redirect_uri(self) -> str:
