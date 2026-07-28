@@ -173,6 +173,10 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
 | ARC Raiders | `arc_search_wiki` | Full-text search of the Embark-supported arcraiders.wiki |
 | ARC Raiders | `arc_get_wiki_page` | One wiki page as plain text + raw wikitext (infobox weapon stats); CC BY-SA 4.0 |
+| ROMs | `roms_list_systems` | Game systems in the ROM library (one FileBrowser directory per console) with sizes |
+| ROMs | `roms_browse` | List one library directory: subfolders + ROM files with parsed No-Intro title/tags; flags truncation |
+| ROMs | `roms_search` | Instant name search across the whole library via FileBrowser Quantum's index, optionally scoped to one system |
+| ROMs | `roms_get_download_url` | Verify a ROM exists and return its direct (session-authenticated) download URL + size/type |
 
 ### Home Assistant posture
 

@@ -76,6 +76,7 @@ async def request_json(
     service: str,
     params: dict[str, Any] | None = None,
     json: Any | None = None,
+    headers: dict[str, str] | None = None,
     expect_json: bool = True,
     unreachable_hint: str = "",
 ) -> Any:
@@ -90,7 +91,7 @@ async def request_json(
     params, bodies, headers, or auth.
     """
     try:
-        resp = await client.request(method, url, params=params, json=json)
+        resp = await client.request(method, url, params=params, json=json, headers=headers)
     except httpx.HTTPError as exc:
         log.warning("%s %s %s failed: %s", service, method, url, exc.__class__.__name__)
         raise ToolError(

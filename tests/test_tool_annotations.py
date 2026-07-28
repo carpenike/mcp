@@ -98,6 +98,11 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "ha_upsert_automation": (False, True, True),
     # POST to HA's check endpoint, but purely a validation read
     "ha_check_config": (True, False, True),
+    # ── roms (FileBrowser Quantum, read-only discovery) ──────────────
+    "roms_list_systems": (True, False, True),
+    "roms_browse": (True, False, True),
+    "roms_search": (True, False, True),
+    "roms_get_download_url": (True, False, True),
 }
 
 
