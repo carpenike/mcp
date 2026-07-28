@@ -445,7 +445,7 @@ class Settings(BaseSettings):
         default="",
         description=(
             "Base URL of the FileBrowser Quantum instance serving the ROM "
-            "library, e.g. 'http://10.4.0.10:8080' (no trailing slash "
+            "library, e.g. 'https://files.burnley.dev' (no trailing slash "
             "needed). Empty disables the roms_* tools — they return a "
             "configuration error instead of calling out."
         ),
