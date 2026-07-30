@@ -77,8 +77,7 @@ def register(mcp, settings):
         name="photos_search",  # namespaced: <category>_<verb>_<object>
         description="Search the immich photo library by free-text query.",
     )
-    async def search(query: str, limit: int = 10) -> dict:
-        ...
+    async def search(query: str, limit: int = 10) -> dict: ...
 ```
 
 **Naming convention:**
