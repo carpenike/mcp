@@ -173,6 +173,95 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
 | ARC Raiders | `arc_search_wiki` | Full-text search of the Embark-supported arcraiders.wiki |
 | ARC Raiders | `arc_get_wiki_page` | One wiki page as plain text + raw wikitext (infobox weapon stats); CC BY-SA 4.0 |
+| Finances | `finances_sync_status` | Per-account bank-data freshness with per-account staleness thresholds and an overall fresh/stale/dead verdict; optional `trigger_sync` — **call this first**, every other number depends on it |
+| Finances | `finances_monthly_summary` | One month's income, spend by category, total, and gap vs. the configured floor; excludes transfers/CC payments/off-budget; pro-rated pace mid-month; reports `uncategorized` as an explicit data-quality signal |
+| Finances | `finances_recurring` | Expected fixed obligations vs. what posted this month — MATCHED / CHANGED / MISSING / ENDED, from an operator-maintained config file |
+| Finances | `finances_trend` | Per-category monthly spend series + income series over the last N months; flags the current partial month |
+| Finances | `finances_debt_status` | HELOC/Synchrony/card balances, HELOC 7- and 30-day paydown deltas, creeping-revolving flags, and home equity when the mortgage balance is configured |
+| Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
+| Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
+| Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
+| Messaging | `signal_send` | Send a message to the ONE configured family Signal group; recipient is config-fixed and not a parameter |
+
+### Finances posture
+
+The `finances_*` tools are **read-only** and deterministic: they compute
+numbers, never prose or advice. Two deployment facts matter:
+
+- **They need the Actual sidecar** (`sidecar/`, `services.homelab-mcp.actualSidecar`).
+  Actual has no HTTP query API and no API keys, so a small Node service owns
+  the `@actual-app/api` client on loopback. Without it the finances tools
+  return a configuration error; nothing else is affected.
+- **`@actual-app/api` is pinned exactly and must never exceed the sync
+  server's version.** The client applies its bundled migrations to the budget
+  file, so a newer client migrates the file to a schema the server's own web
+  UI cannot read. This happened on 2026-07-30 via an unpinned
+  `npx -y actual-budget-mcp`. Check the server's `/info` before bumping.
+
+`finances_monthly_summary` returns `gap_vs_floor: null` until
+`HOMELAB_MCP_FINANCES_FLOOR` is set — that number is a household decision and
+the tool refuses to invent one.
+
+`finances_debt_status` needs no configuration: mortgage, HELOC and card
+balances are all synced accounts, so home equity is fully derived. The single
+hand-maintained figure in the system is the off-budget `House` valuation,
+updated quarterly at review. Equity is **display-only** per the finances repo's
+PLAN.md — it feeds the net-worth view and the HELOC scoreboard, never an
+affordability or spending decision. If the `House` or mortgage account can't be
+uniquely identified by name, equity is reported `null` with the reason rather
+than silently understating the debt side.
+
+### Paperless credential
+
+Use a **dedicated** paperless user + token (`HOMELAB_MCP_PAPERLESS_TOKEN`), not
+the admin's and not paperless-ai's — per-consumer tokens keep revocation
+surgical, and a superuser token would bypass paperless's object-level
+permissions entirely. Minimum grants for the three tools as implemented:
+
+| Permission | Needed by |
+|---|---|
+| `view_document` | `paperless_search`, `paperless_get` |
+| `change_document` | `paperless_link` (PATCHes `custom_fields`) |
+| `view_customfield` | `paperless_link` resolves field ids; documents return their fields |
+| `view_tag` | `paperless_search` resolves tag *names* via `/api/tags/` |
+
+`view_correspondent` is **not** required: correspondent filtering is a
+`correspondent__name__iexact` query parameter on `/api/documents/`, not a
+lookup against the correspondents endpoint.
+
+Two caveats worth knowing before provisioning:
+
+- `change_document` is a Django **model** permission, so it permits editing any
+  metadata on any accessible document — not just the one custom field. Django
+  has no field-level grants; this is the floor for a tool that writes.
+- Documents with an `owner` are invisible to a non-superuser unless explicitly
+  shared. Unowned documents are visible to any user with `view_document`. If
+  `paperless_search` returns zero results for something you can see as admin,
+  that's ownership, and it fails *silently* — no error, just an empty list.
+
+The `actual_txn` and `actual_account` custom fields must be **created once in
+paperless**. This service deliberately holds no `add_customfield` permission
+and reports a missing field as a configuration error rather than creating it.
+Only `actual_txn` is written here (by `paperless_link`); `actual_account` is
+the statement-level half of the join and is expected to be stamped by
+paperless-ai per the finances repo's ARCHITECTURE.md.
+
+### Restricted credentials (tool allowlisting)
+
+`HOMELAB_MCP_RESTRICTED_SCOPES` maps an OAuth scope to the exact tools a token
+carrying it may call (`src/homelab_mcp/scopes.py`). The shipped default is
+`hermes`, for the unattended weekly-pulse agent:
+
+```
+finances_sync_status · finances_monthly_summary · finances_recurring
+finances_debt_status · signal_send
+```
+
+A `hermes` token is refused at `tools/call` for anything else (fails closed)
+and those tools are filtered out of its `tools/list`. Tokens without a
+matching scope — interactive advisor sessions — keep full access. This makes
+the agent's compose-and-send-only remit structural rather than a prompt
+instruction.
 
 ### Home Assistant posture
 

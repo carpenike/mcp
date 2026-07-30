@@ -1,0 +1,17 @@
+{
+  "name": "homelab-mcp-actual-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Localhost-only HTTP bridge to Actual Budget for homelab-mcp's finances tools.",
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@actual-app/api": "26.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

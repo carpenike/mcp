@@ -1,0 +1,133 @@
+{
+  "_comment": [
+    "Expected fixed obligations for finances_recurring. Data, not code: correct an",
+    "amount or an end date here and redeploy the config, no Python change needed.",
+    "Seeded 2026-07-30 from the finances repo's PLAN.md 'Known fixed expenses' table.",
+    "",
+    "Fields per item:",
+    "  name             human label used in the checklist output",
+    "  amount           expected amount in DOLLARS (positive = money out)",
+    "  tolerance        +/- dollars still counted as MATCHED; use a wide band for",
+    "                   variable bills (utilities) so normal seasonality isn't",
+    "                   reported as CHANGED every month",
+    "  expected_day     day of month the charge normally posts (1-31), or null if",
+    "                   it floats; used only to order the checklist and to report",
+    "                   how far off a match landed",
+    "  match_any        payee substrings, case-insensitive. A transaction matches",
+    "                   if ANY substring appears in its payee OR notes. Actual's",
+    "                   payee strings are what SimpleFin delivers, so several of",
+    "                   these are deliberately ugly (see 'Elec Ext Loan').",
+    "  accounts         optional account-name substrings to restrict the search;",
+    "                   omit to search every on-budget account",
+    "  ends             final month the obligation is expected, 'YYYY-MM', or null",
+    "                   for open-ended. Past its end month the item is reported as",
+    "                   ENDED rather than MISSING, so a finished loan stops",
+    "                   generating false alarms forever."
+  ],
+
+  "account_stale_overrides": {
+    "Apple Card": 35
+  },
+
+  "items": [
+    {
+      "name": "Mortgage — Shellpoint/NewRez",
+      "amount": 2735.68,
+      "tolerance": 5.0,
+      "expected_day": 1,
+      "match_any": ["shellpoint", "newrez"],
+      "ends": null
+    },
+    {
+      "name": "Tesla Model Y — Santander",
+      "amount": 652.0,
+      "tolerance": 15.0,
+      "expected_day": 15,
+      "match_any": ["santander"],
+      "ends": null
+    },
+    {
+      "name": "HELOC payment — Spectra CU",
+      "amount": 650.0,
+      "tolerance": 150.0,
+      "expected_day": 1,
+      "match_any": ["elec ext loan", "ryan holt external", "spectra"],
+      "ends": null
+    },
+    {
+      "name": "Synchrony — Container Store (master closet)",
+      "amount": 291.0,
+      "tolerance": 10.0,
+      "expected_day": 15,
+      "match_any": ["synchrony", "container store"],
+      "accounts": ["Synchrony Container Store"],
+      "ends": "2028-02"
+    },
+    {
+      "name": "Synchrony — Music & Arts (saxophone)",
+      "amount": 97.0,
+      "tolerance": 10.0,
+      "expected_day": 1,
+      "match_any": ["synchrony", "music & arts", "music and arts"],
+      "accounts": ["Synchrony Music & Arts"],
+      "ends": "2026-11"
+    },
+    {
+      "name": "Phones — T-Mobile",
+      "amount": 270.0,
+      "tolerance": 60.0,
+      "expected_day": null,
+      "match_any": ["t-mobile", "tmobile"],
+      "ends": null
+    },
+    {
+      "name": "Phone/watch — Verizon",
+      "amount": 95.0,
+      "tolerance": 15.0,
+      "expected_day": null,
+      "match_any": ["verizon"],
+      "ends": null
+    },
+    {
+      "name": "Electric — FirstEnergy",
+      "amount": 608.0,
+      "tolerance": 300.0,
+      "expected_day": null,
+      "match_any": ["firstenergy", "first energy", "potomac edison"],
+      "ends": null
+    },
+    {
+      "name": "Internet — Starlink",
+      "amount": 70.0,
+      "tolerance": 15.0,
+      "expected_day": null,
+      "match_any": ["starlink", "spacex"],
+      "ends": null
+    },
+    {
+      "name": "USAA P&C insurance",
+      "amount": 96.0,
+      "tolerance": 25.0,
+      "expected_day": null,
+      "match_any": ["usaa p&c", "usaa insurance", "usaa gen indemnity"],
+      "ends": null
+    },
+    {
+      "name": "USAA life insurance",
+      "amount": 44.0,
+      "tolerance": 5.0,
+      "expected_day": null,
+      "match_any": ["usaa life"],
+      "ends": null
+    },
+    {
+      "name": "MacBook Pro installment (Apple Card)",
+      "amount": 200.33,
+      "tolerance": 5.0,
+      "expected_day": null,
+      "match_any": ["apple card monthly installment", "installment", "apple.com"],
+      "accounts": ["Apple Card"],
+      "ends": "2027-03"
+    }
+  ]
+}

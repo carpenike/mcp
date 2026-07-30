@@ -27,14 +27,36 @@
 #         HOMELAB_MCP_FEDERATION_BASE_URL   = "https://fedcook.holthome.net";
 #         HOMELAB_MCP_GATUS_BASE_URL        = "https://gatus.holthome.net";
 #         HOMELAB_MCP_GROCY_BASE_URL        = "https://grocy.holthome.net";
+#
+#         # finances / paperless / messaging (non-secret halves)
+#         HOMELAB_MCP_FINANCES_SIDECAR_BASE_URL = "http://127.0.0.1:9210";
+#         # The monthly floor is a household decision; while unset,
+#         # finances_monthly_summary reports gap_vs_floor as null rather
+#         # than inventing a target.
+#         # HOMELAB_MCP_FINANCES_FLOOR            = "8400";
+#         # No mortgage setting: it is a synced off-budget account in Actual,
+#         # so finances_debt_status reads it like every other balance.
+#         HOMELAB_MCP_PAPERLESS_BASE_URL        = "https://paperless.holthome.net";
+#         HOMELAB_MCP_SIGNAL_BASE_URL           = "http://127.0.0.1:8484";
+#         HOMELAB_MCP_SIGNAL_NUMBER             = "<E.164 registered number>";
+#         HOMELAB_MCP_SIGNAL_GROUP_ID           = "group.<base64 id>";
 #       };
 #
 #       # sops-managed file containing:
 #       #   HOMELAB_MCP_POCKETID_CLIENT_SECRET=<from PocketID admin UI>
 #       #   HOMELAB_MCP_GROCY_API_KEY=<from Grocy: Settings -> Manage API keys>
+#       #   HOMELAB_MCP_FINANCES_SIDECAR_TOKEN=<shared with the sidecar>
+#       #   HOMELAB_MCP_PAPERLESS_TOKEN=<dedicated paperless token>
 #       # and optionally:
 #       #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, escaped newlines>
 #       environmentFile = config.sops.secrets."homelab-mcp/env".path;
+#
+#       # The finances_* tools need this; everything else works without it.
+#       actualSidecar = {
+#         enable = true;
+#         serverUrl = "https://budget.holthome.net";
+#         environmentFile = config.sops.secrets."homelab-mcp/actual-env".path;
+#       };
 #     };
 #
 #     # Reverse proxy + tunnel handled separately in your nix-config.
@@ -139,6 +161,28 @@ in
             Required only if the grocy_* tools are used; without it those
             tools return a configuration error. Kept here (not in
             `settings`) because it is a secret.
+          HOMELAB_MCP_FINANCES_SIDECAR_TOKEN=<shared secret>
+            Must equal the sidecar's own SIDECAR_TOKEN. Defense in depth
+            behind the loopback bind: without it any local process could
+            read the household budget off the sidecar port.
+          HOMELAB_MCP_PAPERLESS_TOKEN=<paperless-ngx API token>
+            Use a DEDICATED token for a least-privilege `homelab-mcp`
+            service user (Django admin -> Tokens, or
+            `manage.py drf_create_token homelab-mcp`). Do not reuse
+            paperless-ai's or the admin's token — per-consumer tokens keep
+            revocation surgical, and a superuser token bypasses paperless's
+            object-level permissions entirely.
+
+            Grant exactly: view_document, change_document, view_customfield,
+            view_tag. NOT view_correspondent (correspondent filtering is a
+            query parameter, not an endpoint lookup) and NOT add_customfield
+            (the actual_txn / actual_account fields are declared once in
+            paperless; this service reports a missing field as a config
+            error rather than creating schema at runtime).
+
+            Note: documents with an `owner` are invisible to a non-superuser
+            unless shared, and that failure is silent — an empty result set,
+            not an error.
           HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA private PEM, PKCS#8, escaped \n>
             If absent, the service generates and persists a fresh 2048-bit
             RSA key at /var/lib/homelab-mcp/signing-key.pem (mode 0600).
@@ -150,6 +194,76 @@ in
       type = lib.types.enum [ "debug" "info" "warning" "error" "critical" ];
       default = "info";
       description = "Python logging level for the homelab-mcp process.";
+    };
+
+    actualSidecar = {
+      enable = lib.mkEnableOption ''
+        the Actual Budget sidecar backing the finances_* tools.
+
+        Actual has no HTTP query API and no API keys, so the Python tools
+        cannot talk to it directly. This runs a small Node service on
+        loopback that owns the `@actual-app/api` client, downloads the
+        (end-to-end encrypted) budget once, and answers account/transaction
+        queries. Without it the finances_* tools return a configuration
+        error; every other tool category is unaffected
+      '';
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.callPackage ./sidecar.nix { };
+        defaultText = lib.literalExpression "pkgs.callPackage ./nix/sidecar.nix { }";
+        description = ''
+          The sidecar package. Its `@actual-app/api` version is pinned in
+          `sidecar/package.json`; that version must NEVER exceed the running
+          Actual sync server's version, or the client migrates the budget
+          file to a schema the server's web UI cannot read.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 9210;
+        description = "Loopback port the sidecar listens on.";
+      };
+
+      serverUrl = lib.mkOption {
+        type = lib.types.str;
+        example = "https://budget.holthome.net";
+        description = "Base URL of the Actual sync server.";
+      };
+
+      syncTtlSeconds = lib.mkOption {
+        type = lib.types.int;
+        default = 300;
+        description = ''
+          How long a loaded budget is served before the next read re-syncs
+          it from the Actual server. Bank data itself refreshes roughly
+          daily, so this only bounds how stale the local copy can be
+          relative to the server.
+        '';
+      };
+
+      environmentFile = lib.mkOption {
+        type = lib.types.path;
+        description = ''
+          sops-managed EnvironmentFile for the sidecar. Root-readable only.
+
+          Required keys:
+            ACTUAL_PASSWORD=<the budget.holthome.net login password>
+            ACTUAL_BUDGET_SYNC_ID=<Settings -> Advanced -> Sync ID>
+            SIDECAR_TOKEN=<shared secret; must equal
+                           HOMELAB_MCP_FINANCES_SIDECAR_TOKEN>
+
+          Required when the budget file is end-to-end encrypted:
+            ACTUAL_ENCRYPTION_PASSWORD=<the file encryption password>
+
+          NOTE: Actual rate-limits /account/login at 5 FAILED attempts per
+          15 minutes. A wrong password here does not retry in-process — the
+          service exits and systemd backs off — but repeated restarts with
+          bad credentials will still lock the account out. Verify the values
+          before deploying.
+        '';
+      };
     };
 
     openFirewall = lib.mkOption {
@@ -238,6 +352,67 @@ in
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         MemoryMax = "256M";
         CPUQuota = "50%";
+        TasksMax = "32";
+      };
+    };
+
+    # ── Actual sidecar ────────────────────────────────────────────────
+    systemd.services.homelab-mcp-actual-sidecar = lib.mkIf cfg.actualSidecar.enable {
+      description = "Actual Budget sidecar for homelab-mcp finances tools";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      # homelab-mcp itself starts fine without this (finances_* just report a
+      # configuration error), so this is a soft ordering, not a Requires=.
+      before = [ "homelab-mcp.service" ];
+
+      environment = {
+        SIDECAR_HOST = "127.0.0.1";
+        SIDECAR_PORT = toString cfg.actualSidecar.port;
+        SIDECAR_SYNC_TTL_SECONDS = toString cfg.actualSidecar.syncTtlSeconds;
+        ACTUAL_SERVER_URL = cfg.actualSidecar.serverUrl;
+        # Holds the decrypted budget copy. Inside the service's own
+        # StateDirectory, which is 0700 and owned by the service user.
+        ACTUAL_DATA_DIR = "/var/lib/homelab-mcp-actual/budget";
+      };
+
+      serviceConfig = {
+        ExecStart = lib.getExe cfg.actualSidecar.package;
+        EnvironmentFile = cfg.actualSidecar.environmentFile;
+
+        # Deliberately slow restarts. A crash loop here would hammer
+        # /account/login, which locks out after 5 failures in 15 minutes.
+        Restart = "on-failure";
+        RestartSec = "60s";
+        StartLimitBurst = 3;
+        StartLimitIntervalSec = 900;
+
+        User = "homelab-mcp";
+        Group = "homelab-mcp";
+
+        StateDirectory = "homelab-mcp-actual";
+        StateDirectoryMode = "0700";
+
+        # Same hardening shape as the main service, minus
+        # MemoryDenyWriteExecute: V8 is a JIT and needs W+X pages.
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        NoNewPrivileges = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        CapabilityBoundingSet = [ "" ];
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        # The budget file plus better-sqlite3 need real headroom; 256M (the
+        # Python service's limit) OOM-kills this during the initial download.
+        MemoryMax = "1G";
+        CPUQuota = "75%";
         TasksMax = "32";
       };
     };
