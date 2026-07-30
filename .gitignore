@@ -42,6 +42,10 @@ result-*
 .env
 .env.local
 
+# Actual sidecar: package-lock.json IS committed (buildNpmPackage needs it and
+# it pins the exact @actual-app/api build), but installed deps are not.
+/sidecar/node_modules/
+
 # Fetched-at-build pocketid-mcp-as contract content. GitHub is the single
 # source of truth; hatch_build.py + the scripts pull these from upstream@ref
 # (see contract/PINNED.json). Never commit the contract content here.

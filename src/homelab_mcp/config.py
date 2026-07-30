@@ -383,6 +383,145 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Finances (Actual Budget, via the localhost Node sidecar) ─────
+    # Actual has no HTTP query API and no API keys, so the finances_* tools
+    # talk to the sidecar in `sidecar/` (see its header for why it exists and
+    # why @actual-app/api is version-pinned). Empty base URL disables the
+    # category — the tools return a configuration error instead of calling out.
+    finances_sidecar_base_url: str = Field(
+        default="http://127.0.0.1:9210",
+        description=(
+            "Base URL of the Actual sidecar. Loopback only — the sidecar holds "
+            "a decrypted copy of the household budget and must never be bound "
+            "to a routable interface. Set empty to disable the finances_* tools."
+        ),
+    )
+    finances_sidecar_token: str = Field(
+        default="",
+        description=(
+            "Shared token sent as `X-Sidecar-Token` on every sidecar request. "
+            "SECRET — supply via the sops-managed EnvironmentFile "
+            "(HOMELAB_MCP_FINANCES_SIDECAR_TOKEN). Defense in depth behind the "
+            "loopback bind: stops any other local process from reading the "
+            "budget. Must match the sidecar's own SIDECAR_TOKEN."
+        ),
+    )
+    finances_floor: float | None = Field(
+        default=None,
+        description=(
+            "Monthly spending floor in DOLLARS — the target the household's "
+            "monthly spend is measured against (PLAN.md's Bonus Dependence "
+            "Gap). Deliberately null by default: the number is a household "
+            "decision, and inventing one would produce confident, wrong "
+            "advice. While null, finances_monthly_summary reports "
+            "`gap_vs_floor: null` rather than guessing."
+        ),
+    )
+    # NOTE: there is deliberately no `finances_mortgage_balance` setting. The
+    # mortgage was linked as a synced off-budget account in Actual on
+    # 2026-07-30, so finances_debt_status reads it like every other balance.
+    # A hand-maintained copy would only be able to disagree with reality.
+    finances_recurring_config_path: str = Field(
+        default="",
+        description=(
+            "Path to a JSON file describing expected fixed obligations for "
+            "finances_recurring (schema: see tools/finances_recurring.json). "
+            "Data-driven so amounts, due days and end dates can be corrected "
+            "without a code change or redeploy. Empty uses the copy shipped "
+            "inside the package."
+        ),
+    )
+    finances_stale_days: int = Field(
+        default=3,
+        ge=1,
+        le=90,
+        description=(
+            "Days without a posted transaction before an on-budget account is "
+            "flagged stale by finances_sync_status. Per-account overrides live "
+            "in the recurring config's `account_stale_overrides` (Apple Card "
+            "gets 35: its SimpleFin feed is a monthly statement export, so a "
+            "3-day rule would cry wolf every month)."
+        ),
+    )
+
+    # ── Paperless-ngx ────────────────────────────────────────────────
+    paperless_base_url: str = Field(
+        default="",
+        description=(
+            "Base URL of the paperless-ngx instance, e.g. "
+            "'https://paperless.holthome.net'. Empty disables the paperless_* "
+            "tools — they return a configuration error instead of calling out."
+        ),
+    )
+    paperless_token: str = Field(
+        default="",
+        description=(
+            "paperless-ngx API token, sent as 'Authorization: Token <value>'. "
+            "SECRET — supply via the sops-managed EnvironmentFile "
+            "(HOMELAB_MCP_PAPERLESS_TOKEN). Use a DEDICATED token for a "
+            "least-privilege `homelab-mcp` service user rather than reusing "
+            "paperless-ai's or the admin's: per-consumer tokens keep "
+            "revocation surgical."
+        ),
+    )
+
+    # ── Messaging (signal-cli-rest-api) ──────────────────────────────
+    signal_base_url: str = Field(
+        default="",
+        description=(
+            "Base URL of signal-cli-rest-api, e.g. 'http://127.0.0.1:8484'. "
+            "Empty disables signal_send."
+        ),
+    )
+    signal_number: str = Field(
+        default="",
+        description=(
+            "Registered Signal number this service sends AS, E.164 format "
+            "(e.g. '+12405550100'). Must match a number registered in "
+            "signal-cli-rest-api."
+        ),
+    )
+    signal_group_id: str = Field(
+        default="",
+        description=(
+            "The ONLY recipient signal_send may target. Fixed in config, never "
+            "a tool parameter — the tool structurally cannot message an "
+            "arbitrary person, which is what makes it safe to hand to an "
+            "unattended agent."
+        ),
+    )
+    signal_max_message_chars: int = Field(
+        default=2000,
+        ge=1,
+        le=10000,
+        description="Maximum message length signal_send accepts before refusing.",
+    )
+
+    # ── Restricted-scope clients (hermes-agent) ──────────────────────
+    restricted_scopes: dict[str, list[str]] = Field(
+        default={
+            # hermes-agent composes the weekly pulse and sends it. It needs the
+            # four read summaries plus the transport, and nothing else: no raw
+            # transactions (finances_trend), no documents, no writes anywhere.
+            # Enforced at dispatch in `scopes.py`, not merely by convention.
+            "hermes": [
+                "finances_sync_status",
+                "finances_monthly_summary",
+                "finances_recurring",
+                "finances_debt_status",
+                "signal_send",
+            ],
+        },
+        description=(
+            "Map of scope name -> exact tool names a token carrying that scope "
+            "may call. A token whose `scope` claim names one of these keys is "
+            "restricted to that allowlist: every other tool is hidden from "
+            "tools/list and refused at tools/call. Tokens with no matching "
+            "scope (interactive advisor sessions) keep full access. Env value "
+            "is a JSON object."
+        ),
+    )
+
     # ── ARC Raiders (public game-data upstreams, no secrets) ─────────
     arcraiders_metaforge_base_url: str = Field(
         default="https://metaforge.app/api/arc-raiders",

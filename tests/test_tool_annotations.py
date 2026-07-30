@@ -98,6 +98,21 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "ha_upsert_automation": (False, True, True),
     # POST to HA's check endpoint, but purely a validation read
     "ha_check_config": (True, False, True),
+    # ── finances (Actual, read-only) ─────────────────────────────────
+    # trigger_sync=true reaches out to the banks, so not repeat-safe
+    "finances_sync_status": (True, False, False),
+    "finances_monthly_summary": (True, False, True),
+    "finances_recurring": (True, False, True),
+    "finances_trend": (True, False, True),
+    "finances_debt_status": (True, False, True),
+    # ── paperless ────────────────────────────────────────────────────
+    "paperless_search": (True, False, True),
+    "paperless_get": (True, False, True),
+    # sets one custom field; re-linking the same pair converges
+    "paperless_link": (False, False, True),
+    # ── messaging ────────────────────────────────────────────────────
+    # sending is a real-world side effect and a retry can double-post
+    "signal_send": (False, False, False),
 }
 
 

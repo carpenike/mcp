@@ -38,6 +38,10 @@
       packages = forAllSystems ({ pkgs, ... }: {
         default = mkPackage pkgs;
         homelab-mcp = mkPackage pkgs;
+        # The Actual Budget sidecar backing the finances_* tools. Separate
+        # package (Node, not Python) so a consumer that doesn't want the
+        # finances category never builds it. See nix/sidecar.nix.
+        actual-sidecar = pkgs.callPackage ./nix/sidecar.nix { };
       });
 
       # `nix run github:carpenike/mcp`
@@ -101,6 +105,7 @@
       # adding `inputs.homelab-mcp.overlays.default` to their nixpkgs.
       overlays.default = final: _prev: {
         homelab-mcp = mkPackage final;
+        homelab-mcp-actual-sidecar = final.callPackage ./nix/sidecar.nix { };
       };
     };
 }

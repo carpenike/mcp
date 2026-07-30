@@ -31,6 +31,7 @@ from homelab_mcp.auth import JWTAuthMiddleware
 from homelab_mcp.buildinfo import build_revision
 from homelab_mcp.config import Settings
 from homelab_mcp.oauth_state import OAuthState
+from homelab_mcp.scopes import ToolScopeMiddleware
 from homelab_mcp.tools import collect_instructions, register_all
 
 log = logging.getLogger("homelab_mcp")
@@ -246,6 +247,11 @@ def build_app(settings: Settings) -> Starlette:
     # request logger INNER of the JWT layer so it can read scope["user"] that
     # JWT auth sets — so add the logger FIRST, then JWT auth.
     app.add_middleware(RequestLogMiddleware)
+    # Tool allowlisting by token scope, also INNER of JWT auth (it reads the
+    # claims that layer sets) but OUTER of the logger, so a denied call is
+    # still logged as a request. See scopes.py for why this is enforced at
+    # dispatch rather than by prompt.
+    app.add_middleware(ToolScopeMiddleware, settings=settings)
     app.add_middleware(
         JWTAuthMiddleware,
         signing_key=key,
