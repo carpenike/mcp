@@ -142,6 +142,13 @@
       "                  reported under `notable_variances` even when MATCHED.",
       "min_tolerance     dollar floor, so small bills don't churn on rounding.",
       "expected_day      day of month it normally posts, or null if it floats.",
+      "window_slip_days  {before, after} — for drafts that straddle a month",
+      "                  boundary. Re-anchors the search window on expected_day",
+      "                  instead of the calendar month, so a payment that clears",
+      "                  on the 1st is credited to the month it is FOR. Windows",
+      "                  for consecutive months cannot overlap, so a payment is",
+      "                  never counted into two months. Omit it for bills that",
+      "                  post comfortably inside their month.",
       "match_any         payee substrings, case-insensitive, matched against",
       "                  payee OR notes. Several are deliberately ugly because",
       "                  that is what SimpleFin delivers.",
@@ -226,19 +233,20 @@
       },
       {
         "name": "USAA P&C insurance",
-        "amount": 96.0,
-        "tolerance_pct": 20.0,
-        "expected_day": null,
-        "match_any": ["usaa p&c", "usaa insurance", "usaa gen indemnity"],
-        "ends": null
+        "amount": 215.47,
+        "expected_day": 1,
+        "match_any": ["usaa p&c", "usaa property and casualty", "usaa gen indemnity"],
+        "ends": null,
+        "note": "ONE combined monthly draft covering two policies: auto $198.89/mo ($1,193.32 per 6-month term, both vehicles) plus jewelry personal-property $16.58/mo ($199/yr). 198.89 + 16.58 = 215.47 exactly. The jewelry policy WAS the entire draft until 2026-05-01, which is why the old baseline was $16.58; the auto policy joined it when Tesla Insurance was dropped. Observed: 16.58/mo Oct 2025-Apr 2026, then 215.51 (5/1), 215.47 (6/2), 215.47 (7/1). The auto side REPRICES ~Nov 2026 — the amount will change then, and that is expected rather than an anomaly. Tolerance is deliberately the standard 10%: unlike FirstEnergy this draft is contractually flat between repricings, so any variance is signal."
       },
       {
         "name": "USAA life insurance",
         "amount": 44.15,
-        "expected_day": null,
+        "expected_day": 28,
+        "window_slip_days": { "before": 3, "after": 4 },
         "match_any": ["usaa life insurance", "usaa.com pay int life"],
         "ends": null,
-        "note": "Two payee forms: the clean 'USAA Life Insurance' and the raw import descriptor 'USAA.COM PAY INT LIFE', which is followed by a masked account suffix. Matching is substring and case-insensitive, so the suffix is ignored and bank descriptor casing does not matter."
+        "note": "Drafts on the 28th and posts anywhere from the 28th to the 3rd of the following month, so its billing window is anchored on the 28th rather than the calendar month. Under calendar months the observed series (9/30, 10/30, 12/2, 12/30, 1/30, 3/3, 3/31, 4/30, 6/1, 6/30) read as three MISSING months (Nov, Feb, May) with three other months holding two payments — the charge attributed to the month it CLEARED rather than the one it is for. Consecutive anchored windows cannot overlap, so a slipped payment is claimable by exactly one month. Two payee forms: the clean 'USAA Life Insurance' and the raw descriptor 'USAA.COM PAY INT LIFE' + masked account, which lands in the NOTES field; matching spans payee and notes, substring and case-insensitive."
       },
       {
         "name": "MacBook Pro installment (Apple Card)",

@@ -917,3 +917,178 @@ def test_shipped_expectations_match_the_observed_charges() -> None:
     by_name = {i["name"]: i for i in items}
     assert by_name["USAA life insurance"]["amount"] == 44.15
     assert by_name["Mortgage — Shellpoint/NewRez"]["amount"] == 2735.68
+
+
+# ── month-boundary billing windows ───────────────────────────────────
+
+
+def test_shipped_usaa_pc_expectation_matches_the_observed_series() -> None:
+    """$215.47 = auto $198.89 + jewelry $16.58, observed May-Jul 2026."""
+    items = _shipped()["recurring"]["items"]
+    pc = next(i for i in items if i["name"] == "USAA P&C insurance")
+    assert pc["amount"] == 215.47
+    assert pc["amount"] == pytest.approx(198.89 + 16.58)
+    assert pc["expected_day"] == 1
+    # Contractually flat between repricings, so variance is signal — this one
+    # must NOT get a widened seasonal band the way FirstEnergy does.
+    assert "tolerance_pct" not in pc
+
+
+def test_shipped_usaa_life_has_a_boundary_window() -> None:
+    items = _shipped()["recurring"]["items"]
+    life = next(i for i in items if i["name"] == "USAA life insurance")
+    assert life["expected_day"] == 28
+    assert life["window_slip_days"] == {"before": 3, "after": 4}
+
+
+@pytest.mark.parametrize(
+    ("month", "posted"),
+    [
+        ("2025-10", "2025-10-30"),  # inside the month
+        ("2025-11", "2025-12-02"),  # slipped forward two days
+        ("2025-12", "2025-12-30"),  # December's own, not November's
+        ("2026-02", "2026-03-03"),  # slipped across a short month
+        ("2026-05", "2026-06-01"),
+        ("2026-06", "2026-06-30"),
+    ],
+)
+async def test_boundary_window_credits_the_month_it_is_for(
+    tmp_path: Any, httpx_mock: HTTPXMock, month: str, posted: str
+) -> None:
+    """The full observed USAA Life series, each posting to exactly one month."""
+    series = [
+        "2025-10-30",
+        "2025-12-02",
+        "2025-12-30",
+        "2026-01-30",
+        "2026-03-03",
+        "2026-03-31",
+        "2026-04-30",
+        "2026-06-01",
+        "2026-06-30",
+    ]
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id=d, date=d, amount_cents=-4_415, payee_name="USAA Life Insurance")
+                for d in series
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "USAA life",
+                "amount": 44.15,
+                "expected_day": 28,
+                "window_slip_days": {"before": 3, "after": 4},
+                "match_any": ["usaa life insurance"],
+                "ends": None,
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month=month)
+    row = out["obligations"][0]
+    assert row["status"] == "MATCHED"
+    assert row["posted_date"] == posted
+    assert row["delta"] == 0.0
+
+
+async def test_boundary_window_never_counts_one_payment_into_two_months(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Consecutive windows are disjoint, so no transaction is claimed twice."""
+    series = ["2025-12-02", "2025-12-30", "2026-06-01", "2026-06-30"]
+    item = {
+        "name": "USAA life",
+        "amount": 44.15,
+        "expected_day": 28,
+        "window_slip_days": {"before": 3, "after": 4},
+        "match_any": ["usaa life insurance"],
+        "ends": None,
+    }
+    seen: dict[str, list[str]] = {}
+    for month in ("2025-11", "2025-12", "2026-05", "2026-06"):
+        httpx_mock.add_response(
+            url=re.compile(re.escape(BASE) + r"/transactions.*"),
+            json={
+                "transactions": [
+                    _txn(id=d, date=d, amount_cents=-4_415, payee_name="USAA Life Insurance")
+                    for d in series
+                ]
+            },
+        )
+        out = await _rec_tools(tmp_path, [item])["finances_recurring"](month=month)
+        posted = out["obligations"][0].get("posted_date")
+        assert posted is not None
+        seen.setdefault(posted, []).append(month)
+    duplicated = {d: months for d, months in seen.items() if len(months) > 1}
+    assert duplicated == {}, f"transaction claimed by multiple months: {duplicated}"
+    # And each month found its own distinct payment.
+    assert sorted(seen) == series
+
+
+async def test_slipped_match_is_labelled_as_outside_the_month(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A reader seeing a December date under November needs to know why."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="a",
+                    date="2025-12-02",
+                    amount_cents=-4_415,
+                    payee_name="USAA Life Insurance",
+                )
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "USAA life",
+                "amount": 44.15,
+                "expected_day": 28,
+                "window_slip_days": {"before": 3, "after": 4},
+                "match_any": ["usaa life insurance"],
+                "ends": None,
+            }
+        ],
+    )
+    row = (await tools["finances_recurring"](month="2025-11"))["obligations"][0]
+    assert row["posted_outside_month"] is True
+    assert row["billing_window"] == ["2025-11-25", "2025-12-02"]
+
+
+async def test_items_without_a_slip_keep_calendar_month_scope(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """The window is opt-in; a bill that posts inside its month is unaffected."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id="a", date="2026-08-01", amount_cents=-21_547, payee_name="USAA P&C")
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "USAA P&C",
+                "amount": 215.47,
+                "expected_day": 1,
+                "match_any": ["usaa p&c"],
+                "ends": None,
+            }
+        ],
+    )
+    # August's charge must not be pulled back into July.
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["obligations"][0]["status"] == "MISSING"
