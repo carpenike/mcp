@@ -53,3 +53,6 @@ result-*
 /contract/CONTRACT.md
 /contract/.ref
 /src/homelab_mcp/_vendored/
+
+# Local Claude Code permission grants — never shared
+.claude/settings.local.json

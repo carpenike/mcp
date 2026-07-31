@@ -23,7 +23,7 @@ import json
 import logging
 import pathlib
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
 from mcp.types import ToolAnnotations
@@ -55,7 +55,13 @@ _RO_SYNC = ToolAnnotations(
 # from every spend figure this module produces.
 EXCLUDED_CATEGORY = "CC Payments & Transfers"
 
-_DEFAULT_RECURRING = pathlib.Path(__file__).with_name("finances_recurring.json")
+_DEFAULT_CONFIG = pathlib.Path(__file__).with_name("finances_config.json")
+
+# Feed cadences a `sync.accounts` entry may declare. "manual" accounts (the
+# Tesla loan, the house valuation) are maintained by hand and never sync, so
+# measuring their staleness is meaningless — they are excluded from the
+# verdict rather than permanently red.
+CADENCES = ("daily", "monthly", "manual")
 
 INSTRUCTIONS = """\
 finances_* tools read a self-hosted Actual Budget and return computed numbers,
@@ -95,6 +101,19 @@ def _month_bounds(month: str) -> tuple[date, date]:
     return first, date(year, mon, calendar.monthrange(year, mon)[1])
 
 
+def _classify(rate: float | None, hurdle: float) -> str:
+    """Bucket a debt by cost: worth accelerating, or cheap enough to ride.
+
+    An unconfigured rate stays "unknown" rather than defaulting either way.
+    Defaulting to "ride" would tell the household a 20%-APR carried card
+    balance is cheap money; defaulting to "accelerate" would cry wolf on every
+    grace-period card. Neither is a safe guess, so the tool asks instead.
+    """
+    if rate is None:
+        return "unknown"
+    return "accelerate" if rate > hurdle else "ride"
+
+
 def _shift_month(anchor: date, back: int) -> date:
     """First day of the month `back` months before `anchor`'s month."""
     total = anchor.year * 12 + (anchor.month - 1) - back
@@ -113,23 +132,50 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     client: httpx.AsyncClient = make_client(headers=headers, timeout=60.0)
 
     def _config() -> dict[str, Any]:
-        """Load the recurring-obligations config (operator file, else packaged)."""
-        path = pathlib.Path(settings.finances_recurring_config_path or _DEFAULT_RECURRING)
+        """Load the operator config (operator file, else the packaged copy)."""
+        path = pathlib.Path(settings.finances_config_path or _DEFAULT_CONFIG)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise ToolError(
                 "finances_config_unreadable",
-                f"Could not read the recurring-obligations config at {path}.",
-                "Check HOMELAB_MCP_FINANCES_RECURRING_CONFIG_PATH and that the file is valid JSON.",
+                f"Could not read the finances config at {path}.",
+                "Check HOMELAB_MCP_FINANCES_CONFIG_PATH and that the file is valid JSON.",
             ) from exc
         if not isinstance(data, dict):
             raise ToolError(
                 "finances_config_invalid",
-                "The recurring-obligations config must be a JSON object.",
+                "The finances config must be a JSON object.",
                 "",
             )
         return data
+
+    def _load_state() -> dict[str, Any] | None:
+        """Read the classification memo, or None if unavailable/absent."""
+        if not settings.finances_state_path:
+            return None
+        try:
+            return dict(
+                json.loads(pathlib.Path(settings.finances_state_path).read_text(encoding="utf-8"))
+            )
+        except FileNotFoundError:
+            return {}  # first run: readable location, nothing recorded yet
+        except (OSError, ValueError):
+            log.warning("finances state file unreadable — class-change detection disabled")
+            return None
+
+    def _save_state(state: dict[str, Any]) -> bool:
+        """Persist the classification memo. False if it couldn't be written."""
+        if not settings.finances_state_path:
+            return False
+        path = pathlib.Path(settings.finances_state_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            log.warning("could not write finances state to %s", path)
+            return False
+        return True
 
     async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
         if not base:
@@ -183,15 +229,18 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         annotations=_RO_SYNC,
         name="finances_sync_status",
         description=(
-            "Check how fresh the bank data behind every other finances tool is. "
-            "Returns, per on-budget account, the date of its most recent posted "
-            "transaction, how many days stale that is, and whether it breaches "
-            "its staleness threshold; plus an overall fresh/stale/dead verdict. "
-            "CALL THIS FIRST in any financial review or weekly pulse — a silent "
-            "sync outage makes every other number confidently wrong, and one has "
-            "happened before. Set trigger_sync=true to ask Actual to pull from "
-            "the banks before reporting (slower; use for an on-demand refresh, "
-            "not on every call)."
+            "Check whether the bank data behind every other finances tool is "
+            "actually being fed. Each account is judged against ITS OWN expected "
+            "cadence — daily feeds go stale in days, monthly statement exports "
+            "(Apple Card, Synchrony, HELOC, mortgage) are healthy for weeks, and "
+            "hand-maintained accounts are excluded entirely. The overall verdict "
+            "is the worst account relative to its own cadence, so a correctly "
+            "synced monthly feed never drags everything to 'dead'. Returns per "
+            "account: latest posted transaction, its age, the cadence applied, "
+            "and fresh/stale/dead. CALL THIS FIRST in any review or weekly pulse "
+            "— a silent sync outage makes every other number confidently wrong, "
+            "and one went unnoticed for seven months. Set trigger_sync=true to "
+            "pull from the banks first (slow; on-demand refresh only)."
         ),
     )
     async def sync_status(
@@ -217,12 +266,18 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 )
 
             cfg = _config()
-            overrides: dict[str, int] = dict(cfg.get("account_stale_overrides") or {})
+            sync_cfg = cfg.get("sync") or {}
+            cadence_of: dict[str, str] = dict(sync_cfg.get("accounts") or {})
+            max_age: dict[str, int] = dict(sync_cfg.get("cadence_max_age_days") or {})
+            default_cadence = str(sync_cfg.get("default_cadence") or "daily")
+            feed_stale_h = float(sync_cfg.get("feed_stale_hours", 26))
+            feed_dead_h = float(sync_cfg.get("feed_dead_hours", 72))
             accounts = await _accounts()
+            now = datetime.now(UTC)
             today = date.today()
-            # 120 days covers even the laziest monthly-statement feed, so an
-            # account with no recent activity is reported as an old date rather
-            # than indistinguishable from "never synced".
+            # 120 days covers even the laziest monthly feed, so an account with
+            # no recent activity reports an old date rather than being
+            # indistinguishable from "never synced".
             txns = await _transactions(today - timedelta(days=120), today)
         except ToolError as err:
             return err.payload()
@@ -234,34 +289,90 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 latest[aid] = t["date"]
 
         rows: list[dict[str, Any]] = []
+        manual: list[dict[str, Any]] = []
         for a in accounts:
-            if a["offbudget"] or a["closed"]:
+            if a["closed"]:
                 continue
-            threshold = int(overrides.get(a["name"], settings.finances_stale_days))
+            cadence = cadence_of.get(a["name"])
+            if cadence is None:
+                # Off-budget accounts are investments/valuations unless the
+                # operator explicitly declared a cadence for them; on-budget
+                # accounts default to the daily rule so a NEW account is
+                # monitored from day one rather than silently unwatched.
+                if a["offbudget"]:
+                    continue
+                cadence = default_cadence
+            if cadence not in CADENCES:
+                cadence = default_cadence
+
             last = latest.get(a["id"])
             days = (today - date.fromisoformat(last)).days if last else None
-            # No transactions in the whole lookback window, or far past the
-            # threshold, reads as a broken feed rather than a quiet month.
-            if days is None or days > threshold * 3:
-                status = "dead"
-            elif days > threshold:
-                status = "stale"
-            else:
-                status = "fresh"
-            rows.append(
-                {
-                    "account": a["name"],
-                    "latest_transaction_date": last,
-                    "days_stale": days,
-                    "threshold_days": threshold,
-                    "status": status,
-                    # Surfaced so a reader can see WHY Apple Card is judged
-                    # differently instead of assuming the tool is inconsistent.
-                    "threshold_is_override": a["name"] in overrides,
-                }
-            )
+            threshold = int(max_age.get(cadence, 3))
 
-        rows.sort(key=lambda r: (-(r["days_stale"] or 10_000), r["account"]))
+            # ACTIVITY: has anything posted lately? Informational only. A
+            # dormant card is not a broken feed, and conflating the two is
+            # what made the verdict permanently red.
+            if days is None:
+                activity = "none"
+            elif days > threshold:
+                activity = "quiet"
+            else:
+                activity = "active"
+
+            # FEED HEALTH: when did the bank feed last fetch? This is the
+            # signal the verdict is built on.
+            raw_sync = a.get("last_sync")
+            feed_age_h: float | None = None
+            if raw_sync:
+                try:
+                    fetched = datetime.fromtimestamp(int(raw_sync) / 1000.0, tz=UTC)
+                    feed_age_h = round((now - fetched).total_seconds() / 3600.0, 1)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    feed_age_h = None
+
+            row: dict[str, Any] = {
+                "account": a["name"],
+                "cadence": cadence,
+                "latest_transaction_date": last,
+                "days_since_last_transaction": days,
+                "activity": activity,
+                "activity_threshold_days": threshold,
+                "feed_age_hours": feed_age_h,
+            }
+
+            if cadence == "manual":
+                # Maintained by hand: it has no feed to be healthy or broken.
+                row["status"] = "manual"
+                row["basis"] = "manual"
+                manual.append(row)
+                continue
+
+            if feed_age_h is not None:
+                row["basis"] = "feed"
+                if feed_age_h > feed_dead_h:
+                    row["status"] = "dead"
+                elif feed_age_h > feed_stale_h:
+                    row["status"] = "stale"
+                else:
+                    row["status"] = "fresh"
+            else:
+                # No feed timestamp and not declared manual: fall back to
+                # activity, and say so, rather than passing it silently.
+                row["basis"] = "activity_fallback"
+                row["basis_note"] = (
+                    "No last_sync timestamp on this account, so feed health is "
+                    "inferred from transaction age — a weaker signal. Declare it "
+                    "'manual' in config if it is not bank-linked."
+                )
+                if days is None or days > threshold * 3:
+                    row["status"] = "dead"
+                elif days > threshold:
+                    row["status"] = "stale"
+                else:
+                    row["status"] = "fresh"
+            rows.append(row)
+
+        rows.sort(key=lambda r: (-(r["days_since_last_transaction"] or 10_000), r["account"]))
         overall = (
             "dead"
             if any(r["status"] == "dead" for r in rows)
@@ -273,7 +384,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "as_of": today.isoformat(),
             "overall_status": overall,
             "stale_accounts": [r["account"] for r in rows if r["status"] != "fresh"],
+            # Healthy feed, nothing posted lately. Normal for a dormant card —
+            # surfaced separately so it never reads as a sync failure.
+            "quiet_but_healthy": [
+                r["account"]
+                for r in rows
+                if r["status"] == "fresh" and r["activity"] in ("quiet", "none")
+            ],
             "accounts": rows,
+            # Reported separately so they are visibly excluded rather than
+            # quietly missing from the list.
+            "manual_accounts": manual,
             "sync_triggered": trigger_sync,
         }
 
@@ -388,11 +509,40 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             target = month or date.today().strftime("%Y-%m")
             first, last = _month_bounds(target)
             cfg = _config()
+            rec_cfg = cfg.get("recurring") or {}
+            cadence_of: dict[str, str] = dict(((cfg.get("sync") or {}).get("accounts")) or {})
             txns = await _transactions(first, last)
         except ToolError as err:
             return err.payload()
 
-        items = cfg.get("items") or []
+        default_pct = float(rec_cfg.get("default_tolerance_pct", 10.0))
+        min_tol = float(rec_cfg.get("min_tolerance", 5.0))
+        items = rec_cfg.get("items") or []
+        in_progress = first <= date.today() <= last
+
+        def _tolerance(item: dict[str, Any], expected: float) -> tuple[float, float]:
+            """(tolerance_dollars, pct_used) for an item."""
+            pct = float(item.get("tolerance_pct", default_pct))
+            return max(abs(expected) * pct / 100.0, min_tol), pct
+
+        # Accounts whose feed is a monthly statement drop. An obligation on one
+        # of these has simply not been reported yet between drops — that is not
+        # the same as unpaid, and calling it MISSING every month is what trained
+        # the alert away.
+        monthly_accounts = {n.lower() for n, c in cadence_of.items() if c == "monthly"}
+        accounts_with_activity = {
+            (t.get("account_name") or "").lower() for t in txns if t.get("account_name")
+        }
+
+        def _awaiting_statement(acct_filter: list[str]) -> bool:
+            """True if this item lives on a monthly account that hasn't reported yet."""
+            if not in_progress or not acct_filter:
+                return False
+            return any(
+                any(a in account for a in acct_filter) and account not in accounts_with_activity
+                for account in monthly_accounts
+            )
+
         # Sign depends on which side of the obligation we observe. A bill paid
         # from checking is a NEGATIVE amount there. The same obligation seen on
         # the liability account it services (Synchrony, a card) is a POSITIVE
@@ -410,7 +560,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 continue
 
             expected = float(item.get("amount", 0.0))
-            tol = float(item.get("tolerance", 0.0))
+            tol, pct_used = _tolerance(item, expected)
             needles = [str(s).lower() for s in (item.get("match_any") or [])]
             acct_filter = [str(s).lower() for s in (item.get("accounts") or [])]
 
@@ -447,28 +597,53 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     best = {**t, "_amt": amt}
 
             if best is None:
+                # On a monthly-statement account with no activity yet this
+                # month, the charge hasn't been REPORTED — which is not
+                # evidence it wasn't paid. Only say MISSING once the statement
+                # has actually dropped, or the month is over.
+                pending = _awaiting_statement(acct_filter)
                 rows.append(
                     {
                         "name": name,
-                        "status": "MISSING",
+                        "status": "PENDING_STATEMENT" if pending else "MISSING",
                         "expected_amount": expected,
                         "expected_day": item.get("expected_day"),
+                        **(
+                            {
+                                "note": (
+                                    "This account reports on a monthly statement export; "
+                                    "nothing has posted yet this cycle. Not evidence of "
+                                    "a missed payment."
+                                )
+                            }
+                            if pending
+                            else {}
+                        ),
                     }
                 )
                 continue
 
             claimed.add(best["id"])
             actual_amt = best["_amt"]
-            within = abs(actual_amt - expected) <= tol
+            delta = round(actual_amt - expected, 2)
+            delta_pct = round((delta / expected * 100.0), 1) if expected else None
+            within = abs(delta) <= tol
             posted = date.fromisoformat(best["date"])
+            # A widened band must never mean a silent price rise: anything past
+            # the DEFAULT band is called out even when its own override keeps
+            # the status MATCHED.
+            notable = delta_pct is not None and abs(delta_pct) > default_pct
             rows.append(
                 {
                     "name": name,
                     "status": "MATCHED" if within else "CHANGED",
                     "expected_amount": expected,
                     "actual_amount": actual_amt,
-                    "delta": round(actual_amt - expected, 2),
-                    "tolerance": tol,
+                    "delta": delta,
+                    "delta_pct": delta_pct,
+                    "tolerance": round(tol, 2),
+                    "tolerance_pct": pct_used,
+                    "notable_variance": notable,
                     "expected_day": item.get("expected_day"),
                     "posted_date": best["date"],
                     "posted_day": posted.day,
@@ -477,16 +652,37 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 }
             )
 
-        order = {"MISSING": 0, "CHANGED": 1, "MATCHED": 2, "ENDED": 3}
+        order = {"MISSING": 0, "CHANGED": 1, "PENDING_STATEMENT": 2, "MATCHED": 3, "ENDED": 4}
         rows.sort(key=lambda r: (order.get(str(r["status"]), 9), str(r["name"])))
         counts: dict[str, int] = defaultdict(int)
         for r in rows:
             counts[str(r["status"])] += 1
+        # Sorted by absolute percentage move so the biggest surprise leads.
+        notable_variances = sorted(
+            (
+                {
+                    "name": r["name"],
+                    "expected_amount": r["expected_amount"],
+                    "actual_amount": r["actual_amount"],
+                    "delta": r["delta"],
+                    "delta_pct": r["delta_pct"],
+                    "status": r["status"],
+                }
+                for r in rows
+                if r.get("notable_variance")
+            ),
+            key=lambda r: -abs(float(r["delta_pct"] or 0)),
+        )
         return {
             "month": target,
-            "month_in_progress": first <= date.today() <= last,
+            "month_in_progress": in_progress,
             "counts": dict(counts),
             "needs_attention": [r["name"] for r in rows if r["status"] in ("MISSING", "CHANGED")],
+            # Charges that moved more than the default band, INCLUDING ones a
+            # per-item override kept at MATCHED. The seasonal-bill escape hatch
+            # must not double as a way to hide a price rise.
+            "notable_variances": notable_variances,
+            "default_tolerance_pct": default_pct,
             "obligations": rows,
         }
 
@@ -551,25 +747,45 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         annotations=_RO,
         name="finances_debt_status",
         description=(
-            "The debt scoreboard: current balances of the mortgage, HELOC, the "
-            "Synchrony financed purchases and every credit card, plus total "
-            "debt and the HELOC's change over the last 7 and 30 days (the "
-            "paydown progress number). Flags any card carrying more than $500 "
-            "late in its cycle, which is the early signal that revolving "
-            "balances are creeping back after the July 2026 payoff. Also "
-            "reports home equity — house value minus mortgage minus HELOC, all "
-            "read from Actual. Use for the pulse's debt line and any "
-            "deleveraging discussion. Note equity is display-only: it is not an "
-            "affordability input."
+            "The debt scoreboard. Reports EVERY liability — mortgage, HELOC, car "
+            "loan, financed purchases and cards — including off-budget ones, "
+            "each with its balance, rate, and change over the last 7 and 30 "
+            "days. Classifies each debt as 'accelerate' (rate above the "
+            "configured hurdle, worth paying down early) or 'ride' (cheap money, "
+            "pay on schedule), and totals each group. Loudly flags any debt whose "
+            "classification changed since the last run — a variable-rate debt "
+            "crossing the hurdle must never pass unnoticed. Also reports home "
+            "equity (house minus mortgage minus HELOC) and flags cards carrying "
+            "a balance late in the cycle. Use for the pulse's debt line and any "
+            "deleveraging discussion. Equity is display-only, never an "
+            "affordability input. A debt whose rate is not configured is "
+            "classified 'unknown' rather than guessed at."
         ),
     )
     async def debt_status() -> dict[str, Any]:
         try:
+            cfg = _config()
+            hurdle = float(cfg.get("hurdle_rate", 5.0))
+            debt_cfg: dict[str, Any] = {
+                k: v for k, v in (cfg.get("debts") or {}).items() if not k.startswith("_")
+            }
             today = date.today()
             accounts = await _accounts()
             txns = await _transactions(today - timedelta(days=31), today)
         except ToolError as err:
             return err.payload()
+
+        def _is_account_setup(t: dict[str, Any]) -> bool:
+            """True for Actual's opening-balance entry, which isn't debt movement.
+
+            Linking an account writes a single 'Starting Balance' transaction
+            for its whole balance. Counted as activity, a newly-linked loan
+            reads as the household taking on the entire debt this month — the
+            Tesla loan showed a $43,685.88 30-day 'change' the day it was added.
+            """
+            return (t.get("payee_name") or "").strip().lower() == "starting balance" or (
+                t.get("category_name") or ""
+            ).strip().lower() == "starting balances"
 
         # Reconstruct historical balances by unwinding recent activity from the
         # current balance. Actual has no as-of-date balance API, and deriving it
@@ -578,7 +794,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             delta = sum(
                 int(t["amount_cents"])
                 for t in txns
-                if t["account_id"] == account_id and date.fromisoformat(t["date"]) > cutoff
+                if t["account_id"] == account_id
+                and date.fromisoformat(t["date"]) > cutoff
+                and not _is_account_setup(t)
             )
             return current_cents - delta
 
@@ -590,59 +808,99 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             hits = [a for a in open_accounts if needle in a["name"].lower()]
             return hits[0] if len(hits) == 1 else None
 
-        heloc = _find("heloc")
-        # The mortgage is off-budget (it services the house, it isn't monthly
-        # cashflow), so it is looked up by name rather than swept up by the
-        # on-budget loop below.
-        mortgage = _find("mortgage")
-
         debts: list[dict[str, Any]] = []
+        unlisted: list[dict[str, Any]] = []
         cards_flagged: list[str] = []
 
-        for a in accounts:
-            if a["closed"] or a["offbudget"]:
-                continue
+        for a in open_accounts:
             cents = a["balance_cents"]
             if cents >= 0:
-                continue  # asset-side account, not debt
-            row: dict[str, Any] = {"account": a["name"], "balance": _d(cents)}
-            # A card is "creeping back" if it carries a real balance this late
-            # in the month — before ~day 25 an unpaid statement is just normal
-            # cycle activity, not revolving debt. Instalment/credit-line
-            # accounts carry a balance by design and must never be flagged.
-            name = a["name"].lower()
-            is_card = "synchrony" not in name and "heloc" not in name and "mortgage" not in name
-            if is_card and -cents > 50_000 and today.day > 25:
+                continue  # asset side — never debt, whatever the config says
+            meta = debt_cfg.get(a["name"])
+            if meta is None:
+                # A negative balance we were not told about. Reported rather
+                # than dropped: silently omitting a liability is precisely the
+                # defect that hid the Tesla loan.
+                unlisted.append({"account": a["name"], "balance": _d(cents)})
+                continue
+
+            raw_rate = meta.get("rate")
+            rate = float(raw_rate) if raw_rate is not None else None
+            klass = _classify(rate, hurdle)
+
+            b7 = balance_as_of(a["id"], cents, today - timedelta(days=7))
+            b30 = balance_as_of(a["id"], cents, today - timedelta(days=30))
+            row: dict[str, Any] = {
+                "account": a["name"],
+                "balance": _d(cents),
+                "rate": rate,
+                "is_variable": bool(meta.get("is_variable")),
+                "scheduled_payment": meta.get("scheduled_payment"),
+                "class": klass,
+                "offbudget": bool(a["offbudget"]),
+                # Negative change = balance moved toward zero = paydown.
+                "change_7d": _d(cents - b7),
+                "change_30d": _d(cents - b30),
+            }
+            if meta.get("note"):
+                row["note"] = meta["note"]
+
+            # "Creeping back" only means something for revolving credit, and
+            # only late in the cycle — before ~day 25 an unpaid statement is
+            # normal. Instalment and credit-line debt carry balances by design.
+            name_l = a["name"].lower()
+            revolving = not any(k in name_l for k in ("heloc", "mortgage", "loan", "synchrony"))
+            if revolving and -cents > 50_000 and today.day > 25:
                 row["flag"] = "balance over $500 late in the cycle — revolving may be returning"
                 cards_flagged.append(a["name"])
             debts.append(row)
-        heloc_block: dict[str, Any] | None = None
-        if heloc:
-            cur = heloc["balance_cents"]
-            b7 = balance_as_of(heloc["id"], cur, today - timedelta(days=7))
-            b30 = balance_as_of(heloc["id"], cur, today - timedelta(days=30))
-            heloc_block = {
-                "account": heloc["name"],
-                "balance": _d(cur),
-                "balance_7d_ago": _d(b7),
-                "balance_30d_ago": _d(b30),
-                # Negative change = balance moved toward zero = paydown.
-                "change_7d": _d(cur - b7),
-                "change_30d": _d(cur - b30),
-            }
 
-        # Home equity is entirely derived now that the mortgage is a synced
-        # account: every input except the house valuation comes from Actual.
-        # If an account can't be identified we report null and say which one —
-        # a silently stale hand-maintained number was the failure mode this
-        # replaced, and guessing would reintroduce it.
+        debts.sort(key=lambda r: r["balance"])
+
+        # ── classification change detection ───────────────────────────
+        current_classes = {r["account"]: r["class"] for r in debts}
+        state = _load_state()
+        class_changes: list[dict[str, Any]] = []
+        change_detection = "unavailable"
+        if state is not None:
+            previous = dict(state.get("classes") or {})
+            prev_hurdle = state.get("hurdle_rate")
+            for account, klass in sorted(current_classes.items()):
+                was = previous.get(account)
+                if was is not None and was != klass:
+                    row = next(r for r in debts if r["account"] == account)
+                    class_changes.append(
+                        {
+                            "account": account,
+                            "was": was,
+                            "now": klass,
+                            "rate": row["rate"],
+                            "is_variable": row["is_variable"],
+                            "hurdle_rate": hurdle,
+                            "previous_hurdle_rate": prev_hurdle,
+                        }
+                    )
+            change_detection = "active" if previous else "baseline"
+            if not _save_state(
+                {
+                    "classes": current_classes,
+                    "hurdle_rate": hurdle,
+                    "evaluated_on": today.isoformat(),
+                }
+            ):
+                change_detection = "read_only"
+
+        # ── equity ────────────────────────────────────────────────────
+        # Fully derived: every input except the House valuation comes from
+        # Actual. If an account can't be identified we report null and say
+        # which — a silently stale number was the failure mode this replaced.
         equity: float | None = None
         equity_note = None
         house = by_name.get("House")
+        mortgage = _find("mortgage")
+        heloc = _find("heloc")
         missing = [
-            label
-            for label, account in (("House", house), ("Mortgage", mortgage))
-            if account is None
+            label for label, acct in (("House", house), ("Mortgage", mortgage)) if acct is None
         ]
         if missing:
             equity_note = (
@@ -652,35 +910,45 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             )
         else:
             assert house is not None and mortgage is not None
-            # Both mortgage and HELOC balances are negative, so adding them
-            # subtracts the debt.
+            # Both balances are negative, so adding them subtracts the debt.
             heloc_cents = heloc["balance_cents"] if heloc else 0
             equity = round(
                 _d(house["balance_cents"]) + _d(mortgage["balance_cents"]) + _d(heloc_cents),
                 2,
             )
 
-        # Every liability in the budget, on- and off-budget alike. The mortgage
-        # only became visible here once it was linked as a synced account.
-        total_debt_cents = sum(
-            int(a["balance_cents"]) for a in open_accounts if a["balance_cents"] < 0
-        )
+        def _total(cls: str) -> float:
+            return round(sum(float(r["balance"]) for r in debts if r["class"] == cls), 2)
 
+        unlisted_total = round(sum(float(r["balance"]) for r in unlisted), 2)
         return {
             "as_of": today.isoformat(),
-            "debts": sorted(debts, key=lambda r: r["balance"]),
-            "heloc": heloc_block,
-            "mortgage": (
-                {"account": mortgage["name"], "balance": _d(mortgage["balance_cents"])}
-                if mortgage
-                else None
-            ),
-            "cards_flagged": cards_flagged,
-            "total_debt": _d(total_debt_cents),
+            "hurdle_rate": hurdle,
+            "debts": debts,
+            "accelerate_total": _total("accelerate"),
+            "ride_total": _total("ride"),
+            "unknown_total": _total("unknown"),
+            # Everything with a negative balance, listed or not, so this figure
+            # can never be quietly smaller than reality.
+            "total_debt": round(sum(float(r["balance"]) for r in debts) + unlisted_total, 2),
             "home_equity": equity,
             "home_equity_note": equity_note,
-            # The only hand-maintained figure left in the system: updated
-            # quarterly at review. Display-only per PLAN.md — equity never
-            # feeds an affordability or spending decision.
             "house_value": _d(house["balance_cents"]) if house else None,
+            "cards_flagged": cards_flagged,
+            # LOUD by design: a variable-rate debt crossing the hurdle changes
+            # the household's whole payoff priority.
+            "class_changes": class_changes,
+            "class_change_alert": bool(class_changes),
+            # active = compared against a prior run; baseline = first run, so
+            # nothing to compare; read_only/unavailable = the memo could not be
+            # persisted, so a future change might go undetected.
+            "class_change_detection": change_detection,
+            "unlisted_negative_accounts": unlisted,
+            "unlisted_note": (
+                "These carry a negative balance but have no entry in the config's "
+                "`debts` section, so they are uncategorized and unclassified. Add "
+                "them (with a rate) to bring them into the accelerate/ride split."
+            )
+            if unlisted
+            else None,
         }

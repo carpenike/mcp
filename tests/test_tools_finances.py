@@ -11,8 +11,10 @@ All upstream calls are mocked — the real sidecar is never contacted from CI.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -207,133 +209,218 @@ async def test_bad_month_returns_structured_error(
     assert out["error"]["code"] == "finances_bad_month"
 
 
-# ── staleness ────────────────────────────────────────────────────────
+# ── sync health vs activity ──────────────────────────────────────────
 
 
-async def test_sync_status_flags_stale_account_against_a_fixed_cutoff(
-    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A frozen 'today' makes the threshold arithmetic assertable."""
+def _sync_accounts() -> dict[str, Any]:
+    """Accounts carrying a `last_sync` epoch-ms, as the sidecar returns them."""
+    fresh = int(datetime(2026, 7, 31, 4, 0, tzinfo=UTC).timestamp() * 1000)
+    old = int(datetime(2026, 7, 20, 4, 0, tzinfo=UTC).timestamp() * 1000)
+    return {
+        "accounts": [
+            # Healthy feed, busy account.
+            {
+                "id": "chk",
+                "name": "USAA Checking",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": 5_844_708,
+                "last_sync": fresh,
+            },
+            # Healthy feed, DORMANT: no transactions for months. Must not be
+            # called a sync failure — this is the defect that kept the overall
+            # verdict permanently "dead".
+            {
+                "id": "saph",
+                "name": "Chase Sapphire",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": 9_500,
+                "last_sync": fresh,
+            },
+            # Monthly statement feed, healthy.
+            {
+                "id": "apple",
+                "name": "Apple Card",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": -9_308,
+                "last_sync": fresh,
+            },
+            # Genuinely broken feed: no fetch in 11 days.
+            {
+                "id": "citi",
+                "name": "Citi Costco",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": -22_473,
+                "last_sync": old,
+            },
+            # Hand-maintained: no feed at all.
+            {
+                "id": "tesla",
+                "name": "Tesla Loan (Santander)",
+                "offbudget": True,
+                "closed": False,
+                "balance_cents": -4_368_588,
+                "last_sync": None,
+            },
+        ]
+    }
+
+
+def _sync_cfg(tmp_path: Any) -> str:
+    cfg = tmp_path / "fin.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "sync": {
+                    "feed_stale_hours": 26,
+                    "feed_dead_hours": 72,
+                    "default_cadence": "daily",
+                    "cadence_max_age_days": {"daily": 3, "monthly": 35},
+                    "accounts": {
+                        "USAA Checking": "daily",
+                        "Chase Sapphire": "daily",
+                        "Citi Costco": "daily",
+                        "Apple Card": "monthly",
+                        "Tesla Loan (Santander)": "manual",
+                    },
+                },
+                "recurring": {"items": []},
+            }
+        )
+    )
+    return str(cfg)
+
+
+def _mk(tmp_path: Any, **over: Any) -> dict[str, Callable[..., Any]]:
+    cfg: dict[str, Any] = {
+        "_env_file": None,
+        "oauth_required": False,
+        "finances_sidecar_base_url": BASE,
+        "finances_config_path": _sync_cfg(tmp_path),
+        "finances_state_path": str(tmp_path / "state.json"),
+    }
+    cfg.update(over)
+    mcp = CapturingMCP()
+    register(mcp, Settings(**cfg))  # type: ignore[arg-type]
+    return mcp.tools
+
+
+@pytest.fixture
+def frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin 'now' so feed ages and transaction ages are assertable."""
     import homelab_mcp.tools.finances as fin
 
     class FrozenDate(fin.date):  # type: ignore[misc,valid-type]
         @classmethod
         def today(cls) -> Any:
-            return fin.date(2026, 7, 30)
+            return fin.date(2026, 7, 31)
+
+    class FrozenDT(fin.datetime):  # type: ignore[misc,valid-type]
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            return fin.datetime(2026, 7, 31, 12, 0, tzinfo=tz or UTC)
 
     monkeypatch.setattr(fin, "date", FrozenDate)
+    monkeypatch.setattr(fin, "datetime", FrozenDT)
 
-    httpx_mock.add_response(url=f"{BASE}/accounts", json=_accounts())
+
+async def test_dormant_account_with_a_healthy_feed_is_not_stale(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """The headline defect: activity age is not sync health."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_sync_accounts())
     httpx_mock.add_response(
         url=re.compile(re.escape(BASE) + r"/transactions.*"),
         json={
             "transactions": [
-                # Fresh: today.
                 _txn(id="1", account_id="chk", date="2026-07-30"),
-                # 21 days stale against the default 3-day threshold.
-                _txn(id="2", account_id="heloc", date="2026-07-09"),
-                # 30 days stale, but Apple Card's override allows 35.
-                _txn(id="3", account_id="apple", date="2026-06-30"),
+                # Chase Sapphire: nothing at all in the window.
+                _txn(id="2", account_id="apple", date="2026-07-05"),
+                _txn(id="3", account_id="citi", date="2026-07-29"),
             ]
         },
     )
-    out = await tools["finances_sync_status"]()
+    out = await _mk(tmp_path)["finances_sync_status"]()
     rows = {r["account"]: r for r in out["accounts"]}
 
-    assert rows["USAA Checking"]["days_stale"] == 0
-    assert rows["USAA Checking"]["status"] == "fresh"
+    saph = rows["Chase Sapphire"]
+    assert saph["status"] == "fresh"  # feed fetched 8h ago
+    assert saph["activity"] == "none"  # but nothing has posted
+    assert saph["basis"] == "feed"
+    assert "Chase Sapphire" in out["quiet_but_healthy"]
+    assert "Chase Sapphire" not in out["stale_accounts"]
 
-    assert rows["Spectra HELOC"]["days_stale"] == 21
-    assert rows["Spectra HELOC"]["status"] == "dead"  # > 3x threshold
 
-    # The override is the point: a 3-day rule would flag this every month.
-    assert rows["Apple Card"]["days_stale"] == 30
-    assert rows["Apple Card"]["threshold_days"] == 35
-    assert rows["Apple Card"]["threshold_is_override"] is True
-    assert rows["Apple Card"]["status"] == "fresh"
-
-    # Off-budget accounts are not sync-monitored.
-    assert "House" not in rows
+async def test_verdict_is_driven_by_feed_age_not_transaction_age(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_sync_accounts())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": [_txn(id="3", account_id="citi", date="2026-07-30")]},
+    )
+    out = await _mk(tmp_path)["finances_sync_status"]()
+    rows = {r["account"]: r for r in out["accounts"]}
+    # Citi posted a transaction yesterday but its FEED hasn't run in 11 days —
+    # transaction age would call this healthy; it isn't.
+    assert rows["Citi Costco"]["activity"] == "active"
+    assert rows["Citi Costco"]["status"] == "dead"
     assert out["overall_status"] == "dead"
+
+
+async def test_manual_account_is_excluded_from_the_verdict(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    accounts = _sync_accounts()
+    accounts["accounts"] = [a for a in accounts["accounts"] if a["id"] != "citi"]
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=accounts)
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+    )
+    out = await _mk(tmp_path)["finances_sync_status"]()
+    assert [m["account"] for m in out["manual_accounts"]] == ["Tesla Loan (Santander)"]
+    assert all(r["account"] != "Tesla Loan (Santander)" for r in out["accounts"])
+    # A hand-maintained loan must never drag the verdict down.
+    assert out["overall_status"] == "fresh"
+
+
+async def test_missing_last_sync_falls_back_to_activity_and_says_so(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    accounts = _sync_accounts()
+    for a in accounts["accounts"]:
+        if a["id"] == "chk":
+            a["last_sync"] = None
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=accounts)
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": [_txn(id="1", account_id="chk", date="2026-07-30")]},
+    )
+    out = await _mk(tmp_path)["finances_sync_status"]()
+    row = {r["account"]: r for r in out["accounts"]}["USAA Checking"]
+    assert row["basis"] == "activity_fallback"
+    assert "last_sync" in row["basis_note"]
+    assert row["status"] == "fresh"
 
 
 # ── recurring ────────────────────────────────────────────────────────
 
 
-async def test_recurring_matches_payment_on_the_liability_account(
-    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock, tmp_path: Any
-) -> None:
-    """A payment toward a card/loan is a POSITIVE amount on that account."""
-    import json
-
+def _rec_cfg(tmp_path: Any, items: list[dict[str, Any]], **rec: Any) -> str:
     cfg = tmp_path / "rec.json"
-    cfg.write_text(
-        json.dumps(
-            {
-                "items": [
-                    {
-                        "name": "Synchrony",
-                        "amount": 291.0,
-                        "tolerance": 5.0,
-                        "match_any": ["synchrony"],
-                        "accounts": ["Synchrony Container Store"],
-                        "ends": None,
-                    }
-                ]
-            }
-        )
-    )
-    monkey = Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        oauth_required=False,
-        finances_sidecar_base_url=BASE,
-        finances_recurring_config_path=str(cfg),
-    )
-    mcp = CapturingMCP()
-    register(mcp, monkey)  # type: ignore[arg-type]
-
-    httpx_mock.add_response(
-        url=re.compile(re.escape(BASE) + r"/transactions.*"),
-        json={
-            "transactions": [
-                _txn(
-                    id="p",
-                    date="2026-07-15",
-                    amount_cents=29_200,  # positive: paying the balance down
-                    account_id="syn",
-                    account_name="Synchrony Container Store",
-                    payee_name="Payment",
-                )
-            ]
-        },
-    )
-    out = await mcp.tools["finances_recurring"](month="2026-07")
-    row = out["obligations"][0]
-    assert row["status"] == "MATCHED"
-    assert row["actual_amount"] == 292.0
+    body: dict[str, Any] = {
+        "sync": {"accounts": {"Apple Card": "monthly", "USAA Checking": "daily"}},
+        "recurring": {"default_tolerance_pct": 10.0, "min_tolerance": 5.0, "items": items},
+    }
+    body["recurring"].update(rec)
+    cfg.write_text(json.dumps(body))
+    return str(cfg)
 
 
-async def test_recurring_reports_ended_not_missing_past_end_month(
-    httpx_mock: HTTPXMock, tmp_path: Any
-) -> None:
-    import json
-
-    cfg = tmp_path / "rec.json"
-    cfg.write_text(
-        json.dumps(
-            {
-                "items": [
-                    {
-                        "name": "Saxophone",
-                        "amount": 97.0,
-                        "tolerance": 5.0,
-                        "match_any": ["music"],
-                        "ends": "2026-11",
-                    }
-                ]
-            }
-        )
-    )
+def _rec_tools(tmp_path: Any, items: list[dict[str, Any]], **rec: Any) -> Any:
     mcp = CapturingMCP()
     register(
         mcp,  # type: ignore[arg-type]
@@ -341,13 +428,153 @@ async def test_recurring_reports_ended_not_missing_past_end_month(
             _env_file=None,  # type: ignore[call-arg]
             oauth_required=False,
             finances_sidecar_base_url=BASE,
-            finances_recurring_config_path=str(cfg),
+            finances_config_path=_rec_cfg(tmp_path, items, **rec),
         ),
     )
+    return mcp.tools
+
+
+async def test_tolerance_is_proportional_not_flat(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """FirstEnergy at +45% used to read MATCHED against a flat +/-$300 band."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id="e", date="2026-07-16", amount_cents=-87_906, payee_name="FirstEnergy")
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Electric", "amount": 608.0, "match_any": ["firstenergy"], "ends": None}],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    row = out["obligations"][0]
+    assert row["status"] == "CHANGED"  # 44.6% > the 10% default band
+    assert row["delta"] == pytest.approx(271.06)
+    assert row["delta_pct"] == pytest.approx(44.6, abs=0.1)
+
+
+async def test_widened_band_still_surfaces_the_delta(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """A seasonal override may change the STATUS but must never hide the move."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id="e", date="2026-07-16", amount_cents=-87_906, payee_name="FirstEnergy")
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "Electric",
+                "amount": 608.0,
+                "tolerance_pct": 55.0,
+                "match_any": ["firstenergy"],
+                "ends": None,
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    row = out["obligations"][0]
+    assert row["status"] == "MATCHED"  # inside its own widened band
+    assert row["notable_variance"] is True  # but still called out
+    assert [v["name"] for v in out["notable_variances"]] == ["Electric"]
+
+
+async def test_monthly_account_reports_pending_statement_not_missing(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Apple Card's installment between statement drops is not a missed payment."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": [_txn(id="x", account_name="USAA Checking")]},
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "MacBook installment",
+                "amount": 200.33,
+                "match_any": ["installment"],
+                "accounts": ["Apple Card"],
+                "ends": "2027-03",
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    row = out["obligations"][0]
+    assert row["status"] == "PENDING_STATEMENT"
+    assert "monthly statement" in row["note"]
+    # PENDING is not a problem, so it must not page anyone.
+    assert out["needs_attention"] == []
+
+
+async def test_daily_account_with_nothing_posted_is_still_missing(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """The pending-statement escape hatch must not swallow a real miss."""
     httpx_mock.add_response(
         url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
     )
-    out = await mcp.tools["finances_recurring"](month="2026-12")
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Verizon", "amount": 95.0, "match_any": ["verizon"], "ends": None}],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["obligations"][0]["status"] == "MISSING"
+    assert out["needs_attention"] == ["Verizon"]
+
+
+async def test_recurring_matches_payment_on_the_liability_account(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A payment toward a card/loan is a POSITIVE amount on that account."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="p",
+                    date="2026-07-15",
+                    amount_cents=29_200,
+                    account_id="syn",
+                    account_name="Synchrony Container Store",
+                    payee_name="Payment",
+                )
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "Synchrony",
+                "amount": 291.0,
+                "match_any": ["synchrony"],
+                "accounts": ["Synchrony Container Store"],
+                "ends": None,
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["obligations"][0]["status"] == "MATCHED"
+    assert out["obligations"][0]["actual_amount"] == 292.0
+
+
+async def test_recurring_reports_ended_not_missing_past_end_month(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Saxophone", "amount": 97.0, "match_any": ["music"], "ends": "2026-11"}],
+    )
+    out = await tools["finances_recurring"](month="2026-12")
     # A finished loan must stop generating MISSING alarms forever.
     assert out["obligations"][0]["status"] == "ENDED"
     assert out["needs_attention"] == []
@@ -356,56 +583,74 @@ async def test_recurring_reports_ended_not_missing_past_end_month(
 # ── debt ─────────────────────────────────────────────────────────────
 
 
-async def test_debt_status_equity_is_fully_derived_from_actual(
-    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
-) -> None:
-    """No config input: house, mortgage and HELOC all come from the budget."""
-    httpx_mock.add_response(url=f"{BASE}/accounts", json=_accounts())
-    httpx_mock.add_response(
-        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
-    )
-    out = await tools["finances_debt_status"]()
-    # 850,000.00 - 392,172.46 - 109,290.04
-    assert out["home_equity"] == pytest.approx(348_537.50)
-    assert out["mortgage"]["balance"] == -392_172.46
-    assert out["heloc"]["balance"] == -109_290.04
-    assert out["house_value"] == 850_000.0
-    assert out["home_equity_note"] is None
+def _debt_accounts() -> dict[str, Any]:
+    return {
+        "accounts": [
+            {
+                "id": "heloc",
+                "name": "Spectra HELOC",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": -10_929_004,
+            },
+            {
+                "id": "mortgage",
+                "name": "Mortgage (NewRez)",
+                "offbudget": True,
+                "closed": False,
+                "balance_cents": -39_217_246,
+            },
+            # Off-budget AND manual — the liability that used to be invisible.
+            {
+                "id": "tesla",
+                "name": "Tesla Loan (Santander)",
+                "offbudget": True,
+                "closed": False,
+                "balance_cents": -4_368_588,
+            },
+            {
+                "id": "amex",
+                "name": "Amex Platinum",
+                "offbudget": False,
+                "closed": False,
+                "balance_cents": -2_565_470,
+            },
+            {
+                "id": "house",
+                "name": "House",
+                "offbudget": True,
+                "closed": False,
+                "balance_cents": 85_000_000,
+            },
+            {
+                "id": "b401k",
+                "name": "Microsoft 401k",
+                "offbudget": True,
+                "closed": False,
+                "balance_cents": 79_285_250,
+            },
+        ]
+    }
 
 
-async def test_debt_status_total_debt_includes_offbudget_mortgage(
-    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
-) -> None:
-    httpx_mock.add_response(url=f"{BASE}/accounts", json=_accounts())
-    httpx_mock.add_response(
-        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
-    )
-    out = await tools["finances_debt_status"]()
-    # mortgage + HELOC + Apple Card; the House and Checking are assets.
-    assert out["total_debt"] == pytest.approx(-(392_172.46 + 109_290.04 + 93.08))
+def _debt_cfg(tmp_path: Any, **over: Any) -> str:
+    body: dict[str, Any] = {
+        "hurdle_rate": 5.0,
+        "debts": {
+            "Spectra HELOC": {"rate": 6.75, "is_variable": True, "scheduled_payment": 650.0},
+            "Mortgage (NewRez)": {"rate": 2.49, "is_variable": False},
+            "Tesla Loan (Santander)": {"rate": 0.99, "is_variable": False},
+            "Amex Platinum": {"rate": None, "is_variable": False},
+        },
+        "recurring": {"items": []},
+    }
+    body.update(over)
+    cfg = tmp_path / "debt.json"
+    cfg.write_text(json.dumps(body))
+    return str(cfg)
 
 
-async def test_debt_status_never_flags_the_mortgage_as_revolving(
-    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
-) -> None:
-    """The card-creep heuristic must not fire on instalment/credit-line debt."""
-    httpx_mock.add_response(url=f"{BASE}/accounts", json=_accounts())
-    httpx_mock.add_response(
-        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
-    )
-    out = await tools["finances_debt_status"]()
-    assert "Mortgage (NewRez)" not in out["cards_flagged"]
-    assert "Spectra HELOC" not in out["cards_flagged"]
-    # Off-budget accounts stay out of the on-budget debts list entirely.
-    assert all(r["account"] != "Mortgage (NewRez)" for r in out["debts"])
-
-
-async def test_debt_status_equity_null_when_mortgage_account_missing(
-    httpx_mock: HTTPXMock,
-) -> None:
-    """A renamed/unlinked account must fail loudly, not silently understate."""
-    accounts = _accounts()
-    accounts["accounts"] = [a for a in accounts["accounts"] if a["id"] != "mortgage"]
+def _debt_tools(tmp_path: Any, **over: Any) -> Any:
     mcp = CapturingMCP()
     register(
         mcp,  # type: ignore[arg-type]
@@ -413,16 +658,124 @@ async def test_debt_status_equity_null_when_mortgage_account_missing(
             _env_file=None,  # type: ignore[call-arg]
             oauth_required=False,
             finances_sidecar_base_url=BASE,
+            finances_config_path=_debt_cfg(tmp_path, **over),
+            finances_state_path=str(tmp_path / "state.json"),
         ),
     )
-    httpx_mock.add_response(url=f"{BASE}/accounts", json=accounts)
+    return mcp.tools
+
+
+def _mock_debt(httpx_mock: HTTPXMock, txns: list[dict[str, Any]] | None = None) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_debt_accounts())
     httpx_mock.add_response(
-        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": txns or []}
     )
-    out = await mcp.tools["finances_debt_status"]()
-    assert out["home_equity"] is None
-    assert "Mortgage" in out["home_equity_note"]
-    assert out["mortgage"] is None
+
+
+async def test_debt_includes_offbudget_loans(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """The Tesla loan was invisible because it is off-budget."""
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(tmp_path)["finances_debt_status"]()
+    names = {d["account"] for d in out["debts"]}
+    assert "Tesla Loan (Santander)" in names
+    assert "Mortgage (NewRez)" in names
+    # Assets are never swept in, whatever their offbudget flag.
+    assert "House" not in names and "Microsoft 401k" not in names
+    assert out["total_debt"] == pytest.approx(-(109_290.04 + 392_172.46 + 43_685.88 + 25_654.70))
+
+
+async def test_accelerate_ride_classification(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(tmp_path)["finances_debt_status"]()
+    by = {d["account"]: d for d in out["debts"]}
+    assert by["Spectra HELOC"]["class"] == "accelerate"  # 6.75 > 5.0
+    assert by["Mortgage (NewRez)"]["class"] == "ride"  # 2.49 <= 5.0
+    assert by["Tesla Loan (Santander)"]["class"] == "ride"  # 0.99 <= 5.0
+    # An unconfigured rate is never guessed either way.
+    assert by["Amex Platinum"]["class"] == "unknown"
+    assert out["accelerate_total"] == pytest.approx(-109_290.04)
+    assert out["ride_total"] == pytest.approx(-(392_172.46 + 43_685.88))
+    assert out["unknown_total"] == pytest.approx(-25_654.70)
+
+
+async def test_negative_account_absent_from_config_is_reported_not_dropped(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Silently omitting a liability is exactly how the Tesla loan hid."""
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(
+        tmp_path,
+        debts={"Spectra HELOC": {"rate": 6.75, "is_variable": True}},
+    )["finances_debt_status"]()
+    unlisted = {u["account"] for u in out["unlisted_negative_accounts"]}
+    assert unlisted == {"Mortgage (NewRez)", "Tesla Loan (Santander)", "Amex Platinum"}
+    # Still counted in the total, so it can never read smaller than reality.
+    assert out["total_debt"] == pytest.approx(-(109_290.04 + 392_172.46 + 43_685.88 + 25_654.70))
+    assert out["unlisted_note"] is not None
+
+
+async def test_class_change_is_flagged_loudly(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """A variable-rate debt crossing the hurdle must never pass unnoticed."""
+    _mock_debt(httpx_mock)
+    first = await _debt_tools(tmp_path)["finances_debt_status"]()
+    assert first["class_change_detection"] == "baseline"
+    assert first["class_changes"] == []
+
+    _mock_debt(httpx_mock)
+    # The HELOC is prime-pinned; rates fell and it dropped below the hurdle.
+    dropped = await _debt_tools(
+        tmp_path,
+        debts={
+            "Spectra HELOC": {"rate": 4.25, "is_variable": True},
+            "Mortgage (NewRez)": {"rate": 2.49, "is_variable": False},
+            "Tesla Loan (Santander)": {"rate": 0.99, "is_variable": False},
+            "Amex Platinum": {"rate": None, "is_variable": False},
+        },
+    )["finances_debt_status"]()
+    assert dropped["class_change_alert"] is True
+    change = dropped["class_changes"][0]
+    assert change["account"] == "Spectra HELOC"
+    assert (change["was"], change["now"]) == ("accelerate", "ride")
+    assert change["is_variable"] is True
+
+
+async def test_starting_balance_is_not_debt_movement(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """Linking an account must not read as taking on the whole loan this month."""
+    _mock_debt(
+        httpx_mock,
+        [
+            _txn(
+                id="sb",
+                date="2026-07-31",
+                account_id="tesla",
+                account_name="Tesla Loan (Santander)",
+                amount_cents=-4_368_588,
+                payee_name="Starting Balance",
+                category_name=None,
+            )
+        ],
+    )
+    out = await _debt_tools(tmp_path)["finances_debt_status"]()
+    tesla = {d["account"]: d for d in out["debts"]}["Tesla Loan (Santander)"]
+    assert tesla["change_30d"] == 0.0
+    assert tesla["change_7d"] == 0.0
+
+
+async def test_equity_is_fully_derived(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(tmp_path)["finances_debt_status"]()
+    # 850,000.00 - 392,172.46 - 109,290.04
+    assert out["home_equity"] == pytest.approx(348_537.50)
+    assert out["house_value"] == 850_000.0
+
+
+async def test_instalment_debt_is_never_flagged_as_revolving(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(tmp_path)["finances_debt_status"]()
+    for name in ("Mortgage (NewRez)", "Spectra HELOC", "Tesla Loan (Santander)"):
+        assert name not in out["cards_flagged"]
 
 
 # ── error contract ───────────────────────────────────────────────────

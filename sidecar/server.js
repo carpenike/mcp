@@ -156,6 +156,22 @@ async function freshen(force = false) {
 
 async function getAccounts() {
   await freshen();
+  // `last_sync` is the bank feed's last successful fetch — the only true
+  // sync-health signal. Transaction age is a proxy that misreads a dormant
+  // account as a broken feed. Queried separately because getAccounts() does
+  // not project it; tolerated as null if the schema ever drops it.
+  let lastSyncById = new Map();
+  try {
+    const { data } = await api.runQuery(
+      api.q('accounts').select(['id', 'last_sync']).filter({ closed: false }),
+    );
+    lastSyncById = new Map(data.map((r) => [r.id, r.last_sync ?? null]));
+  } catch (e) {
+    log('last_sync unavailable, falling back to transaction age', {
+      error: String(e && e.message),
+    });
+  }
+
   const accounts = await api.getAccounts();
   const out = [];
   for (const a of accounts) {
@@ -167,6 +183,7 @@ async function getAccounts() {
       // Actual stores money as integer cents everywhere. Keep it that way on
       // the wire; the Python side converts once, at the tool boundary.
       balance_cents: await api.getAccountBalance(a.id),
+      last_sync: lastSyncById.get(a.id) ?? null,
     });
   }
   return out;

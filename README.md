@@ -173,11 +173,11 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_list_maps` | Playable maps with canonical ids + images; 6-h cache (RaidTheory/arcraiders-data) |
 | ARC Raiders | `arc_search_wiki` | Full-text search of the Embark-supported arcraiders.wiki |
 | ARC Raiders | `arc_get_wiki_page` | One wiki page as plain text + raw wikitext (infobox weapon stats); CC BY-SA 4.0 |
-| Finances | `finances_sync_status` | Per-account bank-data freshness with per-account staleness thresholds and an overall fresh/stale/dead verdict; optional `trigger_sync` — **call this first**, every other number depends on it |
+| Finances | `finances_sync_status` | Feed health from each account's `last_sync` (not transaction age), reported separately from activity, with manual accounts excluded and an overall fresh/stale/dead verdict; optional `trigger_sync` — **call this first**, every other number depends on it |
 | Finances | `finances_monthly_summary` | One month's income, spend by category, total, and gap vs. the configured floor; excludes transfers/CC payments/off-budget; pro-rated pace mid-month; reports `uncategorized` as an explicit data-quality signal |
-| Finances | `finances_recurring` | Expected fixed obligations vs. what posted this month — MATCHED / CHANGED / MISSING / ENDED, from an operator-maintained config file |
+| Finances | `finances_recurring` | Expected fixed obligations vs. what posted — MATCHED / CHANGED / MISSING / PENDING_STATEMENT / ENDED, on proportional (±%) tolerance bands, plus `notable_variances` that surface a big move even when a widened seasonal band keeps it MATCHED |
 | Finances | `finances_trend` | Per-category monthly spend series + income series over the last N months; flags the current partial month |
-| Finances | `finances_debt_status` | HELOC/Synchrony/card balances, HELOC 7- and 30-day paydown deltas, creeping-revolving flags, and home equity when the mortgage balance is configured |
+| Finances | `finances_debt_status` | Every liability including off-budget loans, each with rate, 7/30-day deltas and an accelerate/ride classification against a configured hurdle rate; accelerate/ride/unknown totals, total debt, home equity, and a loud flag when a debt's class changes between runs |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
@@ -202,14 +202,28 @@ numbers, never prose or advice. Two deployment facts matter:
 `HOMELAB_MCP_FINANCES_FLOOR` is set — that number is a household decision and
 the tool refuses to invent one.
 
-`finances_debt_status` needs no configuration: mortgage, HELOC and card
-balances are all synced accounts, so home equity is fully derived. The single
-hand-maintained figure in the system is the off-budget `House` valuation,
-updated quarterly at review. Equity is **display-only** per the finances repo's
-PLAN.md — it feeds the net-worth view and the HELOC scoreboard, never an
-affordability or spending decision. If the `House` or mortgage account can't be
-uniquely identified by name, equity is reported `null` with the reason rather
-than silently understating the debt side.
+`finances_debt_status` reads every balance from Actual — mortgage, HELOC, car
+loan and cards, on-budget or off. The single hand-maintained figure left in the
+system is the off-budget `House` valuation, updated quarterly at review. Equity
+is **display-only** per the finances repo's PLAN.md — it feeds the net-worth
+view and the HELOC scoreboard, never an affordability or spending decision. If
+the `House` or mortgage account can't be uniquely identified by name, equity is
+reported `null` with the reason rather than silently understating the debt side.
+
+Three deliberate refusals to guess, all in `tools/finances_config.json`:
+
+- **An account is debt only if it is listed in `debts` AND carries a negative
+  balance**, so the house and investment accounts can never be swept in. A
+  negative balance that *isn't* listed still appears under
+  `unlisted_negative_accounts` and still counts toward `total_debt` — silently
+  omitting a liability is how a $43k car loan stayed invisible.
+- **A debt with no configured rate is classified `unknown`, never guessed.**
+  Defaulting it to "ride" would call a carried card balance cheap money.
+- **Sync health comes from `last_sync`, not transaction age.** A dormant card
+  with a healthy feed reports `fresh` with `activity: "none"` and appears in
+  `quiet_but_healthy`; an account whose feed hasn't run reports `dead` even if
+  a transaction posted yesterday. Conflating the two kept the overall verdict
+  permanently red, which trains the alert away.
 
 ### Paperless credential
 

@@ -421,26 +421,27 @@ class Settings(BaseSettings):
     # mortgage was linked as a synced off-budget account in Actual on
     # 2026-07-30, so finances_debt_status reads it like every other balance.
     # A hand-maintained copy would only be able to disagree with reality.
-    finances_recurring_config_path: str = Field(
+    finances_config_path: str = Field(
         default="",
         description=(
-            "Path to a JSON file describing expected fixed obligations for "
-            "finances_recurring (schema: see tools/finances_recurring.json). "
-            "Data-driven so amounts, due days and end dates can be corrected "
-            "without a code change or redeploy. Empty uses the copy shipped "
-            "inside the package."
+            "Path to the operator-maintained JSON config for the finances_* "
+            "tools: debt rates and the accelerate/ride hurdle, per-account feed "
+            "cadences, and the expected fixed obligations (schema and rationale: "
+            "see tools/finances_config.json). Data-driven so a rate change, a "
+            "new account or a corrected due date needs no code change or "
+            "redeploy. Empty uses the copy shipped inside the package."
         ),
     )
-    finances_stale_days: int = Field(
-        default=3,
-        ge=1,
-        le=90,
+    finances_state_path: str = Field(
+        default="/var/lib/homelab-mcp/finances-state.json",
         description=(
-            "Days without a posted transaction before an on-budget account is "
-            "flagged stale by finances_sync_status. Per-account overrides live "
-            "in the recurring config's `account_stale_overrides` (Apple Card "
-            "gets 35: its SimpleFin feed is a monthly statement export, so a "
-            "3-day rule would cry wolf every month)."
+            "Small JSON memo of the last debt classification, so "
+            "finances_debt_status can report when a debt crossed the hurdle "
+            "rate since the previous run. A variable-rate debt reclassifying "
+            "silently is the failure this exists to prevent. Purely derived "
+            "bookkeeping — if the path is unwritable the tool still returns its "
+            "numbers, it just reports that change detection is unavailable "
+            "rather than inventing a 'no change' answer. Set empty to disable."
         ),
     )
 
