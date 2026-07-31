@@ -213,6 +213,10 @@ def build_routes(
         a misspelled key triggers a silent disconnect with no log line on
         the client side.
         """
+        supported_scopes = ["openid", "email", "profile"]
+        supported_scopes.extend(
+            name for name in sorted(settings.restricted_scopes) if name not in supported_scopes
+        )
         return JSONResponse(
             {
                 "issuer": settings.issuer,
@@ -228,7 +232,7 @@ def build_routes(
                     "client_secret_post",
                     "none",
                 ],
-                "scopes_supported": ["openid", "email", "profile"],
+                "scopes_supported": supported_scopes,
                 # OAuth 2.1 marker (informational; spec doesn't define an
                 # exact field but several clients sniff for it).
                 "service_documentation": "https://github.com/carpenike/mcp",

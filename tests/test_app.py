@@ -67,6 +67,7 @@ def test_as_metadata_returns_spec_clean_fields(settings: Settings) -> None:
     assert body["grant_types_supported"] == ["authorization_code", "refresh_token"]
     assert body["code_challenge_methods_supported"] == ["S256"]
     assert "token_endpoint_auth_methods_supported" in body
+    assert body["scopes_supported"] == ["openid", "email", "profile", "hermes"]
 
 
 def test_register_rate_limit_returns_429(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
