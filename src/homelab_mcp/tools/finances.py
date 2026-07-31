@@ -101,6 +101,37 @@ def _month_bounds(month: str) -> tuple[date, date]:
     return first, date(year, mon, calendar.monthrange(year, mon)[1])
 
 
+def _billing_window(item: dict[str, Any], first: date, last: date) -> tuple[date, date]:
+    """The date range a month's instance of an obligation may post in.
+
+    Default is the calendar month. An item that drafts near a month boundary
+    can declare `window_slip_days`, which re-anchors the window on
+    `expected_day` instead:
+
+        anchor = expected_day of this month
+        window = [anchor - before, anchor + after]
+
+    USAA Life drafts on the 28th and posts anywhere from the 28th to the 3rd
+    of the following month. Under calendar months that reads as three MISSING
+    months (Nov, Feb, May) and three months holding two payments — the charge
+    is attributed to the month it *cleared* rather than the one it is for.
+
+    Anchored windows for consecutive months cannot overlap as long as
+    before + after stays well under a month, so a single transaction is
+    claimable by exactly one month. That is what keeps a slipped payment from
+    being counted twice.
+    """
+    slip = item.get("window_slip_days")
+    day = item.get("expected_day")
+    if not slip or not day:
+        return first, last
+    before = int(slip.get("before", 0))
+    after = int(slip.get("after", 0))
+    # Clamp so expected_day=31 still resolves in a 30-day month.
+    anchor = first.replace(day=min(int(day), calendar.monthrange(first.year, first.month)[1]))
+    return anchor - timedelta(days=before), anchor + timedelta(days=after)
+
+
 def _classify(rate: float | None, hurdle: float) -> str:
     """Bucket a debt by cost: worth accelerating, or cheap enough to ride.
 
@@ -511,7 +542,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             cfg = _config()
             rec_cfg = cfg.get("recurring") or {}
             cadence_of: dict[str, str] = dict(((cfg.get("sync") or {}).get("accounts")) or {})
-            txns = await _transactions(first, last)
+            # Fetch wide enough to cover the most boundary-slipping item, then
+            # narrow per item. Items without a slip keep calendar-month scope.
+            slips = [
+                i.get("window_slip_days") or {}
+                for i in (cfg.get("recurring") or {}).get("items", [])
+            ]
+            pad_before = max((int(s.get("before", 0)) for s in slips), default=0)
+            pad_after = max((int(s.get("after", 0)) for s in slips), default=0)
+            txns = await _transactions(
+                first - timedelta(days=pad_before), last + timedelta(days=pad_after)
+            )
         except ToolError as err:
             return err.payload()
 
@@ -531,7 +572,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         # the alert away.
         monthly_accounts = {n.lower() for n, c in cadence_of.items() if c == "monthly"}
         accounts_with_activity = {
-            (t.get("account_name") or "").lower() for t in txns if t.get("account_name")
+            (t.get("account_name") or "").lower()
+            for t in txns
+            if t.get("account_name") and first.isoformat() <= t["date"] <= last.isoformat()
         }
 
         def _awaiting_statement(acct_filter: list[str]) -> bool:
@@ -561,12 +604,16 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
             expected = float(item.get("amount", 0.0))
             tol, pct_used = _tolerance(item, expected)
+            win_start, win_end = _billing_window(item, first, last)
+            win_lo, win_hi = win_start.isoformat(), win_end.isoformat()
             needles = [str(s).lower() for s in (item.get("match_any") or [])]
             acct_filter = [str(s).lower() for s in (item.get("accounts") or [])]
 
             best: dict[str, Any] | None = None
             for t in candidates:
                 if t["id"] in claimed:
+                    continue
+                if not (win_lo <= t["date"] <= win_hi):
                     continue
                 # A dedicated account (Synchrony Container Store, Apple Card)
                 # narrows the search; it never widens it.
@@ -647,6 +694,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     "expected_day": item.get("expected_day"),
                     "posted_date": best["date"],
                     "posted_day": posted.day,
+                    "billing_window": [win_lo, win_hi],
+                    # True when the charge cleared outside the calendar month
+                    # it belongs to — normal for a draft near a boundary.
+                    "posted_outside_month": not (
+                        first.isoformat() <= best["date"] <= last.isoformat()
+                    ),
                     "account": best.get("account_name"),
                     "payee": best.get("payee_name"),
                 }
