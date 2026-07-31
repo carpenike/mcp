@@ -1,0 +1,240 @@
+{
+  "_comment": [
+    "Operator-maintained configuration for the finances_* tools. Data, not code:",
+    "correct a rate, a due date or a cadence here and redeploy the config; no",
+    "Python change needed.",
+    "",
+    "Seeded 2026-07-30 from the finances repo's PLAN.md; revised 2026-07-31 after",
+    "the first live verification session (see that repo's DECISIONS.md).",
+    "",
+    "Four sections:",
+    "  hurdle_rate  the APR above which a debt is worth accelerating rather than",
+    "               paying on schedule. Everything at or below it is cheap money",
+    "               and gets 'ride'.",
+    "  debts        which accounts count as debt, and what each one costs. An",
+    "               account is treated as debt only if it is BOTH listed here AND",
+    "               carrying a negative balance, so the House and the investment",
+    "               accounts can never be swept in. Negative-balance accounts that",
+    "               are NOT listed are still reported, under `unlisted`, rather",
+    "               than silently dropped.",
+    "  sync         per-account expected feed cadence. 'daily' feeds are stale",
+    "               after a few days; 'monthly' feeds (statement exports) are",
+    "               healthy for weeks; 'manual' accounts never sync at all and are",
+    "               excluded from the verdict. Judging a monthly feed by a daily",
+    "               rule is what made the overall verdict permanently 'dead'.",
+    "  recurring    expected fixed obligations, checked against what posted."
+  ],
+
+  "hurdle_rate": 5.0,
+
+  "debts": {
+    "_comment": [
+      "rate              APR percent. null means UNKNOWN — the tool refuses to",
+      "                  classify it rather than guessing, because calling a",
+      "                  carried card balance 'ride' would be actively wrong.",
+      "is_variable       true if the rate moves on its own (prime-pinned etc.).",
+      "                  These are the ones whose classification can change",
+      "                  without anyone touching this file, so a flip is",
+      "                  reported loudly.",
+      "scheduled_payment the normal monthly payment, dollars. null if none."
+    ],
+    "Spectra HELOC": {
+      "rate": 6.75,
+      "is_variable": true,
+      "scheduled_payment": 650.0,
+      "note": "Prime-pinned; interest-only minimum. The only expensive debt."
+    },
+    "Mortgage (NewRez)": {
+      "rate": 2.49,
+      "is_variable": false,
+      "scheduled_payment": 2735.68,
+      "note": "Irreplaceable rate — never prepay or refinance."
+    },
+    "Tesla Loan (Santander)": {
+      "rate": 0.99,
+      "is_variable": false,
+      "scheduled_payment": 652.0,
+      "note": "Manual off-budget account; balance updated by hand."
+    },
+    "Synchrony Container Store": {
+      "rate": 0.0,
+      "is_variable": false,
+      "scheduled_payment": 291.0,
+      "note": "0% promotional through ~Feb 2028."
+    },
+    "Synchrony Music & Arts": {
+      "rate": 0.0,
+      "is_variable": false,
+      "scheduled_payment": 97.0,
+      "note": "0% promotional; ends ~Nov 2026."
+    },
+    "Amex Platinum": { "rate": null, "is_variable": false, "scheduled_payment": null },
+    "Chase Amazon": { "rate": null, "is_variable": false, "scheduled_payment": null },
+    "Chase Freedom": { "rate": null, "is_variable": false, "scheduled_payment": null },
+    "Chase Sapphire": { "rate": null, "is_variable": false, "scheduled_payment": null },
+    "Citi Costco": { "rate": null, "is_variable": false, "scheduled_payment": null },
+    "Apple Card": { "rate": null, "is_variable": false, "scheduled_payment": null }
+  },
+
+  "sync": {
+    "_comment": [
+      "Feed health is judged on `last_sync` — the bank feed's last successful",
+      "fetch, which Actual records per account. That is the real signal.",
+      "Transaction age is only a proxy, and a misleading one: a dormant card",
+      "with a perfectly healthy feed looks identical to a broken one. Both are",
+      "reported, but only `last_sync` decides the verdict.",
+      "",
+      "Accounts with no `last_sync` are not bank-linked. If declared 'manual'",
+      "below they are excluded outright; otherwise the tool falls back to",
+      "activity age and says so, rather than silently passing them."
+    ],
+    "feed_stale_hours": 26,
+    "feed_dead_hours": 72,
+
+    "default_cadence": "daily",
+    "cadence_max_age_days": {
+      "daily": 3,
+      "monthly": 35
+    },
+    "accounts": {
+      "USAA Checking": "daily",
+      "Amex Platinum": "daily",
+      "Amex Rewards Checking": "daily",
+      "Amex Savings (HYSA)": "daily",
+      "Chase Amazon": "daily",
+      "Chase Freedom": "daily",
+      "Chase Sapphire": "daily",
+      "Citi Costco": "daily",
+
+      "Apple Card": "monthly",
+      "Synchrony Container Store": "monthly",
+      "Synchrony Music & Arts": "monthly",
+      "Spectra HELOC": "monthly",
+      "Mortgage (NewRez)": "monthly",
+
+      "Tesla Loan (Santander)": "manual",
+      "House": "manual"
+    }
+  },
+
+  "recurring": {
+    "_comment": [
+      "default_tolerance_pct is the band, as a percent of the expected amount,",
+      "within which a posted charge counts as MATCHED. Flat dollar bands were the",
+      "original design and were too wide to catch what this tool exists to catch",
+      "(FirstEnergy posted 45% over and read MATCHED against a +/-$300 band).",
+      "",
+      "tolerance_pct     per-item override. Widen ONLY for genuinely seasonal",
+      "                  bills. A widened band never hides the delta: any charge",
+      "                  more than default_tolerance_pct off expectation is",
+      "                  reported under `notable_variances` even when MATCHED.",
+      "min_tolerance     dollar floor, so small bills don't churn on rounding.",
+      "expected_day      day of month it normally posts, or null if it floats.",
+      "match_any         payee substrings, case-insensitive, matched against",
+      "                  payee OR notes. Several are deliberately ugly because",
+      "                  that is what SimpleFin delivers.",
+      "accounts          restrict to these account names. On such an account the",
+      "                  servicing payment is the POSITIVE leg, so magnitude is",
+      "                  compared rather than sign.",
+      "ends              final month expected, 'YYYY-MM'. Past it the item is",
+      "                  ENDED, not MISSING, so a finished loan stops alarming."
+    ],
+    "default_tolerance_pct": 10.0,
+    "min_tolerance": 5.0,
+    "items": [
+      {
+        "name": "Mortgage — Shellpoint/NewRez",
+        "amount": 2735.68,
+        "expected_day": 1,
+        "match_any": ["shellpoint", "newrez"],
+        "ends": null
+      },
+      {
+        "name": "Tesla Model Y — Santander",
+        "amount": 652.0,
+        "expected_day": 15,
+        "match_any": ["santander"],
+        "ends": null
+      },
+      {
+        "name": "HELOC payment — Spectra CU",
+        "amount": 650.0,
+        "tolerance_pct": 25.0,
+        "expected_day": 1,
+        "match_any": ["elec ext loan", "ryan holt external", "spectra"],
+        "ends": null
+      },
+      {
+        "name": "Synchrony — Container Store (master closet)",
+        "amount": 291.0,
+        "expected_day": 15,
+        "match_any": ["synchrony", "container store"],
+        "accounts": ["Synchrony Container Store"],
+        "ends": "2028-02"
+      },
+      {
+        "name": "Synchrony — Music & Arts (saxophone)",
+        "amount": 97.0,
+        "expected_day": 1,
+        "match_any": ["synchrony", "music & arts", "music and arts"],
+        "accounts": ["Synchrony Music & Arts"],
+        "ends": "2026-11"
+      },
+      {
+        "name": "Phones — T-Mobile",
+        "amount": 270.0,
+        "tolerance_pct": 20.0,
+        "expected_day": null,
+        "match_any": ["t-mobile", "tmobile"],
+        "ends": null
+      },
+      {
+        "name": "Phone/watch — Verizon",
+        "amount": 95.0,
+        "expected_day": null,
+        "match_any": ["verizon"],
+        "ends": null
+      },
+      {
+        "name": "Electric — FirstEnergy",
+        "amount": 608.0,
+        "tolerance_pct": 55.0,
+        "expected_day": null,
+        "match_any": ["firstenergy", "first energy", "potomac edison"],
+        "ends": null,
+        "note": "Genuinely seasonal (summer AC / winter heat), so the band is wide. The delta is still surfaced under notable_variances whenever it exceeds the default band — a wide band must never mean a silent price rise."
+      },
+      {
+        "name": "Internet — Starlink",
+        "amount": 70.0,
+        "tolerance_pct": 20.0,
+        "expected_day": null,
+        "match_any": ["starlink", "spacex"],
+        "ends": null
+      },
+      {
+        "name": "USAA P&C insurance",
+        "amount": 96.0,
+        "tolerance_pct": 20.0,
+        "expected_day": null,
+        "match_any": ["usaa p&c", "usaa insurance", "usaa gen indemnity"],
+        "ends": null
+      },
+      {
+        "name": "USAA life insurance",
+        "amount": 44.0,
+        "expected_day": null,
+        "match_any": ["usaa life"],
+        "ends": null
+      },
+      {
+        "name": "MacBook Pro installment (Apple Card)",
+        "amount": 200.33,
+        "expected_day": null,
+        "match_any": ["apple card monthly installment", "installment", "apple.com"],
+        "accounts": ["Apple Card"],
+        "ends": "2027-03"
+      }
+    ]
+  }
+}
