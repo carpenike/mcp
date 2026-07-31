@@ -68,12 +68,24 @@
       "scheduled_payment": 97.0,
       "note": "0% promotional; ends ~Nov 2026."
     },
-    "Amex Platinum": { "rate": null, "is_variable": false, "scheduled_payment": null },
-    "Chase Amazon": { "rate": null, "is_variable": false, "scheduled_payment": null },
-    "Chase Freedom": { "rate": null, "is_variable": false, "scheduled_payment": null },
-    "Chase Sapphire": { "rate": null, "is_variable": false, "scheduled_payment": null },
-    "Citi Costco": { "rate": null, "is_variable": false, "scheduled_payment": null },
-    "Apple Card": { "rate": null, "is_variable": false, "scheduled_payment": null }
+    "_cards_comment": [
+      "Purchase APRs from the 2026-08-01 statements. Every one is far above the",
+      "5.0 hurdle, so ANY balance that survives the grace period classifies",
+      "'accelerate' — which is the intended signal: revolving on a card is the",
+      "most expensive money in the household, well past even the HELOC's 6.75%.",
+      "A card sitting at $0 has no negative balance and so never appears at all.",
+      "",
+      "is_variable is true because US card APRs are prime-pinned and reprice on",
+      "their own. It does not change any classification here (all are far above",
+      "the hurdle); it marks them as rates that can move without anyone editing",
+      "this file."
+    ],
+    "Amex Platinum": { "rate": 29.99, "is_variable": true, "scheduled_payment": null },
+    "Citi Costco": { "rate": 29.99, "is_variable": true, "scheduled_payment": null },
+    "Chase Sapphire": { "rate": 23.49, "is_variable": true, "scheduled_payment": null },
+    "Chase Freedom": { "rate": 20.74, "is_variable": true, "scheduled_payment": null },
+    "Chase Amazon": { "rate": 18.74, "is_variable": true, "scheduled_payment": null },
+    "Apple Card": { "rate": 14.49, "is_variable": true, "scheduled_payment": null }
   },
 
   "sync": {
@@ -224,8 +236,9 @@
         "name": "USAA life insurance",
         "amount": 44.0,
         "expected_day": null,
-        "match_any": ["usaa life"],
-        "ends": null
+        "match_any": ["usaa life insurance", "usaa.com pay int life"],
+        "ends": null,
+        "note": "Two payee forms: the clean 'USAA Life Insurance' and the raw import descriptor 'USAA.COM PAY INT LIFE', which is followed by a masked account suffix. Matching is substring and case-insensitive, so the suffix is ignored and bank descriptor casing does not matter."
       },
       {
         "name": "MacBook Pro installment (Apple Card)",
