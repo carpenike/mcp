@@ -789,3 +789,117 @@ async def test_sidecar_down_returns_structured_error_not_raise(
     httpx_mock.add_exception(httpx.ConnectError("refused"))
     out = await tools["finances_debt_status"]()
     assert out["error"]["code"] == "actual_unreachable"
+
+
+# ── shipped config ───────────────────────────────────────────────────
+# These assert the DATA in the packaged finances_config.json, not just the
+# code that reads it. A nulled rate or a dropped payee form is a silent
+# behavior change that no logic test would catch.
+
+
+def _shipped() -> dict[str, Any]:
+    import homelab_mcp.tools.finances as fin
+
+    return dict(json.loads(fin._DEFAULT_CONFIG.read_text(encoding="utf-8")))
+
+
+def test_every_shipped_debt_has_a_rate() -> None:
+    """No debt may ship as 'unknown' — including the cards."""
+    debts = {k: v for k, v in _shipped()["debts"].items() if not k.startswith("_")}
+    missing = [k for k, v in debts.items() if v.get("rate") is None]
+    assert missing == [], f"these would classify 'unknown': {missing}"
+
+
+def test_every_shipped_card_is_above_the_hurdle() -> None:
+    """Card APRs are the most expensive money here; none should read 'ride'."""
+    cfg = _shipped()
+    hurdle = cfg["hurdle_rate"]
+    debts = {k: v for k, v in cfg["debts"].items() if not k.startswith("_")}
+    cards = {
+        k: v
+        for k, v in debts.items()
+        if not any(t in k.lower() for t in ("heloc", "mortgage", "loan", "synchrony"))
+    }
+    assert cards, "expected the card entries to be present"
+    for name, meta in cards.items():
+        assert meta["rate"] > hurdle, f"{name} at {meta['rate']} would classify 'ride'"
+
+
+def test_usaa_life_matches_both_payee_forms() -> None:
+    """The clean payee AND the raw bank descriptor, which lands in `notes`."""
+    items = _shipped()["recurring"]["items"]
+    item = next(i for i in items if i["name"] == "USAA life insurance")
+    needles = item["match_any"]
+    # Real strings observed in the budget: the descriptor carries a masked
+    # account suffix, so this must stay a substring match.
+    for hay in (
+        "usaa life insurance ",
+        "usaa life insurance usaa.com pay int life       ***********1669",
+        # Casing varies between import paths.
+        "USAA LIFE INSURANCE".lower(),
+        "USAA.COM PAY INT LIFE  ***1669".lower(),
+    ):
+        assert any(n in hay for n in needles), f"no needle matched {hay!r}"
+
+
+def test_usaa_life_needles_do_not_match_unrelated_payees() -> None:
+    """A broader needle like 'life' would sweep in real, unrelated payees."""
+    items = _shipped()["recurring"]["items"]
+    needles = next(i for i in items if i["name"] == "USAA life insurance")["match_any"]
+    for hay in ("lifechangers minis732 russell ave akron ", "usaa p&c insurance "):
+        assert not any(n in hay for n in needles), f"false positive on {hay!r}"
+
+
+async def test_recurring_matches_against_notes_not_just_payee(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """The raw descriptor lives in `notes`; matching must reach it."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="l",
+                    date="2026-06-30",
+                    amount_cents=-4_415,
+                    payee_name="Some Opaque Payee",
+                    notes="USAA.COM PAY INT LIFE       ***********1669",
+                )
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "USAA life",
+                "amount": 44.0,
+                "match_any": ["usaa life insurance", "usaa.com pay int life"],
+                "ends": None,
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-06")
+    row = out["obligations"][0]
+    assert row["status"] == "MATCHED"
+    assert row["actual_amount"] == 44.15
+    # 0.15 on a $44 bill is noise, not a price rise.
+    assert row["notable_variance"] is False
+
+
+async def test_card_balance_classifies_accelerate(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """Any surviving card balance is the most expensive debt in the house."""
+    _mock_debt(httpx_mock)
+    out = await _debt_tools(
+        tmp_path,
+        debts={
+            "Spectra HELOC": {"rate": 6.75, "is_variable": True},
+            "Mortgage (NewRez)": {"rate": 2.49, "is_variable": False},
+            "Tesla Loan (Santander)": {"rate": 0.99, "is_variable": False},
+            "Amex Platinum": {"rate": 29.99, "is_variable": True},
+        },
+    )["finances_debt_status"]()
+    by = {d["account"]: d for d in out["debts"]}
+    assert by["Amex Platinum"]["class"] == "accelerate"
+    assert out["unknown_total"] == 0.0
+    assert not [d for d in out["debts"] if d["class"] == "unknown"]
