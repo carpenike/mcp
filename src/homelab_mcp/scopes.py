@@ -151,7 +151,23 @@ class ToolScopeMiddleware:
                 return messages.pop(0)
             return await receive()
 
-        await self._filtered_send(scope, _receive, send, allowed)
+        await self._filtered_send(
+            scope,
+            _receive,
+            send,
+            allowed,
+            filter_tools_list=self._is_tools_list(body),
+        )
+
+    @staticmethod
+    def _is_tools_list(body: bytes) -> bool:
+        """Return whether the request contains a tools/list operation."""
+        try:
+            parsed = json.loads(body or b"{}")
+        except ValueError:
+            return False
+        requests = parsed if isinstance(parsed, list) else [parsed]
+        return any(isinstance(req, dict) and req.get("method") == "tools/list" for req in requests)
 
     @staticmethod
     def _blocked_call(body: bytes, allowed: set[str]) -> tuple[Any, str] | None:
@@ -171,28 +187,37 @@ class ToolScopeMiddleware:
         return None
 
     async def _filtered_send(
-        self, scope: Scope, receive: Receive, send: Send, allowed: set[str]
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        allowed: set[str],
+        *,
+        filter_tools_list: bool,
     ) -> None:
         """Pass the request through, filtering any tools/list result on the way out."""
         start: Message | None = None
         chunks: list[bytes] = []
-        is_json = False
+        buffer_mode: str | None = None
 
         async def _send(message: Message) -> None:
-            nonlocal start, is_json
+            nonlocal start, buffer_mode
             if message["type"] == "http.response.start":
                 start = message
                 headers = {k.lower(): v for k, v in message.get("headers", [])}
                 ctype = headers.get(b"content-type", b"")
-                # Only buffer what we can safely rewrite. An SSE stream is left
-                # alone: tools/call enforcement above is the real gate, and
-                # stalling a stream to rewrite it risks breaking the transport.
-                is_json = ctype.startswith(b"application/json")
-                if not is_json:
+                if ctype.startswith(b"application/json"):
+                    buffer_mode = "json"
+                elif filter_tools_list and ctype.startswith(b"text/event-stream"):
+                    # Streamable HTTP frames even finite tools/list responses as
+                    # SSE. Buffer only this known finite response; tool-call SSE
+                    # streams continue passing through without delay.
+                    buffer_mode = "sse"
+                if buffer_mode is None:
                     await send(message)
                 return
 
-            if message["type"] != "http.response.body" or not is_json:
+            if message["type"] != "http.response.body" or buffer_mode is None:
                 await send(message)
                 return
 
@@ -201,7 +226,11 @@ class ToolScopeMiddleware:
                 return
 
             raw = b"".join(chunks)
-            out = self._filter_tools_list(raw, allowed)
+            out = (
+                self._filter_tools_list(raw, allowed)
+                if buffer_mode == "json"
+                else self._filter_sse_tools_list(raw, allowed)
+            )
             assert start is not None
             # Rebuild Content-Length: filtering shortens the body, and a stale
             # length would truncate the response or hang the client.
@@ -213,6 +242,29 @@ class ToolScopeMiddleware:
             await send({"type": "http.response.body", "body": out, "more_body": False})
 
         await self.app(scope, receive, _send)
+
+    @classmethod
+    def _filter_sse_tools_list(cls, raw: bytes, allowed: set[str]) -> bytes:
+        """Filter compact JSON payloads in SSE data fields."""
+        output: list[bytes] = []
+        for line in raw.splitlines(keepends=True):
+            if not line.startswith(b"data:"):
+                output.append(line)
+                continue
+
+            prefix = b"data:"
+            payload = line[len(prefix) :]
+            if payload.startswith(b" "):
+                prefix += b" "
+                payload = payload[1:]
+
+            ending = b""
+            if payload.endswith(b"\r\n"):
+                payload, ending = payload[:-2], b"\r\n"
+            elif payload.endswith(b"\n"):
+                payload, ending = payload[:-1], b"\n"
+            output.append(prefix + cls._filter_tools_list(payload, allowed) + ending)
+        return b"".join(output)
 
     @staticmethod
     def _filter_tools_list(raw: bytes, allowed: set[str]) -> bytes:

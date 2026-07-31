@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
@@ -67,24 +67,28 @@ def test_scope_is_matched_per_token_not_by_substring() -> None:
 # ── dispatch enforcement ─────────────────────────────────────────────
 
 
-def _app(scope_claim: str | None) -> TestClient:
+def _app(scope_claim: str | None, *, sse_tools_list: bool = False) -> TestClient:
     """An app that echoes a tools/list result, wrapped in the scope middleware."""
 
-    async def mcp_endpoint(request: Any) -> JSONResponse:
+    async def mcp_endpoint(request: Any) -> JSONResponse | StreamingResponse:
         body = await request.json()
         if body.get("method") == "tools/list":
-            return JSONResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": body.get("id"),
-                    "result": {
-                        "tools": [
-                            {"name": n}
-                            for n in sorted(HERMES_TOOLS | {"finances_trend", "ha_call_service"})
-                        ]
-                    },
-                }
-            )
+            payload = {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {
+                    "tools": [
+                        {"name": n}
+                        for n in sorted(HERMES_TOOLS | {"finances_trend", "ha_call_service"})
+                    ]
+                },
+            }
+            if sse_tools_list:
+                return StreamingResponse(
+                    iter([f"data: {json.dumps(payload)}\n\n"]),
+                    media_type="text/event-stream",
+                )
+            return JSONResponse(payload)
         return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {"ok": True}})
 
     app = Starlette(routes=[Route("/mcp", mcp_endpoint, methods=["POST"])])
@@ -174,6 +178,18 @@ def test_tools_list_is_filtered_for_hermes() -> None:
     assert names == HERMES_TOOLS
     # Content-Length must be rewritten to the filtered body, or the client hangs.
     assert int(resp.headers["content-length"]) == len(resp.content)
+
+
+def test_sse_tools_list_is_filtered_for_hermes() -> None:
+    client = _app("hermes", sse_tools_list=True)
+    resp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    data = next(
+        line.removeprefix("data: ") for line in resp.text.splitlines() if line.startswith("data:")
+    )
+    names = {tool["name"] for tool in json.loads(data)["result"]["tools"]}
+    assert names == HERMES_TOOLS
 
 
 def test_tools_list_is_unfiltered_for_an_unrestricted_token() -> None:

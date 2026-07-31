@@ -278,11 +278,12 @@ finances_debt_status
 
 A `hermes` token is refused at `tools/call` for anything else (fails closed),
 including `signal_send` because Hermes delivers through its native gateway,
-and those tools are filtered out of its `tools/list`. Tokens without a
-matching scope — interactive advisor sessions — keep full access. This makes
-the agent's compose-and-send-only remit structural rather than a prompt
-instruction. Configured restricted-scope names are also advertised in OAuth
-discovery so standards-compliant clients can request them explicitly.
+and those tools are filtered out of its `tools/list` for both JSON and
+Streamable HTTP's SSE framing. Tokens without a matching scope — interactive
+advisor sessions — keep full access. This makes the agent's compose-and-send-only
+remit structural rather than a prompt instruction. Configured restricted-scope
+names are also advertised in OAuth discovery so standards-compliant clients can
+request them explicitly.
 
 ### Home Assistant posture
 
