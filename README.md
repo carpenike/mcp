@@ -174,8 +174,8 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | ARC Raiders | `arc_search_wiki` | Full-text search of the Embark-supported arcraiders.wiki |
 | ARC Raiders | `arc_get_wiki_page` | One wiki page as plain text + raw wikitext (infobox weapon stats); CC BY-SA 4.0 |
 | Finances | `finances_sync_status` | Feed health from each account's `last_sync` (not transaction age), reported separately from activity, with manual accounts excluded and an overall fresh/stale/dead verdict; optional `trigger_sync` — **call this first**, every other number depends on it |
-| Finances | `finances_monthly_summary` | One month's income, spend by category, total, and gap vs. the configured floor; excludes transfers/CC payments/off-budget; pro-rated pace mid-month; reports `uncategorized` as an explicit data-quality signal |
-| Finances | `finances_recurring` | Expected fixed obligations vs. what posted — MATCHED / CHANGED / MISSING / PENDING_STATEMENT / ENDED, on proportional (±%) tolerance bands, plus `notable_variances` that surface a big move even when a widened seasonal band keeps it MATCHED |
+| Finances | `finances_monthly_summary` | One month's income, spend by category, total, and gap vs. the configured floor; excludes transfers/CC payments/off-budget; pro-rated pace mid-month; reports `uncategorized` plus rolling-seven-day/MTD Amazon spend |
+| Finances | `finances_recurring` | Expected fixed obligations vs. what posted — MATCHED / CHANGED / MISSING / PENDING_STATEMENT / ENDED, on proportional (±%) tolerance bands, plus notable variances and genuinely new payees over the configured review threshold |
 | Finances | `finances_trend` | Per-category monthly spend series + income series over the last N months; flags the current partial month |
 | Finances | `finances_debt_status` | Every liability including off-budget loans, each with rate, 7/30-day deltas and an accelerate/ride classification against a configured hurdle rate; accelerate/ride/unknown totals, total debt, home equity, and a loud flag when a debt's class changes between runs |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
@@ -201,6 +201,11 @@ numbers, never prose or advice. Two deployment facts matter:
 `finances_monthly_summary` returns `gap_vs_floor: null` until
 `HOMELAB_MCP_FINANCES_FLOOR` is set — that number is a household decision and
 the tool refuses to invent one.
+
+Its Amazon aggregate always returns rolling-seven-day and month-to-date spend.
+`HOMELAB_MCP_FINANCES_AMAZON_BASELINE` optionally supplies the private monthly
+comparison baseline; the tool returns `monthly_baseline: null` rather than
+guessing when it is unset.
 
 `finances_debt_status` reads every balance from Actual — mortgage, HELOC, car
 loan and cards, on-budget or off. The single hand-maintained figure left in the
@@ -268,10 +273,11 @@ carrying it may call (`src/homelab_mcp/scopes.py`). The shipped default is
 
 ```
 finances_sync_status · finances_monthly_summary · finances_recurring
-finances_debt_status · signal_send
+finances_debt_status
 ```
 
-A `hermes` token is refused at `tools/call` for anything else (fails closed)
+A `hermes` token is refused at `tools/call` for anything else (fails closed),
+including `signal_send` because Hermes delivers through its native gateway,
 and those tools are filtered out of its `tools/list`. Tokens without a
 matching scope — interactive advisor sessions — keep full access. This makes
 the agent's compose-and-send-only remit structural rather than a prompt

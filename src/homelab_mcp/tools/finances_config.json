@@ -7,7 +7,7 @@
     "Seeded 2026-07-30 from the finances repo's PLAN.md; revised 2026-07-31 after",
     "the first live verification session (see that repo's DECISIONS.md).",
     "",
-    "Four sections:",
+    "Five sections:",
     "  hurdle_rate  the APR above which a debt is worth accelerating rather than",
     "               paying on schedule. Everything at or below it is cheap money",
     "               and gets 'ride'.",
@@ -22,6 +22,7 @@
     "               healthy for weeks; 'manual' accounts never sync at all and are",
     "               excluded from the verdict. Judging a monthly feed by a daily",
     "               rule is what made the overall verdict permanently 'dead'.",
+    "  pulse        non-secret matching policy for pulse-specific aggregates.",
     "  recurring    expected fixed obligations, checked against what posted."
   ],
 
@@ -129,6 +130,10 @@
     }
   },
 
+  "pulse": {
+    "amazon_match_any": ["amazon", "amzn"]
+  },
+
   "recurring": {
     "_comment": [
       "default_tolerance_pct is the band, as a percent of the expected amount,",
@@ -160,6 +165,8 @@
     ],
     "default_tolerance_pct": 10.0,
     "min_tolerance": 5.0,
+    "new_payee_threshold": 500.0,
+    "new_payee_lookback_days": 365,
     "items": [
       {
         "name": "Mortgage — Shellpoint/NewRez",

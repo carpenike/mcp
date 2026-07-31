@@ -127,6 +127,7 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
     monkeypatch.setenv("HOMELAB_MCP_OAUTH_REQUIRED", "false")
     monkeypatch.setenv("HOMELAB_MCP_FINANCES_SIDECAR_BASE_URL", BASE)
     monkeypatch.setenv("HOMELAB_MCP_FINANCES_SIDECAR_TOKEN", "tok")
+    monkeypatch.setenv("HOMELAB_MCP_FINANCES_AMAZON_BASELINE", "1234.56")
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
     return mcp.tools
@@ -163,6 +164,45 @@ async def test_monthly_summary_excludes_transfers_cc_and_offbudget(
     assert {r["category"] for r in out["spend_by_category"]} == {"Fixed", "Amazon"}
 
 
+async def test_monthly_summary_reports_amazon_week_and_mtd(
+    tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    _mock_month(
+        httpx_mock,
+        [
+            _txn(
+                id="week-a",
+                date="2026-07-26",
+                amount_cents=-2_500,
+                category_name="Groceries & Household",
+                payee_name="Amazon.com",
+            ),
+            _txn(
+                id="mtd-a",
+                date="2026-07-10",
+                amount_cents=-10_000,
+                category_name="Groceries & Household",
+                payee_name="AMZN Mktp US",
+            ),
+            _txn(
+                id="other",
+                date="2026-07-27",
+                amount_cents=-5_000,
+                category_name="Groceries & Household",
+                payee_name="Local Market",
+            ),
+        ],
+    )
+    out = await tools["finances_monthly_summary"](month="2026-07")
+    assert out["amazon"] == {
+        "week_start": "2026-07-25",
+        "week_end": "2026-07-31",
+        "week_spend": 25.0,
+        "mtd_spend": 125.0,
+        "monthly_baseline": 1234.56,
+    }
+
+
 async def test_monthly_summary_reports_uncategorized_separately(
     tools: dict[str, Callable[..., Any]], httpx_mock: HTTPXMock
 ) -> None:
@@ -197,7 +237,7 @@ async def test_gap_computed_when_floor_configured(
     monkeypatch.setenv("HOMELAB_MCP_FINANCES_FLOOR", "8400")
     mcp = CapturingMCP()
     register(mcp, Settings())  # type: ignore[arg-type]
-    _mock_month(httpx_mock, [_txn(amount_cents=-1_000_000)])
+    _mock_month(httpx_mock, [_txn(date="2026-01-05", amount_cents=-1_000_000)])
     out = await mcp.tools["finances_monthly_summary"](month="2026-01")
     assert out["gap_vs_floor"] == pytest.approx(10_000.0 - 8400.0)
 
@@ -526,6 +566,70 @@ async def test_daily_account_with_nothing_posted_is_still_missing(
     out = await tools["finances_recurring"](month="2026-07")
     assert out["obligations"][0]["status"] == "MISSING"
     assert out["needs_attention"] == ["Verizon"]
+
+
+async def test_recurring_reports_only_genuinely_new_payees_over_threshold(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="old-history",
+                    date="2026-06-01",
+                    amount_cents=-80_000,
+                    payee_name="Existing Vendor",
+                ),
+                _txn(
+                    id="old-current",
+                    date="2026-07-12",
+                    amount_cents=-70_000,
+                    payee_name="Existing Vendor",
+                ),
+                _txn(
+                    id="new-a",
+                    date="2026-07-10",
+                    amount_cents=-30_000,
+                    payee_name="Brand New Vendor",
+                ),
+                _txn(
+                    id="new-b",
+                    date="2026-07-20",
+                    amount_cents=-30_000,
+                    payee_name="Brand New Vendor",
+                ),
+                _txn(
+                    id="small",
+                    date="2026-07-15",
+                    amount_cents=-40_000,
+                    payee_name="Small New Vendor",
+                ),
+                _txn(
+                    id="known-bill",
+                    date="2026-07-16",
+                    amount_cents=-70_000,
+                    payee_name="Known Bill",
+                ),
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Known bill", "amount": 700.0, "match_any": ["known bill"]}],
+        new_payee_threshold=500.0,
+        new_payee_lookback_days=365,
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["new_payee_threshold"] == 500.0
+    assert out["new_payees_over_threshold"] == [
+        {
+            "payee": "Brand New Vendor",
+            "spend": 600.0,
+            "transaction_count": 2,
+            "first_seen": "2026-07-10",
+        }
+    ]
 
 
 async def test_recurring_matches_payment_on_the_liability_account(

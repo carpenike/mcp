@@ -438,7 +438,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "gap against the configured monthly floor. Excludes the 'CC Payments "
             "& Transfers' category, transfer legs, and off-budget accounts, so "
             "the total is household spend rather than money movement. For a "
-            "month still in progress it also returns a pro-rated pace projection. "
+            "month still in progress it also returns a pro-rated pace projection, "
+            "plus rolling-seven-day and month-to-date Amazon spend. "
             "Use for 'how are we doing this month', the weekly pulse's gap line, "
             "and monthly reviews. Check the `uncategorized` figure before quoting "
             "category totals — a large value means they understate reality."
@@ -453,16 +454,35 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         try:
             target = month or date.today().strftime("%Y-%m")
             first, last = _month_bounds(target)
+            today = date.today()
+            anchor = min(max(today, first), last)
+            week_start = anchor - timedelta(days=6)
+            pulse_cfg = _config().get("pulse") or {}
             categories = await _categories()
             income_names = _income_category_names(categories)
-            txns = await _transactions(first, last)
+            txns = await _transactions(min(first, week_start), last)
         except ToolError as err:
             return err.payload()
 
         by_category: dict[str, int] = defaultdict(int)
         income_cents = 0
         uncategorized_cents = 0
+        amazon_mtd_cents = 0
+        amazon_week_cents = 0
+        amazon_needles = [
+            str(value).lower() for value in pulse_cfg.get("amazon_match_any", ["amazon", "amzn"])
+        ]
         for t in txns:
+            txn_date = date.fromisoformat(t["date"])
+            if _is_spend(t, income_names):
+                payee = str(t.get("payee_name") or "").lower()
+                if any(needle in payee for needle in amazon_needles):
+                    if first <= txn_date <= last:
+                        amazon_mtd_cents += -t["amount_cents"]
+                    if week_start <= txn_date <= anchor:
+                        amazon_week_cents += -t["amount_cents"]
+            if not first <= txn_date <= last:
+                continue
             if t["account_offbudget"] or t["is_transfer"]:
                 continue
             name = t["category_name"]
@@ -476,7 +496,6 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     uncategorized_cents += -t["amount_cents"]
 
         total_cents = sum(by_category.values())
-        today = date.today()
         in_progress = first <= today <= last
         days_elapsed = (today - first).days + 1 if in_progress else (last - first).days + 1
         days_in_month = (last - first).days + 1
@@ -496,6 +515,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             ],
             "excluded_category": EXCLUDED_CATEGORY,
             "floor": floor,
+            "amazon": {
+                "week_start": week_start.isoformat(),
+                "week_end": anchor.isoformat(),
+                "week_spend": _d(amazon_week_cents),
+                "mtd_spend": _d(amazon_mtd_cents),
+                "monthly_baseline": settings.finances_amazon_baseline,
+            },
         }
         if floor is None:
             result["gap_vs_floor"] = None
@@ -526,8 +552,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "posted yet), or ENDED (past its final month). Use for late-fee "
             "prevention in the weekly pulse and to catch silent price rises. "
             "The expected list is operator-maintained config, not inferred from "
-            "history, so a genuinely new bill shows up as unmatched spend "
-            "elsewhere rather than being silently absorbed here."
+            "history. Also returns genuinely new payees whose month-to-date "
+            "spend exceeds the configured review threshold."
         ),
     )
     async def recurring(
@@ -541,6 +567,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             first, last = _month_bounds(target)
             cfg = _config()
             rec_cfg = cfg.get("recurring") or {}
+            new_payee_threshold = float(rec_cfg.get("new_payee_threshold", 500.0))
+            new_payee_lookback_days = int(rec_cfg.get("new_payee_lookback_days", 365))
             cadence_of: dict[str, str] = dict(((cfg.get("sync") or {}).get("accounts")) or {})
             # Fetch wide enough to cover the most boundary-slipping item, then
             # narrow per item. Items without a slip keep calendar-month scope.
@@ -550,9 +578,11 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             ]
             pad_before = max((int(s.get("before", 0)) for s in slips), default=0)
             pad_after = max((int(s.get("after", 0)) for s in slips), default=0)
-            txns = await _transactions(
-                first - timedelta(days=pad_before), last + timedelta(days=pad_after)
+            history_start = min(
+                first - timedelta(days=pad_before),
+                first - timedelta(days=new_payee_lookback_days),
             )
+            txns = await _transactions(history_start, last + timedelta(days=pad_after))
         except ToolError as err:
             return err.payload()
 
@@ -726,6 +756,51 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             ),
             key=lambda r: -abs(float(r["delta_pct"] or 0)),
         )
+        prior_payees = {
+            str(t.get("payee_name") or "").strip().lower()
+            for t in txns
+            if t["date"] < first.isoformat() and str(t.get("payee_name") or "").strip()
+        }
+        new_payees: dict[str, dict[str, Any]] = {}
+        for t in txns:
+            payee = str(t.get("payee_name") or "").strip()
+            normalized = payee.lower()
+            if (
+                not first.isoformat() <= t["date"] <= last.isoformat()
+                or t["id"] in claimed
+                or not payee
+                or normalized in prior_payees
+                or t["account_offbudget"]
+                or t["is_transfer"]
+                or t["category_name"] == EXCLUDED_CATEGORY
+                or t["amount_cents"] >= 0
+            ):
+                continue
+            row = new_payees.setdefault(
+                normalized,
+                {
+                    "payee": payee,
+                    "spend_cents": 0,
+                    "transaction_count": 0,
+                    "first_seen": t["date"],
+                },
+            )
+            row["spend_cents"] += -t["amount_cents"]
+            row["transaction_count"] += 1
+            row["first_seen"] = min(row["first_seen"], t["date"])
+        new_payees_over_threshold = sorted(
+            (
+                {
+                    "payee": row["payee"],
+                    "spend": _d(row["spend_cents"]),
+                    "transaction_count": row["transaction_count"],
+                    "first_seen": row["first_seen"],
+                }
+                for row in new_payees.values()
+                if _d(row["spend_cents"]) > new_payee_threshold
+            ),
+            key=lambda row: (-float(row["spend"]), str(row["payee"]).lower()),
+        )
         return {
             "month": target,
             "month_in_progress": in_progress,
@@ -735,6 +810,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             # per-item override kept at MATCHED. The seasonal-bill escape hatch
             # must not double as a way to hide a price rise.
             "notable_variances": notable_variances,
+            "new_payee_threshold": new_payee_threshold,
+            "new_payee_lookback_days": new_payee_lookback_days,
+            "new_payees_over_threshold": new_payees_over_threshold,
             "default_tolerance_pct": default_pct,
             "obligations": rows,
         }

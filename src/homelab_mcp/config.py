@@ -417,6 +417,15 @@ class Settings(BaseSettings):
             "`gap_vs_floor: null` rather than guessing."
         ),
     )
+    finances_amazon_baseline: float | None = Field(
+        default=None,
+        description=(
+            "Monthly Amazon spending baseline in DOLLARS. SECRET household "
+            "context supplied through the sops-managed EnvironmentFile. While "
+            "null, the Amazon aggregate still reports week and month-to-date "
+            "spend but no baseline."
+        ),
+    )
     # NOTE: there is deliberately no `finances_mortgage_balance` setting. The
     # mortgage was linked as a synced off-budget account in Actual on
     # 2026-07-30, so finances_debt_status reads it like every other balance.
@@ -501,16 +510,15 @@ class Settings(BaseSettings):
     # ── Restricted-scope clients (hermes-agent) ──────────────────────
     restricted_scopes: dict[str, list[str]] = Field(
         default={
-            # hermes-agent composes the weekly pulse and sends it. It needs the
-            # four read summaries plus the transport, and nothing else: no raw
-            # transactions (finances_trend), no documents, no writes anywhere.
+            # hermes-agent composes the weekly pulse and delivers it through its
+            # native Signal gateway. It needs four read summaries and nothing
+            # else: no raw transactions, documents, messaging tools, or writes.
             # Enforced at dispatch in `scopes.py`, not merely by convention.
             "hermes": [
                 "finances_sync_status",
                 "finances_monthly_summary",
                 "finances_recurring",
                 "finances_debt_status",
-                "signal_send",
             ],
         },
         description=(

@@ -1,7 +1,7 @@
 """Tool-allowlisting tests.
 
 The acceptance requirement for the hermes credential is precise: it can call
-exactly its five tools and is rejected from every other one. These tests hold
+exactly its four tools and is rejected from every other one. These tests hold
 that line, including the cases that would quietly widen it — a batched
 JSON-RPC request smuggling a forbidden call alongside a permitted one, and an
 unrestricted token that must keep full access.
@@ -26,7 +26,6 @@ HERMES_TOOLS = {
     "finances_monthly_summary",
     "finances_recurring",
     "finances_debt_status",
-    "signal_send",
 }
 
 
@@ -37,7 +36,7 @@ def _settings() -> Settings:
 # ── allowlist resolution ─────────────────────────────────────────────
 
 
-def test_hermes_scope_resolves_to_exactly_five_tools() -> None:
+def test_hermes_scope_resolves_to_exactly_four_tools() -> None:
     allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
     assert allowed == HERMES_TOOLS
 
@@ -115,7 +114,7 @@ def _call(client: TestClient, tool: str) -> Any:
 
 
 @pytest.mark.parametrize("tool", sorted(HERMES_TOOLS))
-def test_hermes_can_call_each_of_its_five_tools(tool: str) -> None:
+def test_hermes_can_call_each_of_its_four_tools(tool: str) -> None:
     resp = _call(_app("hermes"), tool)
     assert resp.status_code == 200
     assert resp.json()["result"] == {"ok": True}
@@ -125,6 +124,7 @@ def test_hermes_can_call_each_of_its_five_tools(tool: str) -> None:
     "tool",
     [
         "finances_trend",  # raw-ish series: deliberately out of remit
+        "signal_send",  # Hermes delivers through its native Signal gateway
         "paperless_search",
         "paperless_link",
         "ha_call_service",  # the physical control plane
@@ -153,7 +153,7 @@ def test_batched_request_is_blocked_if_any_call_is_forbidden() -> None:
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": "signal_send"},
+                "params": {"name": "finances_sync_status"},
             },
             {
                 "jsonrpc": "2.0",
@@ -217,5 +217,5 @@ def test_denied_call_is_audit_logged(caplog: pytest.LogCaptureFixture) -> None:
 def test_json_body_without_tools_list_result_passes_through_unchanged() -> None:
     """Fail-open on shapes we don't recognize; call-time enforcement is the gate."""
     client = _app("hermes")
-    resp = _call(client, "signal_send")
+    resp = _call(client, "finances_sync_status")
     assert json.loads(resp.content)["result"] == {"ok": True}
