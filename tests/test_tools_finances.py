@@ -873,7 +873,7 @@ async def test_recurring_matches_against_notes_not_just_payee(
         [
             {
                 "name": "USAA life",
-                "amount": 44.0,
+                "amount": 44.15,
                 "match_any": ["usaa life insurance", "usaa.com pay int life"],
                 "ends": None,
             }
@@ -883,7 +883,9 @@ async def test_recurring_matches_against_notes_not_just_payee(
     row = out["obligations"][0]
     assert row["status"] == "MATCHED"
     assert row["actual_amount"] == 44.15
-    # 0.15 on a $44 bill is noise, not a price rise.
+    # Expectation now equals the real charge, so there is no standing delta to
+    # explain away every month.
+    assert row["delta"] == 0.0
     assert row["notable_variance"] is False
 
 
@@ -903,3 +905,15 @@ async def test_card_balance_classifies_accelerate(tmp_path: Any, httpx_mock: HTT
     assert by["Amex Platinum"]["class"] == "accelerate"
     assert out["unknown_total"] == 0.0
     assert not [d for d in out["debts"] if d["class"] == "unknown"]
+
+
+def test_shipped_expectations_match_the_observed_charges() -> None:
+    """Expected amounts are the real ones, so deltas mean something.
+
+    A permanently non-zero delta is noise that trains the reader to ignore the
+    column. USAA Life bills $44.15, not $44.00.
+    """
+    items = _shipped()["recurring"]["items"]
+    by_name = {i["name"]: i for i in items}
+    assert by_name["USAA life insurance"]["amount"] == 44.15
+    assert by_name["Mortgage — Shellpoint/NewRez"]["amount"] == 2735.68

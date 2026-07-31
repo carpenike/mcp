@@ -234,7 +234,7 @@
       },
       {
         "name": "USAA life insurance",
-        "amount": 44.0,
+        "amount": 44.15,
         "expected_day": null,
         "match_any": ["usaa life insurance", "usaa.com pay int life"],
         "ends": null,
