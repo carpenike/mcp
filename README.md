@@ -183,6 +183,14 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_rules_list` | Actual's auto-categorization rules: what each matches, which category it sets |
 | Finances | `finances_rule_create` | Create a set-category rule matching payee ids OR an imported-payee regex; the action is built server-side so it cannot rewrite payees or amounts |
 | Finances | `finances_rule_delete` | Delete a rule; refuses any rule that does more than set a category |
+| Finances | `finances_payees` / `finances_payee_merge` | Payees with transaction counts to spot duplicate variants; merge folds them into one. Merge is **irreversible** and refuses transfer payees |
+| Finances | `finances_buffer` | PLAN.md's fear metric: cleared checking − card debt − next mortgage, plus the 14-day look-ahead. Components and totals, so it can be checked by hand |
+| Finances | `finances_breaches` | Non-income deposits into checking — money arriving from HYSA/brokerage/HELOC to fund operations. Detection only |
+| Finances | `finances_room` | The "can we spend this?" arithmetic: elapsed %, pro-rated floor, pace delta, room left, optional per-category trailing average |
+| Finances | `finances_reconcile` | Register vs cleared balance per account, feed status and age, drift classified |
+| Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
+| Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only) |
+| Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |

@@ -239,6 +239,20 @@ def test_json_body_without_tools_list_result_passes_through_unchanged() -> None:
 
 # ── advisor scope (the interactive write layer) ──────────────────────
 
+ADVISOR_ADDED_V2 = {
+    "finances_payees",
+    "finances_payee_merge",
+    "finances_buffer",
+    "finances_breaches",
+    "finances_room",
+    "finances_reconcile",
+    "finances_subscriptions",
+    "finances_net_worth",
+    "finances_payoff_projection",
+}
+# hermes gains exactly these three and nothing else.
+HERMES_ADDED_V2 = {"finances_buffer", "finances_breaches", "finances_room"}
+
 ADVISOR_TOOLS = {
     "finances_sync_status",
     "finances_monthly_summary",
@@ -254,6 +268,7 @@ ADVISOR_TOOLS = {
     "paperless_get",
     "paperless_link",
     "signal_send",
+    *ADVISOR_ADDED_V2,
 }
 
 # Everything the advisor layer added. hermes must reach none of it.
@@ -279,15 +294,41 @@ def test_advisor_scope_excludes_the_physical_control_plane() -> None:
         assert tool not in allowed
 
 
-def test_hermes_scope_is_unchanged_by_the_advisor_addition() -> None:
-    """hermes keeps exactly its four read summaries — no drift."""
+HERMES_TOOLS = {
+    "finances_sync_status",
+    "finances_monthly_summary",
+    "finances_recurring",
+    "finances_debt_status",
+    *HERMES_ADDED_V2,
+}
+
+
+def test_hermes_scope_is_exactly_its_seven() -> None:
+    """Four read summaries plus the three the pulse needs. Nothing more."""
     allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
-    assert allowed == {
-        "finances_sync_status",
-        "finances_monthly_summary",
-        "finances_recurring",
-        "finances_debt_status",
-    }
+    assert allowed == HERMES_TOOLS
+    assert len(allowed) == 7
+
+
+@pytest.mark.parametrize("tool", sorted(ADVISOR_ADDED_V2 - HERMES_ADDED_V2))
+def test_hermes_is_403_on_every_advisor_only_tool(tool: str) -> None:
+    """The balance sheet, the payee writer and the raw scans stay out of reach."""
+    resp = _call(_app("hermes"), tool)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == -32601
+
+
+@pytest.mark.parametrize("tool", sorted(HERMES_ADDED_V2))
+def test_hermes_can_call_its_three_new_tools(tool: str) -> None:
+    assert _call(_app("hermes"), tool).status_code == 200
+
+
+def test_advisor_is_a_superset_of_hermes() -> None:
+    scopes = _settings().restricted_scopes
+    advisor = resolve_allowlist({"scope": "advisor"}, scopes)
+    hermes = resolve_allowlist({"scope": "hermes"}, scopes)
+    assert advisor is not None and hermes is not None
+    assert hermes <= advisor
 
 
 @pytest.mark.parametrize("tool", NEW_WRITE_TOOLS)

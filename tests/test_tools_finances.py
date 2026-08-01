@@ -1462,3 +1462,381 @@ async def test_rule_delete_unknown_id(tmp_path: Any, httpx_mock: HTTPXMock) -> N
     httpx_mock.add_response(url=f"{BASE}/rules", method="GET", json=_rules_payload())
     out = await _adv_tools(tmp_path)["finances_rule_delete"](rule_id="nope")
     assert out["error"]["code"] == "finances_rule_not_found"
+
+
+# ── buffer / breaches / room ──────────────────────────────────────────
+
+
+def _v2_cfg(tmp_path: Any, _name: str = "v2.json", **over: Any) -> str:
+    body: dict[str, Any] = {
+        "buffer": {
+            "cash_accounts": ["USAA Checking"],
+            "card_accounts": ["Apple Card", "Chase Freedom", "Chase Sapphire"],
+            "mortgage_obligation": "Mortgage",
+            "lookahead_days": 14,
+        },
+        "income_payees": {"allow_substrings": ["microsoft", "irs", "interest"]},
+        "lumpy": {
+            "items": [
+                {"name": "Baseball", "annual_amount": 2400.0, "category": "Kids"},
+                {"name": "Unquantified", "annual_amount": None, "category": "Health"},
+            ]
+        },
+        "recurring": {
+            "items": [
+                {"name": "Mortgage", "amount": 2735.68, "expected_day": 1, "match_any": ["m"]},
+                {"name": "Verizon", "amount": 95.0, "expected_day": 20, "match_any": ["v"]},
+            ]
+        },
+        "debts": {"Spectra HELOC": {"rate": 6.75, "is_variable": True, "scheduled_payment": 650.0}},
+    }
+    body.update(over)
+    cfg = tmp_path / _name
+    cfg.write_text(json.dumps(body))
+    return str(cfg)
+
+
+def _v2_tools(tmp_path: Any, **settings_over: Any) -> Any:
+    kw: dict[str, Any] = {
+        "_env_file": None,
+        "oauth_required": False,
+        "finances_sidecar_base_url": BASE,
+        "finances_config_path": _v2_cfg(tmp_path),
+    }
+    kw.update(settings_over)
+    mcp = CapturingMCP()
+    register(mcp, Settings(**kw))  # type: ignore[arg-type]
+    return mcp.tools
+
+
+def _acct(name: str, register: int, cleared: int, **kw: Any) -> dict[str, Any]:
+    base = {
+        "id": name.lower().replace(" ", "-"),
+        "name": name,
+        "offbudget": False,
+        "closed": False,
+        "balance_cents": register,
+        "cleared_balance_cents": cleared,
+        "last_sync": "1785583758342",
+        "bank_sync_status": "ok",
+    }
+    base.update(kw)
+    return base
+
+
+def _buffer_accounts() -> dict[str, Any]:
+    return {
+        "accounts": [
+            # Register and cleared deliberately differ, to pin which is used.
+            _acct("USAA Checking", 5_000_000, 4_648_201),
+            _acct("Amex Savings (HYSA)", 315_993, 315_993),
+            _acct("Apple Card", -9_308, -9_308),
+            _acct("Chase Freedom", -10_767, 2_120),
+            _acct("Chase Sapphire", 9_500, 9_500),
+            _acct("Synchrony Container Store", -537_154, -537_154),
+        ]
+    }
+
+
+async def test_buffer_uses_cleared_cash_and_register_cards(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """PLAN.md qualifies only the cash side as cleared."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    c = out["components"]
+    assert c["cleared_cash"] == 46_482.01  # cleared, not the 50,000 register
+    # Only cards in debt: 93.08 + 107.67. Sapphire's credit is not cash.
+    assert c["card_debt"] == pytest.approx(200.75)
+    assert out["buffer"] == pytest.approx(46_482.01 - 200.75 - 2_735.68)
+
+
+async def test_buffer_excludes_hysa_and_instalment_debt(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Operations run on checking; Synchrony is a schedule, not revolving."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    cash = {a["account"] for a in out["components"]["cash_accounts"]}
+    cards = {a["account"] for a in out["components"]["card_accounts"]}
+    assert cash == {"USAA Checking"}
+    assert "Amex Savings (HYSA)" not in cash | cards
+    assert "Synchrony Container Store" not in cards
+
+
+async def test_buffer_reports_no_floor_until_one_is_set(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    assert out["floor"] is None
+    assert out["status"] == "no_floor"
+
+
+async def test_buffer_flags_below_floor(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    out = await _v2_tools(tmp_path, finances_buffer_floor=90_000.0)["finances_buffer"]()
+    assert out["status"] == "below_floor"
+
+
+async def test_buffer_lookahead_never_exceeds_the_buffer(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Scheduled outflows only ever reduce it — an autopay pull is not income."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    assert out["buffer_after_scheduled"] <= out["buffer"]
+    assert out["scheduled_outflows_total"] >= 0
+
+
+async def test_breaches_flags_non_income_deposits_only(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                # Breach: a brokerage sale funding operations.
+                _txn(id="1", amount_cents=3_070_787, payee_name="Fidelity Brokerage Services"),
+                # Income, allowlisted.
+                _txn(id="2", amount_cents=800_000, payee_name="Microsoft Payroll"),
+                # Outflow, not a deposit.
+                _txn(id="3", amount_cents=-5_000, payee_name="Anything"),
+                # Deposit into a non-cash account.
+                _txn(id="4", amount_cents=100_000, account_name="Amex Savings (HYSA)"),
+                # Account setup, not a real deposit.
+                _txn(id="5", amount_cents=900_000, payee_name="Starting Balance"),
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path)["finances_breaches"](lookback_days=120)
+    assert [b["payee"] for b in out["breach_candidates"]] == ["Fidelity Brokerage Services"]
+    assert out["total_amount"] == pytest.approx(30_707.87)
+
+
+async def test_room_arithmetic_and_savings_exclusion(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """The floor governs consumption; 529 contributions are not spend."""
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id="a", date="2026-07-05", amount_cents=-100_000, category_name="Fixed"),
+                _txn(
+                    id="b",
+                    date="2026-07-06",
+                    amount_cents=-50_000,
+                    category_name="Savings/Investments",
+                ),
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path, finances_floor=8400.0)["finances_room"]()
+    assert out["consumption_mtd"] == 1000.0
+    assert out["savings_mtd"] == 500.0  # reported, not counted
+    # 31 July days, frozen at the 31st.
+    assert out["days_elapsed"] == 31 and out["days_in_month"] == 31
+    assert out["floor_to_date"] == pytest.approx(8400.0)
+    assert out["pace_delta"] == pytest.approx(1000.0 - 8400.0)
+    assert out["room_this_month"] == pytest.approx(7400.0)
+
+
+# ── amortization ──────────────────────────────────────────────────────
+
+
+async def test_amortized_gap_differs_by_exactly_one_twelfth(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": [_txn(id="a", amount_cents=-900_000, category_name="Fixed")]},
+    )
+    out = await _v2_tools(tmp_path, finances_floor=8400.0)["finances_monthly_summary"](
+        month="2026-07"
+    )
+    # Only the quantified lumpy contributes: 2400/12. The null one must not.
+    assert out["lumpy_monthly_amortized"] == 200.0
+    assert round(out["gap_vs_floor_amortized"] - out["gap_vs_floor"], 2) == 200.0
+    unquantified = [i for i in out["lumpy_items"] if not i["quantified"]]
+    assert len(unquantified) == 1
+    assert unquantified[0]["monthly_amortized"] is None
+
+
+async def test_savings_is_excluded_from_the_floor_comparator(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id="a", amount_cents=-100_000, category_name="Fixed"),
+                _txn(id="b", amount_cents=-50_000, category_name="Savings/Investments"),
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path, finances_floor=8400.0)["finances_monthly_summary"](
+        month="2026-07"
+    )
+    assert out["total_spend"] == 1500.0
+    assert out["savings_contributions"] == 500.0
+    assert out["consumption_spend"] == 1000.0
+    # The gap must not penalize wealth-building.
+    assert out["gap_vs_floor"] == pytest.approx(1000.0 - 8400.0)
+    assert out["gap_basis"] == "consumption_spend"
+
+
+# ── payoff / net worth / reconcile / payees ───────────────────────────
+
+
+async def test_payoff_reports_never_when_payment_cannot_cover_interest(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/accounts",
+        json={"accounts": [_acct("Spectra HELOC", -10_929_004, -10_929_004)]},
+    )
+    tools = _v2_tools(
+        tmp_path,
+        finances_config_path=_v2_cfg(
+            tmp_path,
+            "interest_only.json",
+            debts={
+                "Spectra HELOC": {
+                    "rate": 6.75,
+                    "is_variable": True,
+                    # Below the ~$614.76 monthly interest.
+                    "scheduled_payment": 400.0,
+                }
+            },
+        ),
+    )
+    out = await tools["finances_payoff_projection"](debt_name="Spectra HELOC")
+    assert out["minimum_only_baseline"]["months"] is None
+    assert "never amortizes" in out["minimum_only_baseline"]["note"]
+
+
+async def test_payoff_extra_payment_beats_the_baseline(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/accounts",
+        json={"accounts": [_acct("Spectra HELOC", -10_929_004, -10_929_004)]},
+    )
+    out = await _v2_tools(tmp_path)["finances_payoff_projection"](
+        debt_name="Spectra HELOC", extra_monthly=3000
+    )
+    months = out["projection"]["months"]
+    assert months is not None and 30 <= months <= 40  # ~3 years, per PLAN.md
+    assert out["interest_saved_vs_baseline"] > 0
+
+
+async def test_payoff_refuses_to_guess_a_missing_rate(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/accounts", json={"accounts": [_acct("Mystery Card", -50_000, -50_000)]}
+    )
+    out = await _v2_tools(tmp_path)["finances_payoff_projection"](debt_name="Mystery Card")
+    assert out["error"]["code"] == "finances_rate_unknown"
+
+
+async def test_net_worth_labels_equity_display_only(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/accounts",
+        json={
+            "accounts": [
+                _acct("House", 85_000_000, 85_000_000, offbudget=True),
+                _acct("Mortgage (NewRez)", -39_217_246, -39_217_246, offbudget=True),
+                _acct("Spectra HELOC", -10_929_004, -10_929_004),
+                _acct("USAA Checking", 4_648_201, 4_648_201),
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path)["finances_net_worth"]()
+    assert out["home_equity"] == pytest.approx(348_537.50)
+    assert "DISPLAY ONLY" in out["home_equity_note"]
+    assert out["net_worth"] == pytest.approx(850_000 - 392_172.46 - 109_290.04 + 46_482.01)
+
+
+async def test_reconcile_classifies_drift(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/accounts",
+        json={
+            "accounts": [
+                _acct("USAA Checking", 4_648_201, 4_648_201),
+                _acct("Citi Costco", -22_473, -219_550),
+                _acct("Broken Feed", -1_000, -1_000, bank_sync_status="error"),
+                _acct("Manual Loan", -100_000, -100_000, last_sync=None),
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path)["finances_reconcile"]()
+    by = {r["account"]: r for r in out["accounts"]}
+    assert by["USAA Checking"]["classification"] == "exact"
+    assert by["Citi Costco"]["classification"] == "settlement_window"
+    assert by["Broken Feed"]["classification"] == "feed_error"
+    assert by["Manual Loan"]["classification"] == "manual"
+    assert "Broken Feed" in out["needs_attention"]
+    # The known limitation must be stated, not implied.
+    assert "not exposed by Actual's API" in out["limitation"]
+
+
+async def test_payee_merge_refuses_a_transfer_payee(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """Merging a transfer payee would corrupt account-to-account wiring."""
+    httpx_mock.add_response(
+        url=f"{BASE}/payees",
+        json={
+            "payees": [
+                {"id": "keep", "name": "Costco", "transaction_count": 10, "transfer_acct": None},
+                {
+                    "id": "xfer",
+                    "name": "Transfer: HYSA",
+                    "transaction_count": 3,
+                    "transfer_acct": "a1",
+                },
+            ]
+        },
+    )
+    out = await _v2_tools(tmp_path)["finances_payee_merge"](keep_id="keep", merge_ids=["xfer"])
+    assert out["error"]["code"] == "finances_merge_transfer_payee"
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+async def test_payee_merge_reports_irreversibility(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url=f"{BASE}/payees",
+        json={
+            "payees": [
+                {"id": "keep", "name": "Costco", "transaction_count": 10, "transfer_acct": None},
+                {"id": "dup", "name": "COSTCO WHSE", "transaction_count": 4, "transfer_acct": None},
+            ]
+        },
+    )
+    httpx_mock.add_response(url=f"{BASE}/payees/merge", method="POST", json={"merged": True})
+    out = await _v2_tools(tmp_path)["finances_payee_merge"](keep_id="keep", merge_ids=["dup"])
+    assert out["merged"] is True
+    assert out["reversible"] is False
+    assert out["transactions_repointed"] == 4
+
+
+async def test_subscriptions_requires_min_months(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(id=f"s{i}", date=f"2026-0{i}-10", amount_cents=-1_099, payee_name="Spotify")
+                for i in range(1, 5)
+            ]
+            + [_txn(id="one", date="2026-05-01", amount_cents=-9_999, payee_name="One Off")]
+        },
+    )
+    out = await _v2_tools(tmp_path)["finances_subscriptions"](min_months=3)
+    names = {s["payee"] for s in out["subscriptions"]}
+    assert names == {"Spotify"}
+    spotify = out["subscriptions"][0]
+    assert spotify["months_present"] == 4
+    assert spotify["fixed_amount"] is True
+    assert spotify["first_seen"] == "2026-01-10"
