@@ -1764,27 +1764,182 @@ async def test_net_worth_labels_equity_display_only(tmp_path: Any, httpx_mock: H
     assert out["net_worth"] == pytest.approx(850_000 - 392_172.46 - 109_290.04 + 46_482.01)
 
 
-async def test_reconcile_classifies_drift(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+def _rc_cfg(tmp_path: Any) -> str:
+    cfg = tmp_path / "rc.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "reconcile": {
+                    "settlement_window_days": 7,
+                    "pending_alert_threshold": 25000.0,
+                    "market_valued_accounts": ["Fidelity Brokerage"],
+                    "pending_inclusive_accounts": ["USAA Checking"],
+                },
+                "recurring": {"items": []},
+            }
+        )
+    )
+    return str(cfg)
+
+
+def _rc_tools(tmp_path: Any) -> Any:
+    mcp = CapturingMCP()
+    register(
+        mcp,  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            oauth_required=False,
+            finances_sidecar_base_url=BASE,
+            finances_config_path=_rc_cfg(tmp_path),
+        ),
+    )
+    return mcp.tools
+
+
+def _rc_accounts() -> dict[str, Any]:
+    return {
+        "accounts": [
+            _acct("USAA Checking", 4_648_201, 4_648_201, simplefin_id="ACT-usaa"),
+            _acct("Mortgage (NewRez)", -39_217_246, -39_217_246, simplefin_id="ACT-mtg"),
+            _acct("Citi Costco", -22_473, -22_473, simplefin_id="ACT-citi"),
+            _acct("Fidelity Brokerage", 13_678_711, 13_678_711, simplefin_id="ACT-fid"),
+            _acct("Tesla Loan (Santander)", -4_368_588, -4_368_588, last_sync=None),
+        ]
+    }
+
+
+def _rc_bank(usaa: float = 36_404.03) -> dict[str, Any]:
+    return {
+        "accounts": [
+            {
+                "simplefin_id": "ACT-usaa",
+                "balance": usaa,
+                "available_balance": usaa,
+                "balance_date": 1785508459,
+                "name": "USAA CHECKING",
+                "org": "USAA",
+            },
+            {
+                "simplefin_id": "ACT-mtg",
+                "balance": -392_172.46,
+                "available_balance": None,
+                "balance_date": 1785508459,
+                "name": "MTG",
+                "org": "NewRez",
+            },
+            {
+                "simplefin_id": "ACT-citi",
+                "balance": 0.0,
+                "available_balance": 0.0,
+                "balance_date": 1785508459,
+                "name": "CITI",
+                "org": "Citi",
+            },
+            {
+                "simplefin_id": "ACT-fid",
+                "balance": 156_704.40,
+                "available_balance": None,
+                "balance_date": 1785508459,
+                "name": "FID",
+                "org": "Fidelity",
+            },
+        ]
+    }
+
+
+def _rc_mock(httpx_mock: HTTPXMock, bank: dict[str, Any], activity_cents: int) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_rc_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=bank)
     httpx_mock.add_response(
-        url=f"{BASE}/accounts",
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
         json={
-            "accounts": [
-                _acct("USAA Checking", 4_648_201, 4_648_201),
-                _acct("Citi Costco", -22_473, -219_550),
-                _acct("Broken Feed", -1_000, -1_000, bank_sync_status="error"),
-                _acct("Manual Loan", -100_000, -100_000, last_sync=None),
-            ]
+            "transactions": [_txn(id="r", account_id="usaa-checking", amount_cents=activity_cents)]
         },
     )
-    out = await _v2_tools(tmp_path)["finances_reconcile"]()
+
+
+async def test_reconcile_uses_the_banks_own_balance(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """The whole point: a register can now be checked against reality."""
+    _rc_mock(httpx_mock, _rc_bank(), -9_472_897)  # big recent activity
+    out = await _rc_tools(tmp_path)["finances_reconcile"]()
+    assert out["mode"] == "bank_verified"
     by = {r["account"]: r for r in out["accounts"]}
-    assert by["USAA Checking"]["classification"] == "exact"
-    assert by["Citi Costco"]["classification"] == "settlement_window"
-    assert by["Broken Feed"]["classification"] == "feed_error"
-    assert by["Manual Loan"]["classification"] == "manual"
-    assert "Broken Feed" in out["needs_attention"]
-    # The known limitation must be stated, not implied.
-    assert "not exposed by Actual's API" in out["limitation"]
+    assert by["USAA Checking"]["bank_reported_balance"] == 36_404.03
+    assert by["USAA Checking"]["drift"] == pytest.approx(10_077.98)
+
+
+async def test_reconcile_classifications(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _rc_mock(httpx_mock, _rc_bank(), -9_472_897)
+    out = await _rc_tools(tmp_path)["finances_reconcile"]()
+    by = {r["account"]: r for r in out["accounts"]}
+    # Bank agrees exactly.
+    assert by["Mortgage (NewRez)"]["classification"] == "exact"
+    # Drift smaller than the week's activity is float, not fault.
+    assert by["USAA Checking"]["classification"] == "settlement_window"
+    assert by["USAA Checking"]["pending_inclusive"] is True
+    # Live market value vs a transaction-driven register.
+    assert by["Fidelity Brokerage"]["classification"] == "market_movement"
+    # No bank to disagree with.
+    assert by["Tesla Loan (Santander)"]["classification"] == "manual"
+    assert by["Tesla Loan (Santander)"]["drift"] is None
+    assert "Tesla Loan (Santander)" not in out["needs_attention"]
+
+
+async def test_reconcile_detects_a_structural_drift(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """The Jan-Apr 2026 fault: register wrong for months, everything cleared.
+
+    Perturb the register far beyond the settlement window with almost no
+    recent activity — the shape cleared-vs-register mode could never see.
+    """
+    accounts = _rc_accounts()
+    for a in accounts["accounts"]:
+        if a["name"] == "USAA Checking":
+            # $12,195.50 off, exactly the documented anchor error, and fully
+            # "cleared" so the old mode reported it as healthy.
+            a["balance_cents"] = a["cleared_balance_cents"] = 4_859_953
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=accounts)
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_rc_bank(36_404.03))
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": [_txn(id="q", account_id="usaa-checking", amount_cents=-5_000)]},
+    )
+    out = await _rc_tools(tmp_path)["finances_reconcile"]()
+    usaa = {r["account"]: r for r in out["accounts"]}["USAA Checking"]
+    assert usaa["classification"] == "structural"
+    assert usaa["uncleared"] == 0.0  # fully cleared, yet wrong
+    assert "anchor-error shape" in usaa["note"]
+    assert "USAA Checking" in out["needs_attention"]
+
+
+async def test_pending_inclusive_does_not_license_unlimited_drift(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """The flag explains expected drift; it must not suppress a huge one."""
+    _rc_mock(httpx_mock, _rc_bank(usaa=-30_000.0), -99_999_999)
+    out = await _rc_tools(tmp_path)["finances_reconcile"]()
+    usaa = {r["account"]: r for r in out["accounts"]}["USAA Checking"]
+    assert usaa["drift"] > 25_000.0
+    assert usaa["classification"] == "structural"
+    assert "alert threshold" in usaa["note"]
+
+
+async def test_reconcile_degrades_honestly_without_bank_balances(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Never report a comparison it did not make."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_rc_accounts())
+    httpx_mock.add_response(
+        url=f"{BASE}/simplefin-balances", status_code=503, json={"error": "simplefin_unavailable"}
+    )
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+    )
+    out = await _rc_tools(tmp_path)["finances_reconcile"]()
+    assert out["mode"] == "cleared_only"
+    assert "would be invisible" in out["limitation"]
+    by = {r["account"]: r for r in out["accounts"]}
+    assert by["USAA Checking"]["classification"] == "no_bank_balance"
+    assert "USAA Checking" in out["needs_attention"]
 
 
 async def test_payee_merge_refuses_a_transfer_payee(tmp_path: Any, httpx_mock: HTTPXMock) -> None:

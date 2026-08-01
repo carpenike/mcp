@@ -2120,24 +2120,52 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         annotations=_RO,
         name="finances_reconcile",
         description=(
-            "Per account: the register balance (every transaction) against the "
-            "cleared balance (only what the bank has confirmed), the gap "
-            "between them, the feed's status and its last successful fetch. "
-            "The gap is normal settlement float when small and recent; a large "
-            "or old one means transactions are sitting unconfirmed. IMPORTANT "
-            "LIMIT: Actual's API does not expose the bank's own reported "
-            "balance, so this cannot detect a register that has drifted from "
-            "reality while every transaction is cleared — the documented "
-            "Jan-Apr 2026 drift is exactly that shape and would NOT be caught "
-            "here. Detection only; it changes nothing."
+            "Compare Actual's register against the BANK'S OWN reported balance, "
+            "per account. This is what catches a register that has drifted from "
+            "reality while every transaction reads as cleared — the Jan-Apr 2026 "
+            "fault, where the balance was wrong for months and nothing looked "
+            "amiss. Each account is classified exact / settlement_window / "
+            "structural / market_movement / manual, with the drift and the "
+            "account's recent activity so the call is checkable. Detection only; "
+            "it changes nothing. If the bank-balance feed is unavailable it "
+            "degrades to a cleared-vs-register comparison and says so, rather "
+            "than reporting a comparison it did not make."
         ),
     )
     async def reconcile() -> dict[str, Any]:
         try:
+            cfg = _config()
+            rcfg = cfg.get("reconcile") or {}
+            window_days = int(rcfg.get("settlement_window_days", 7))
+            alert_threshold = float(rcfg.get("pending_alert_threshold", 25000.0))
+            market_valued = set(rcfg.get("market_valued_accounts") or [])
+            pending_inclusive = set(rcfg.get("pending_inclusive_accounts") or [])
             now = datetime.now(UTC)
+            today = date.today()
             accounts = await _accounts()
+            recent = await _transactions(today - timedelta(days=window_days), today)
         except ToolError as err:
             return err.payload()
+
+        # Bank balances are best-effort: their absence downgrades the tool, it
+        # does not fail it.
+        bank_by_id: dict[str, dict[str, Any]] = {}
+        degraded_reason: str | None = None
+        try:
+            payload = await _get("/simplefin-balances")
+            for row in (payload or {}).get("accounts") or []:
+                if row.get("simplefin_id"):
+                    bank_by_id[str(row["simplefin_id"])] = row
+        except ToolError as err:
+            degraded_reason = err.message
+
+        # Recent activity sizes the settlement window. Opening balances are
+        # excluded: a newly-linked account's setup row is the size of its whole
+        # balance, which would swallow any genuine structural drift on it.
+        gross: dict[str, float] = defaultdict(float)
+        for t in recent:
+            if t.get("account_id") and not _is_account_setup(t):
+                gross[t["account_id"]] += abs(_d(t["amount_cents"]))
 
         rows: list[dict[str, Any]] = []
         for a in accounts:
@@ -2145,63 +2173,111 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 continue
             register = _d(a["balance_cents"])
             cleared = _d(a.get("cleared_balance_cents", 0))
-            drift = round(register - cleared, 2)
-            raw_sync = a.get("last_sync")
-            feed_age_h: float | None = None
-            if raw_sync:
-                try:
-                    fetched = datetime.fromtimestamp(int(raw_sync) / 1000.0, tz=UTC)
-                    feed_age_h = round((now - fetched).total_seconds() / 3600.0, 1)
-                except (TypeError, ValueError, OSError, OverflowError):
-                    feed_age_h = None
+            activity = round(gross.get(a["id"], 0.0), 2)
+            bank_row = bank_by_id.get(str(a.get("simplefin_id") or ""))
+            bank = bank_row.get("balance") if bank_row else None
 
-            status = a.get("bank_sync_status")
-            if raw_sync is None:
-                classification = "manual"
-            elif status not in (None, "ok"):
-                classification = "feed_error"
-            elif drift == 0:
-                classification = "exact"
-            elif feed_age_h is not None and feed_age_h <= 72:
-                classification = "settlement_window"
+            account_row: dict[str, Any] = {
+                "account": a["name"],
+                "register_balance": register,
+                "cleared_balance": cleared,
+                "bank_reported_balance": bank,
+                "uncleared": round(register - cleared, 2),
+                "recent_activity_gross": activity,
+                "settlement_window_days": window_days,
+                "bank_sync_status": a.get("bank_sync_status"),
+            }
+            if bank_row:
+                account_row["bank_balance_date"] = bank_row.get("balance_date")
+                account_row["bank_available_balance"] = bank_row.get("available_balance")
+
+            if a.get("last_sync") is None and bank is None:
+                # Hand-maintained: there is no bank to disagree with.
+                account_row["drift"] = None
+                account_row["classification"] = "manual"
+            elif bank is None:
+                account_row["drift"] = None
+                account_row["classification"] = "no_bank_balance"
+                account_row["note"] = (
+                    degraded_reason
+                    or "No bank-reported balance for this account; cannot verify the register."
+                )
             else:
-                classification = "structural_suspect"
+                drift = round(register - bank, 2)
+                account_row["drift"] = drift
+                if a["name"] in market_valued:
+                    # Live market value vs a register that only moves on a
+                    # transaction. Drift here is valuation, not error.
+                    account_row["classification"] = "market_movement"
+                    account_row["note"] = (
+                        "Market-valued account: the bank reports live value while the "
+                        "register moves only when a transaction posts."
+                    )
+                elif drift == 0:
+                    account_row["classification"] = "exact"
+                elif abs(drift) <= activity:
+                    account_row["classification"] = "settlement_window"
+                    if a["name"] in pending_inclusive:
+                        account_row["pending_inclusive"] = True
+                        account_row["note"] = (
+                            "This feed reports a PENDING-INCLUSIVE balance while its "
+                            "transaction feed is cleared-only, so some drift is expected "
+                            "by construction."
+                        )
+                else:
+                    account_row["classification"] = "structural"
+                    account_row["note"] = (
+                        "Drift exceeds this account's recent activity, so it is not "
+                        "settlement float. This is the anchor-error shape: verify the "
+                        "register against the bank."
+                    )
+                # A pending-inclusive flag explains expected drift; it does not
+                # license unlimited drift.
+                if (
+                    a["name"] in pending_inclusive
+                    and abs(drift) > alert_threshold
+                    and account_row["classification"] != "structural"
+                ):
+                    account_row["classification"] = "structural"
+                    account_row["note"] = (
+                        f"Drift exceeds the {alert_threshold:,.0f} alert threshold. Pending "
+                        "items do not explain a gap this large."
+                    )
+            rows.append(account_row)
 
-            rows.append(
-                {
-                    "account": a["name"],
-                    "register_balance": register,
-                    "cleared_balance": cleared,
-                    "uncleared": drift,
-                    "bank_sync_status": status,
-                    "feed_age_hours": feed_age_h,
-                    "classification": classification,
-                }
-            )
         order = {
-            "feed_error": 0,
-            "structural_suspect": 1,
+            "structural": 0,
+            "no_bank_balance": 1,
             "settlement_window": 2,
-            "exact": 3,
-            "manual": 4,
+            "market_movement": 3,
+            "exact": 4,
+            "manual": 5,
         }
         rows.sort(
-            key=lambda r: (order.get(str(r["classification"]), 9), -abs(float(r["uncleared"])))
+            key=lambda r: (
+                order.get(str(r["classification"]), 9),
+                -abs(float(r["drift"] or 0)),
+            )
         )
-        return {
+        result: dict[str, Any] = {
             "as_of": now.date().isoformat(),
+            "mode": "cleared_only" if degraded_reason else "bank_verified",
             "accounts": rows,
             "needs_attention": [
                 r["account"]
                 for r in rows
-                if r["classification"] in ("feed_error", "structural_suspect")
+                if r["classification"] in ("structural", "no_bank_balance")
             ],
-            "limitation": (
-                "The bank's own reported balance is not exposed by Actual's API, "
-                "so a register that has drifted from reality with everything "
-                "cleared is invisible here. Verify such a case against the bank."
-            ),
         }
+        if degraded_reason:
+            result["limitation"] = (
+                "The bank-reported balance feed was unavailable, so this run "
+                f"compared register against cleared only ({degraded_reason}). In "
+                "that mode a register that drifted from reality while fully "
+                "cleared is NOT detectable — the Jan-Apr 2026 fault would be "
+                "invisible. Re-run once the sidecar can reach it."
+            )
+        return result
 
     # ── 14. subscriptions ────────────────────────────────────────────
     @mcp.tool(

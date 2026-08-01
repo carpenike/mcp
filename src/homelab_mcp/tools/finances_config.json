@@ -412,5 +412,43 @@
         "note": "$9.1k observed across May-Jul 2026 (ortho/implants?) — that is a treatment episode, not a known annual run-rate. Quantify from the treatment plan before amortizing; guessing would move the household's headline metric on a fiction."
       }
     ]
+  },
+  "reconcile": {
+    "_comment": [
+      "finances_reconcile compares Actual's register against the bank's OWN",
+      "reported balance (via the sidecar's /simplefin-balances). That is what",
+      "catches the Jan-Apr 2026 class of fault: a register that drifted from",
+      "reality while every transaction was 'cleared'.",
+      "",
+      "settlement_window_days — drift is normal float when it is smaller than",
+      "the account's gross activity over this many days. A big deposit or a",
+      "card payoff moves both sides at different moments.",
+      "",
+      "market_valued_accounts — investment accounts whose bank balance is live",
+      "market value while Actual's register only moves when a transaction",
+      "posts. Drift there is valuation, not error, and would otherwise report",
+      "five false 'structural' faults on every run.",
+      "",
+      "pending_inclusive_accounts — feeds whose reported balance includes",
+      "PENDING items while their transaction feed is cleared-only, so some",
+      "drift is expected by construction. USAA Checking is the documented",
+      "case. This explains expected drift; it does not license unlimited",
+      "drift, so such an account is still escalated past",
+      "pending_alert_threshold."
+    ],
+    "settlement_window_days": 7,
+    "pending_alert_threshold": 25000.0,
+    "market_valued_accounts": [
+      "Fidelity Brokerage",
+      "Fidelity HSA",
+      "Microsoft 401k",
+      "Microsoft ESPP",
+      "Fidelity 529 (0528)",
+      "Fidelity 529 (0538)",
+      "Fidelity 529 (0555)"
+    ],
+    "pending_inclusive_accounts": [
+      "USAA Checking"
+    ]
   }
 }

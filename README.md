@@ -187,7 +187,7 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_buffer` | PLAN.md's fear metric: cleared checking − card debt − next mortgage, plus the 14-day look-ahead. Components and totals, so it can be checked by hand |
 | Finances | `finances_breaches` | Non-income deposits into checking — money arriving from HYSA/brokerage/HELOC to fund operations. Detection only |
 | Finances | `finances_room` | The "can we spend this?" arithmetic, **net of fixed bills not yet posted**: room, itemized `remaining_committed`, `variable_floor`/`variable_mtd`, and pace measured on variable spend only. Present as "$X after $Y of upcoming fixed bills" — never the naive figure |
-| Finances | `finances_reconcile` | Register vs cleared balance per account, feed status and age, drift classified |
+| Finances | `finances_reconcile` | Register vs the **bank's own reported balance** per account; drift classified exact / settlement_window / structural / market_movement / manual. Catches a register that drifted from reality while fully "cleared". Degrades to cleared-only and says so if the bank feed is unavailable |
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
 | Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only) |
 | Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
