@@ -192,6 +192,41 @@ def _is_account_setup(txn: dict[str, Any]) -> bool:
     ).strip().lower() == "starting balances"
 
 
+SAVINGS_CATEGORY = "Savings/Investments"
+
+
+def _lumpy_monthly(cfg: dict[str, Any]) -> tuple[float, list[dict[str, Any]]]:
+    """Total 1/12 amortization of annual lumpy costs, plus the per-item detail.
+
+    PLAN.md defines the Bonus Dependence Gap as monthly baseline spend
+    *including* 1/12 of annual lumpy expenses. Without this the raw monthly
+    gap flatters every month one of them does not happen to land, then
+    lurches in the month it does.
+
+    Entries with a null `annual_amount` are listed but contribute nothing — a
+    not-yet-quantified cost must not become an invented one.
+    """
+    items = ((cfg.get("lumpy") or {}).get("items")) or []
+    detail: list[dict[str, Any]] = []
+    total = 0.0
+    for item in items:
+        amount = item.get("annual_amount")
+        monthly = round(float(amount) / 12.0, 2) if amount is not None else None
+        if monthly is not None:
+            total += monthly
+        detail.append(
+            {
+                "name": item.get("name"),
+                "category": item.get("category"),
+                "annual_amount": amount,
+                "monthly_amortized": monthly,
+                "quantified": amount is not None,
+                "note": item.get("note"),
+            }
+        )
+    return round(total, 2), detail
+
+
 def _classify(rate: float | None, hurdle: float) -> str:
     """Bucket a debt by cost: worth accelerating, or cheap enough to ride.
 
@@ -548,7 +583,8 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             today = date.today()
             anchor = min(max(today, first), last)
             week_start = anchor - timedelta(days=6)
-            pulse_cfg = _config().get("pulse") or {}
+            cfg = _config()
+            pulse_cfg = cfg.get("pulse") or {}
             categories = await _categories()
             income_names = _income_category_names(categories)
             txns = await _transactions(min(first, week_start), last)
@@ -587,6 +623,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     uncategorized_cents += -t["amount_cents"]
 
         total_cents = sum(by_category.values())
+        # The floor governs CONSUMPTION. A 529 or brokerage contribution is
+        # wealth-building, and counting it as spend would penalize exactly the
+        # behaviour the plan wants more of — so it is reported beside the gap,
+        # never inside it.
+        savings_cents = by_category.get(SAVINGS_CATEGORY, 0)
+        consumption_cents = total_cents - savings_cents
         in_progress = first <= today <= last
         days_elapsed = (today - first).days + 1 if in_progress else (last - first).days + 1
         days_in_month = (last - first).days + 1
@@ -599,6 +641,14 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "days_in_month": days_in_month,
             "income": _d(income_cents),
             "total_spend": _d(total_cents),
+            "consumption_spend": _d(consumption_cents),
+            "savings_contributions": _d(savings_cents),
+            "gap_basis": "consumption_spend",
+            "gap_basis_note": (
+                f"The floor is compared against consumption only; the "
+                f"{SAVINGS_CATEGORY!r} category is reported separately rather "
+                "than counted as spend."
+            ),
             "uncategorized": _d(uncategorized_cents),
             "spend_by_category": [
                 {"category": k, "spend": _d(v)}
@@ -614,20 +664,32 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "monthly_baseline": settings.finances_amazon_baseline,
             },
         }
+        # Lumpy amortization: the gap is DEFINED with it (PLAN.md), so both
+        # views are returned and the amortized one is named as the definition.
+        lumpy_monthly, lumpy_detail = _lumpy_monthly(cfg)
+        result["lumpy_monthly_amortized"] = lumpy_monthly
+        result["lumpy_items"] = lumpy_detail
+        result["consumption_spend_amortized"] = round(_d(consumption_cents) + lumpy_monthly, 2)
+
         if floor is None:
             result["gap_vs_floor"] = None
+            result["gap_vs_floor_amortized"] = None
             result["gap_note"] = (
                 "No floor configured (HOMELAB_MCP_FINANCES_FLOOR); gap not computed."
             )
         else:
-            result["gap_vs_floor"] = round(_d(total_cents) - floor, 2)
+            result["gap_vs_floor"] = round(_d(consumption_cents) - floor, 2)
+            # This one is the Bonus Dependence Gap as PLAN.md defines it.
+            result["gap_vs_floor_amortized"] = round(
+                _d(consumption_cents) + lumpy_monthly - floor, 2
+            )
             if in_progress:
                 # Straight-line pace. Deliberately naive — a weighted model would
                 # imply a forecasting confidence this data doesn't support.
                 prorated = round(floor * days_elapsed / days_in_month, 2)
-                projected = round(_d(total_cents) * days_in_month / days_elapsed, 2)
+                projected = round(_d(consumption_cents) * days_in_month / days_elapsed, 2)
                 result["prorated_floor_to_date"] = prorated
-                result["gap_vs_prorated_floor"] = round(_d(total_cents) - prorated, 2)
+                result["gap_vs_prorated_floor"] = round(_d(consumption_cents) - prorated, 2)
                 result["projected_month_end_spend"] = projected
         return result
 
@@ -1516,3 +1578,810 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             return err.payload()
         audit.info("finances_rule_delete id=%s", rule_id)
         return {"deleted": True, "rule_id": rule_id}
+
+    # ── 9. payees + merge ────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_payees",
+        description=(
+            "List payees with how many transactions each has. Use it to spot "
+            "near-duplicate variants of the same merchant — the ledger carries "
+            "Costco twice, Spotify twice, Starlink twice and Monrovia four "
+            "times — which split a merchant's history across several names and "
+            "quietly understate every per-merchant figure. Feed the ids to "
+            "finances_payee_merge. Transfer payees (the other side of an "
+            "account-to-account move) are flagged and must never be merged."
+        ),
+    )
+    async def payees(
+        name_contains: Annotated[
+            str | None, Field(description="Case-insensitive substring filter.")
+        ] = None,
+        min_transactions: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=500)] = 200,
+    ) -> dict[str, Any]:
+        try:
+            data = await _get("/payees")
+        except ToolError as err:
+            return err.payload()
+        rows = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "transaction_count": p.get("transaction_count", 0),
+                "is_transfer": bool(p.get("transfer_acct")),
+            }
+            for p in (data or {}).get("payees") or []
+        ]
+        needle = (name_contains or "").lower()
+        if needle:
+            rows = [r for r in rows if needle in (r["name"] or "").lower()]
+        rows = [r for r in rows if r["transaction_count"] >= min_transactions]
+        rows.sort(key=lambda r: (-r["transaction_count"], (r["name"] or "").lower()))
+        page = rows[:limit]
+        return {
+            "returned": len(page),
+            "total": len(rows),
+            "truncated": len(rows) > len(page),
+            "payees": page,
+        }
+
+    @mcp.tool(
+        annotations=_WRITE_DESTRUCTIVE,
+        name="finances_payee_merge",
+        description=(
+            "Merge duplicate payees into one. Every transaction pointing at a "
+            "merged payee is repointed at keep_id and the merged payees are "
+            "deleted. IRREVERSIBLE — Actual has no undo for this; recovering "
+            "means restoring a backup. Confirm the ids with finances_payees "
+            "first, and merge only true variants of the same merchant. It "
+            "cannot rename anything: the surviving payee keeps keep_id's name, "
+            "so choose the spelling you want by choosing which id to keep. "
+            "Refuses to touch transfer payees, where a merge would corrupt the "
+            "account-to-account wiring."
+        ),
+    )
+    async def payee_merge(
+        keep_id: Annotated[str, Field(min_length=1, description="Payee id to keep.")],
+        merge_ids: Annotated[
+            list[str], Field(description="Payee ids to fold into keep_id and delete.")
+        ],
+    ) -> dict[str, Any]:
+        try:
+            if not merge_ids:
+                raise ToolError("finances_merge_empty", "merge_ids is empty.", "")
+            if keep_id in merge_ids:
+                raise ToolError(
+                    "finances_merge_self",
+                    "keep_id also appears in merge_ids.",
+                    "The surviving payee cannot also be merged away.",
+                )
+            data = await _get("/payees")
+            known = {p["id"]: p for p in (data or {}).get("payees") or []}
+            missing = [i for i in [keep_id, *merge_ids] if i not in known]
+            if missing:
+                raise ToolError(
+                    "finances_payee_not_found",
+                    f"Unknown payee id(s): {', '.join(missing)}.",
+                    "Call finances_payees for current ids.",
+                )
+            transfers = [i for i in [keep_id, *merge_ids] if known[i].get("transfer_acct")]
+            if transfers:
+                raise ToolError(
+                    "finances_merge_transfer_payee",
+                    "One or more ids is a transfer payee: "
+                    + ", ".join(known[i]["name"] for i in transfers),
+                    "Transfer payees are the other side of an account-to-account "
+                    "move; merging one would corrupt that wiring.",
+                )
+            moved = sum(known[i].get("transaction_count", 0) for i in merge_ids)
+            await _post("/payees/merge", {"keep_id": keep_id, "merge_ids": merge_ids})
+        except ToolError as err:
+            return err.payload()
+        audit.warning(
+            "finances_payee_merge keep=%s merged=%s transactions_moved=%d",
+            keep_id,
+            ",".join(merge_ids),
+            moved,
+        )
+        return {
+            "merged": True,
+            "kept": {"id": keep_id, "name": known[keep_id]["name"]},
+            "merged_payees": [
+                {
+                    "id": i,
+                    "name": known[i]["name"],
+                    "transactions": known[i].get("transaction_count", 0),
+                }
+                for i in merge_ids
+            ],
+            "transactions_repointed": moved,
+            "reversible": False,
+        }
+
+    # ── 10. buffer ───────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_buffer",
+        description=(
+            "The buffer: cleared USAA Checking, minus every revolving card "
+            "balance, minus the next mortgage payment. 'Could we clear the "
+            "decks today, from the operating account alone?' Checking ONLY — "
+            "no HYSA, no brokerage, because operations run on checking. Uses "
+            "CLEARED balances: money the bank hasn't confirmed can't clear "
+            "anything. Also returns the buffer after the next 14 days of "
+            "scheduled outflows, so an autopay pull is never a surprise. "
+            "Returns every component alongside the totals so the number can be "
+            "checked by hand. Status is measured against the configured buffer "
+            "floor, or 'no_floor' when none is set."
+        ),
+    )
+    async def buffer() -> dict[str, Any]:
+        try:
+            cfg = _config()
+            bcfg = dict(cfg.get("buffer") or {})
+            cash_names = list(bcfg.get("cash_accounts") or [])
+            card_names = list(bcfg.get("card_accounts") or [])
+            lookahead = int(bcfg.get("lookahead_days", 14))
+            accounts = await _accounts()
+        except ToolError as err:
+            return err.payload()
+
+        by_name = {a["name"]: a for a in accounts if not a["closed"]}
+        cash_detail = [
+            {"account": n, "cleared_balance": _d(by_name[n]["cleared_balance_cents"])}
+            for n in cash_names
+            if n in by_name
+        ]
+        cash = round(sum(c["cleared_balance"] for c in cash_detail), 2)
+
+        # Only balances that are OWED reduce the buffer. A card carrying a
+        # credit is not cash on hand.
+        # Cards use the REGISTER balance, not the cleared one — PLAN.md
+        # qualifies only the cash side as cleared ("cleared USAA Checking -
+        # all card balances"). It is also the conservative reading: a card
+        # payment already made but not yet settled has left the obligation
+        # behind it, and counting the pre-payment cleared balance against
+        # cleared cash that still holds the money would double-count it.
+        card_detail = []
+        for n in card_names:
+            a = by_name.get(n)
+            if a is None:
+                continue
+            bal = _d(a["balance_cents"])
+            card_detail.append(
+                {
+                    "account": n,
+                    "balance": bal,
+                    "cleared_balance": _d(a["cleared_balance_cents"]),
+                    "counted": bal < 0,
+                }
+            )
+        card_debt = round(-sum(c["balance"] for c in card_detail if c["counted"]), 2)
+
+        rec_items = ((cfg.get("recurring") or {}).get("items")) or []
+        mortgage_name = bcfg.get("mortgage_obligation")
+        mortgage = next(
+            (float(i.get("amount", 0.0)) for i in rec_items if i.get("name") == mortgage_name),
+            0.0,
+        )
+
+        value = round(cash - card_debt - mortgage, 2)
+
+        # Look-ahead: everything the config says is due in the next N days,
+        # plus the cards themselves as obligations already incurred.
+        today = date.today()
+        horizon = today + timedelta(days=lookahead)
+        scheduled: list[dict[str, Any]] = []
+        for item in rec_items:
+            day = item.get("expected_day")
+            amount = item.get("amount")
+            if not day or amount is None or item.get("name") == mortgage_name:
+                continue
+            for base in (today.replace(day=1), _shift_month(today, -1)):
+                try:
+                    due = base.replace(
+                        day=min(int(day), calendar.monthrange(base.year, base.month)[1])
+                    )
+                except ValueError:  # pragma: no cover - defensive
+                    continue
+                if today <= due <= horizon:
+                    scheduled.append(
+                        {"name": item.get("name"), "due": due.isoformat(), "amount": float(amount)}
+                    )
+                    break
+        scheduled.sort(key=lambda r: r["due"])
+        scheduled_total = round(sum(r["amount"] for r in scheduled), 2)
+
+        floor = settings.finances_buffer_floor
+        if floor is None:
+            status = "no_floor"
+        elif value < floor:
+            status = "below_floor"
+        elif value < floor * 1.25:
+            status = "near_floor"
+        else:
+            status = "above_floor"
+
+        return {
+            "as_of": today.isoformat(),
+            "buffer": value,
+            "components": {
+                "cleared_cash": cash,
+                "cash_accounts": cash_detail,
+                "card_debt": card_debt,
+                "card_accounts": card_detail,
+                "next_mortgage_payment": mortgage,
+            },
+            "lookahead_days": lookahead,
+            "scheduled_outflows": scheduled,
+            "scheduled_outflows_total": scheduled_total,
+            "buffer_after_scheduled": round(value - scheduled_total, 2),
+            "floor": floor,
+            "status": status,
+            "basis": (
+                "Cash is the CLEARED checking balance (money the bank has "
+                "confirmed); cards use their register balance, so a payment "
+                "already made counts. Checking only — HYSA, brokerage and every "
+                "other account are excluded by design. Only cards in debt are "
+                "counted; a card carrying a credit is not cash on hand."
+            ),
+        }
+
+    # ── 11. breaches ─────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_breaches",
+        description=(
+            "Find deposits into checking that are not income — money arriving "
+            "from the HYSA, the brokerage or the HELOC to cover operational "
+            "spending. PLAN.md's operational bright line is that operations run "
+            "on checking alone, so anything else landing there is a breach "
+            "candidate, not a judgment call: the May 2026 $30.7k brokerage sale "
+            "is the canonical case. Payees on the configured income allowlist "
+            "(payroll, tax refunds, interest, healthcare reimbursements) are "
+            "excluded. DETECTION ONLY — it never clears, dismisses or explains "
+            "one away; that is the household's call."
+        ),
+    )
+    async def breaches(
+        lookback_days: Annotated[int, Field(ge=1, le=730)] = 30,
+    ) -> dict[str, Any]:
+        try:
+            cfg = _config()
+            allow = [
+                str(x).lower()
+                for x in ((cfg.get("income_payees") or {}).get("allow_substrings") or [])
+            ]
+            cash_names = set((cfg.get("buffer") or {}).get("cash_accounts") or [])
+            today = date.today()
+            rows = await _transactions(today - timedelta(days=lookback_days), today)
+        except ToolError as err:
+            return err.payload()
+
+        candidates = []
+        for t in rows:
+            if t.get("account_name") not in cash_names:
+                continue
+            if t["amount_cents"] <= 0:
+                continue  # outflow, not a deposit
+            if _is_account_setup(t):
+                continue
+            hay = f"{t.get('payee_name') or ''} {t.get('notes') or ''}".lower()
+            if any(a in hay for a in allow):
+                continue
+            candidates.append(
+                {
+                    "date": t["date"],
+                    "amount": _d(t["amount_cents"]),
+                    "payee": t.get("payee_name"),
+                    "account": t.get("account_name"),
+                    "notes": t.get("notes"),
+                    "is_transfer": t.get("is_transfer", False),
+                }
+            )
+        candidates.sort(key=lambda r: (-float(r["amount"]), r["date"]))
+        return {
+            "as_of": today.isoformat(),
+            "lookback_days": lookback_days,
+            "returned": len(candidates),
+            "total": len(candidates),
+            "truncated": False,
+            "breach_candidates": candidates,
+            "total_amount": round(sum(float(c["amount"]) for c in candidates), 2),
+            "note": (
+                "Candidates, not verdicts. Each needs an explanation; a bonus or "
+                "reimbursement the allowlist doesn't know about will appear here."
+            ),
+        }
+
+    # ── 12. room ─────────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_room",
+        description=(
+            "The 'can we spend this?' arithmetic, computed rather than "
+            "estimated: how far into the month we are, month-to-date "
+            "consumption against the pro-rated floor, whether that is ahead or "
+            "behind pace, and how much of the floor is left. Optionally pass a "
+            "category to get its month-to-date against its own trailing "
+            "6-month average as a second lens. Savings/investment contributions "
+            "are excluded — the floor governs consumption, not wealth-building. "
+            "Returns numbers ONLY; how to phrase the answer is the caller's "
+            "job. Use this rather than doing the arithmetic yourself."
+        ),
+    )
+    async def room(
+        category: Annotated[
+            str | None, Field(description="Optional category for a second lens.")
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            today = date.today()
+            first, last = _month_bounds(today.strftime("%Y-%m"))
+            categories = await _categories()
+            income_names = _income_category_names(categories)
+            # Six prior months plus this one, for the trailing average.
+            rows = await _transactions(_shift_month(today, 6), last)
+        except ToolError as err:
+            return err.payload()
+
+        mtd = 0
+        savings_mtd = 0
+        per_month_cat: dict[str, int] = defaultdict(int)
+        cat_mtd = 0
+        for t in rows:
+            if not _is_spend(t, income_names):
+                continue
+            in_month = first.isoformat() <= t["date"] <= last.isoformat()
+            name = t["category_name"] or "(uncategorized)"
+            amount = -t["amount_cents"]
+            if in_month:
+                if name == SAVINGS_CATEGORY:
+                    savings_mtd += amount
+                else:
+                    mtd += amount
+                if category and name == category:
+                    cat_mtd += amount
+            elif category and name == category:
+                per_month_cat[t["date"][:7]] += amount
+
+        days_in_month = (last - first).days + 1
+        days_elapsed = (today - first).days + 1
+        elapsed_pct = round(days_elapsed / days_in_month * 100.0, 1)
+        floor = settings.finances_floor
+
+        result: dict[str, Any] = {
+            "as_of": today.isoformat(),
+            "month": today.strftime("%Y-%m"),
+            "days_elapsed": days_elapsed,
+            "days_in_month": days_in_month,
+            "days_remaining": days_in_month - days_elapsed,
+            "month_elapsed_pct": elapsed_pct,
+            "consumption_mtd": _d(mtd),
+            "savings_mtd": _d(savings_mtd),
+            "floor": floor,
+            "basis": (
+                f"Consumption only; {SAVINGS_CATEGORY!r} is excluded and reported "
+                "separately. The floor governs consumption, not wealth-building."
+            ),
+        }
+        if floor is None:
+            result["floor_to_date"] = None
+            result["pace_delta"] = None
+            result["room_this_month"] = None
+            result["note"] = "No floor configured (HOMELAB_MCP_FINANCES_FLOOR)."
+        else:
+            floor_to_date = round(floor * days_elapsed / days_in_month, 2)
+            result["floor_to_date"] = floor_to_date
+            # Positive = spending faster than the floor allows at this point.
+            result["pace_delta"] = round(_d(mtd) - floor_to_date, 2)
+            # May be negative: the floor is already spent.
+            result["room_this_month"] = round(floor - _d(mtd), 2)
+
+        if category:
+            months = sorted(per_month_cat)
+            avg = round(sum(per_month_cat.values()) / 100.0 / len(months), 2) if months else None
+            result["category"] = {
+                "name": category,
+                "mtd": _d(cat_mtd),
+                "trailing_months": len(months),
+                "trailing_avg": avg,
+                "delta_vs_trailing_avg": round(_d(cat_mtd) - avg, 2) if avg is not None else None,
+            }
+        return result
+
+    # ── 13. reconcile ────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_reconcile",
+        description=(
+            "Per account: the register balance (every transaction) against the "
+            "cleared balance (only what the bank has confirmed), the gap "
+            "between them, the feed's status and its last successful fetch. "
+            "The gap is normal settlement float when small and recent; a large "
+            "or old one means transactions are sitting unconfirmed. IMPORTANT "
+            "LIMIT: Actual's API does not expose the bank's own reported "
+            "balance, so this cannot detect a register that has drifted from "
+            "reality while every transaction is cleared — the documented "
+            "Jan-Apr 2026 drift is exactly that shape and would NOT be caught "
+            "here. Detection only; it changes nothing."
+        ),
+    )
+    async def reconcile() -> dict[str, Any]:
+        try:
+            now = datetime.now(UTC)
+            accounts = await _accounts()
+        except ToolError as err:
+            return err.payload()
+
+        rows: list[dict[str, Any]] = []
+        for a in accounts:
+            if a["closed"]:
+                continue
+            register = _d(a["balance_cents"])
+            cleared = _d(a.get("cleared_balance_cents", 0))
+            drift = round(register - cleared, 2)
+            raw_sync = a.get("last_sync")
+            feed_age_h: float | None = None
+            if raw_sync:
+                try:
+                    fetched = datetime.fromtimestamp(int(raw_sync) / 1000.0, tz=UTC)
+                    feed_age_h = round((now - fetched).total_seconds() / 3600.0, 1)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    feed_age_h = None
+
+            status = a.get("bank_sync_status")
+            if raw_sync is None:
+                classification = "manual"
+            elif status not in (None, "ok"):
+                classification = "feed_error"
+            elif drift == 0:
+                classification = "exact"
+            elif feed_age_h is not None and feed_age_h <= 72:
+                classification = "settlement_window"
+            else:
+                classification = "structural_suspect"
+
+            rows.append(
+                {
+                    "account": a["name"],
+                    "register_balance": register,
+                    "cleared_balance": cleared,
+                    "uncleared": drift,
+                    "bank_sync_status": status,
+                    "feed_age_hours": feed_age_h,
+                    "classification": classification,
+                }
+            )
+        order = {
+            "feed_error": 0,
+            "structural_suspect": 1,
+            "settlement_window": 2,
+            "exact": 3,
+            "manual": 4,
+        }
+        rows.sort(
+            key=lambda r: (order.get(str(r["classification"]), 9), -abs(float(r["uncleared"])))
+        )
+        return {
+            "as_of": now.date().isoformat(),
+            "accounts": rows,
+            "needs_attention": [
+                r["account"]
+                for r in rows
+                if r["classification"] in ("feed_error", "structural_suspect")
+            ],
+            "limitation": (
+                "The bank's own reported balance is not exposed by Actual's API, "
+                "so a register that has drifted from reality with everything "
+                "cleared is invisible here. Verify such a case against the bank."
+            ),
+        }
+
+    # ── 14. subscriptions ────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_subscriptions",
+        description=(
+            "Find recurring merchants by scanning charge history: any payee "
+            "billing in at least min_months distinct months. Reports how many "
+            "months it appears in, the average and latest charge, its variance, "
+            "and — the useful one — when it was FIRST seen, which surfaces "
+            "subscription creep that a monthly total hides. Charges already "
+            "covered by the recurring-obligations config are flagged as known "
+            "so the unknown ones stand out."
+        ),
+    )
+    async def subscriptions(
+        min_months: Annotated[int, Field(ge=2, le=12)] = 3,
+        lookback_months: Annotated[int, Field(ge=3, le=24)] = 12,
+    ) -> dict[str, Any]:
+        try:
+            cfg = _config()
+            today = date.today()
+            categories = await _categories()
+            income_names = _income_category_names(categories)
+            rows = await _transactions(_shift_month(today, lookback_months - 1), today)
+        except ToolError as err:
+            return err.payload()
+
+        known = [
+            str(n).lower()
+            for item in ((cfg.get("recurring") or {}).get("items") or [])
+            for n in (item.get("match_any") or [])
+        ]
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for t in rows:
+            if not _is_spend(t, income_names) or _is_account_setup(t):
+                continue
+            payee = (t.get("payee_name") or "").strip()
+            if payee:
+                buckets[payee].append(t)
+
+        found: list[dict[str, Any]] = []
+        for payee, items in buckets.items():
+            months = sorted({t["date"][:7] for t in items})
+            if len(months) < min_months:
+                continue
+            amounts = [_d(-t["amount_cents"]) for t in items]
+            avg = round(sum(amounts) / len(amounts), 2)
+            spread = round(max(amounts) - min(amounts), 2)
+            hay = payee.lower()
+            found.append(
+                {
+                    "payee": payee,
+                    "months_present": len(months),
+                    "first_seen": min(t["date"] for t in items),
+                    "last_charge_date": max(t["date"] for t in items),
+                    "last_charge_amount": _d(-max(items, key=lambda t: t["date"])["amount_cents"]),
+                    "average_charge": avg,
+                    "amount_spread": spread,
+                    # Flat amount every month is the signature of a subscription;
+                    # a wide spread is more likely an ordinary recurring merchant.
+                    "fixed_amount": spread <= max(1.0, avg * 0.02),
+                    "annualized": round(avg * 12, 2),
+                    "known_obligation": any(n in hay for n in known),
+                }
+            )
+        found.sort(key=lambda r: (-int(r["months_present"]), -float(r["annualized"])))
+        return {
+            "lookback_months": lookback_months,
+            "min_months": min_months,
+            "returned": len(found),
+            "total": len(found),
+            "truncated": False,
+            "subscriptions": found,
+            "unknown_annualized_total": round(
+                sum(float(r["annualized"]) for r in found if not r["known_obligation"]), 2
+            ),
+        }
+
+    # ── 15. net worth ────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_net_worth",
+        description=(
+            "Full balance-sheet rollup across every open account, on-budget and "
+            "off: cash, investments, property and all debt, netted. Also "
+            "reports the investable total (liquid + retirement, excluding the "
+            "house) and home equity. Home equity is DISPLAY-ONLY per PLAN.md's "
+            "guardrail — it feeds the net-worth view and the HELOC scoreboard "
+            "and must never enter an affordability or spending decision, "
+            "because paper equity treated as spendable is how HELOCs happen. "
+            "The house valuation is the one hand-maintained figure, updated "
+            "quarterly."
+        ),
+    )
+    async def net_worth() -> dict[str, Any]:
+        try:
+            cfg = _config()
+            debt_cfg = {k: v for k, v in (cfg.get("debts") or {}).items() if not k.startswith("_")}
+            accounts = await _accounts()
+        except ToolError as err:
+            return err.payload()
+
+        cash_names = set((cfg.get("buffer") or {}).get("cash_accounts") or [])
+        assets: list[dict[str, Any]] = []
+        debts: list[dict[str, Any]] = []
+        for a in accounts:
+            if a["closed"]:
+                continue
+            bal = _d(a["balance_cents"])
+            row = {"account": a["name"], "balance": bal, "offbudget": bool(a["offbudget"])}
+            (debts if bal < 0 else assets).append(row)
+
+        def _is(name: str, *needles: str) -> bool:
+            low = name.lower()
+            return any(n in low for n in needles)
+
+        house = next((a for a in assets if a["account"] == "House"), None)
+        property_total = round(house["balance"], 2) if house else 0.0
+        cash_total = round(sum(a["balance"] for a in assets if a["account"] in cash_names), 2)
+        investable = round(
+            sum(
+                a["balance"]
+                for a in assets
+                if a["account"] != "House" and a["account"] not in cash_names
+            ),
+            2,
+        )
+        other_liquid = round(
+            sum(a["balance"] for a in assets) - property_total - cash_total - investable, 2
+        )
+        asset_total = round(sum(a["balance"] for a in assets), 2)
+        debt_total = round(sum(d["balance"] for d in debts), 2)
+
+        mortgage = next((d for d in debts if _is(d["account"], "mortgage")), None)
+        heloc = next((d for d in debts if _is(d["account"], "heloc")), None)
+        equity = None
+        if house and mortgage:
+            equity = round(
+                house["balance"] + mortgage["balance"] + (heloc["balance"] if heloc else 0.0), 2
+            )
+
+        return {
+            "as_of": date.today().isoformat(),
+            "net_worth": round(asset_total + debt_total, 2),
+            "assets_total": asset_total,
+            "debts_total": debt_total,
+            "cash": cash_total,
+            "investable": investable,
+            "other_liquid": other_liquid,
+            "property": property_total,
+            "assets": sorted(assets, key=lambda r: -r["balance"]),
+            "debts": sorted(debts, key=lambda r: r["balance"]),
+            "unclassified_debts": [d["account"] for d in debts if d["account"] not in debt_cfg],
+            "home_equity": equity,
+            "home_equity_note": (
+                "DISPLAY ONLY. Per PLAN.md this never enters an affordability or "
+                "spending decision; paper equity treated as spendable is how "
+                "HELOCs happen. The house valuation is hand-maintained, updated "
+                "quarterly at review."
+            ),
+        }
+
+    # ── 16. payoff projection ────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_payoff_projection",
+        description=(
+            "Amortize a debt to zero from its LIVE balance and its configured "
+            "rate: months to payoff, the date, and total interest — with and "
+            "without extra monthly payments and one-off lump sums. Always "
+            "returns the minimum-only baseline alongside, so the value of "
+            "accelerating is explicit. Deterministic month-by-month "
+            "arithmetic, not a formula approximation, so lumps land where you "
+            "put them. Interest-only debts never amortize on the minimum "
+            "alone; that is reported as 'never' rather than a huge number."
+        ),
+    )
+    async def payoff_projection(
+        debt_name: Annotated[
+            str, Field(min_length=1, description="Account name, e.g. 'Spectra HELOC'.")
+        ],
+        extra_monthly: Annotated[float, Field(ge=0)] = 0.0,
+        lumps: Annotated[
+            list[dict[str, Any]] | None,
+            Field(description="One-off payments: [{month: 'YYYY-MM', amount: 5000}]."),
+        ] = None,
+        max_months: Annotated[
+            int, Field(ge=12, le=600, description="Give up after this many months.")
+        ] = 600,
+    ) -> dict[str, Any]:
+        try:
+            cfg = _config()
+            debt_cfg = {k: v for k, v in (cfg.get("debts") or {}).items() if not k.startswith("_")}
+            accounts = await _accounts()
+        except ToolError as err:
+            return err.payload()
+
+        by_name = {a["name"]: a for a in accounts if not a["closed"]}
+        matches = [n for n in by_name if debt_name.lower() in n.lower()]
+        if len(matches) != 1:
+            return ToolError(
+                "finances_debt_ambiguous" if matches else "finances_debt_not_found",
+                f"{'Several' if matches else 'No'} accounts match {debt_name!r}"
+                + (f": {', '.join(matches)}." if matches else "."),
+                "Use the exact account name from finances_debt_status.",
+            ).payload()
+        name = matches[0]
+        balance = -_d(by_name[name]["balance_cents"])
+        if balance <= 0:
+            return {"debt": name, "balance": 0.0, "note": "Nothing outstanding."}
+
+        meta = debt_cfg.get(name) or {}
+        rate = meta.get("rate")
+        if rate is None:
+            return ToolError(
+                "finances_rate_unknown",
+                f"No rate configured for {name!r}.",
+                "Add it to the config's `debts` section; projecting without a "
+                "rate would invent the answer.",
+            ).payload()
+        payment = meta.get("scheduled_payment")
+        if payment is None:
+            return ToolError(
+                "finances_payment_unknown",
+                f"No scheduled_payment configured for {name!r}.",
+                "Add it to the config's `debts` section.",
+            ).payload()
+
+        lump_by_month: dict[str, float] = defaultdict(float)
+        for lump in lumps or []:
+            try:
+                lump_by_month[str(lump["month"])] += float(lump["amount"])
+            except (KeyError, TypeError, ValueError):
+                return ToolError(
+                    "finances_bad_lump",
+                    "Each lump needs {month: 'YYYY-MM', amount: <number>}.",
+                    "",
+                ).payload()
+
+        monthly_rate = float(rate) / 100.0 / 12.0
+        start = date.today()
+
+        def simulate(extra: float, use_lumps: bool) -> dict[str, Any]:
+            bal = balance
+            interest = 0.0
+            cursor = start
+            for month in range(1, max_months + 1):
+                accrued = round(bal * monthly_rate, 2)
+                interest += accrued
+                bal = round(bal + accrued, 2)
+                pay = float(payment) + extra
+                if use_lumps:
+                    pay += lump_by_month.get(cursor.strftime("%Y-%m"), 0.0)
+                # A payment that doesn't cover interest never retires anything.
+                if pay <= accrued and not (use_lumps and lump_by_month):
+                    return {
+                        "months": None,
+                        "payoff_date": None,
+                        "total_interest": None,
+                        "note": (
+                            "The scheduled payment does not exceed monthly interest, "
+                            "so this debt never amortizes on it alone."
+                        ),
+                    }
+                bal = round(bal - pay, 2)
+                if bal <= 0:
+                    return {
+                        "months": month,
+                        "payoff_date": cursor.strftime("%Y-%m"),
+                        "total_interest": round(interest + bal, 2)
+                        if bal < 0
+                        else round(interest, 2),
+                        "note": None,
+                    }
+                cursor = _shift_month(cursor, -1)
+            return {
+                "months": None,
+                "payoff_date": None,
+                "total_interest": None,
+                "note": f"Not retired within {max_months} months.",
+            }
+
+        baseline = simulate(0.0, use_lumps=False)
+        plan = simulate(float(extra_monthly), use_lumps=True)
+        saved = (
+            round(float(baseline["total_interest"]) - float(plan["total_interest"]), 2)
+            if baseline["total_interest"] is not None and plan["total_interest"] is not None
+            else None
+        )
+        return {
+            "debt": name,
+            "balance": balance,
+            "rate": float(rate),
+            "is_variable": bool(meta.get("is_variable")),
+            "scheduled_payment": float(payment),
+            "extra_monthly": float(extra_monthly),
+            "lumps": [{"month": m, "amount": a} for m, a in sorted(lump_by_month.items())],
+            "projection": plan,
+            "minimum_only_baseline": baseline,
+            "interest_saved_vs_baseline": saved,
+            "assumptions": (
+                "Interest accrues monthly on the outstanding balance at the "
+                "configured rate, held constant. A variable rate will not stay "
+                "where it is, so treat a variable-rate projection as a scenario."
+            ),
+        }

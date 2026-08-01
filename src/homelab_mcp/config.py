@@ -430,6 +430,20 @@ class Settings(BaseSettings):
     # mortgage was linked as a synced off-budget account in Actual on
     # 2026-07-30, so finances_debt_status reads it like every other balance.
     # A hand-maintained copy would only be able to disagree with reality.
+    finances_buffer_floor: float | None = Field(
+        default=None,
+        description=(
+            "Buffer floor in DOLLARS — the level below which no HELOC strike or "
+            "discretionary lump may take the buffer (PLAN.md suggests ~$15k, "
+            "about two months of fixed costs). Deliberately null by default: "
+            "like the monthly floor it is a household decision pending the "
+            "partner conversation, and inventing one would produce a confident, "
+            "wrong verdict. While null, finances_buffer reports status "
+            "'no_floor' rather than guessing. Read from the sops-managed env "
+            "(HOMELAB_MCP_FINANCES_BUFFER_FLOOR) at call time, so setting it "
+            "needs no redeploy of the packaged config."
+        ),
+    )
     finances_config_path: str = Field(
         default="",
         description=(
@@ -531,16 +545,33 @@ class Settings(BaseSettings):
                 "finances_rules_list",
                 "finances_rule_create",
                 "finances_rule_delete",
+                "finances_payees",
+                "finances_payee_merge",
+                "finances_buffer",
+                "finances_breaches",
+                "finances_room",
+                "finances_reconcile",
+                "finances_subscriptions",
+                "finances_net_worth",
+                "finances_payoff_projection",
                 "paperless_search",
                 "paperless_get",
                 "paperless_link",
                 "signal_send",
             ],
+            # The unattended weekly-pulse agent. PULSE.md line 4 needs the
+            # buffer and any breach (a breach preempts line 5 and is never
+            # softened); `room` supplies the pace arithmetic for line 2 so the
+            # agent never does that math itself. Deliberately NOT extended to
+            # raw transactions, any writer, or the balance sheet.
             "hermes": [
                 "finances_sync_status",
                 "finances_monthly_summary",
                 "finances_recurring",
                 "finances_debt_status",
+                "finances_buffer",
+                "finances_breaches",
+                "finances_room",
             ],
         },
         description=(

@@ -191,6 +191,29 @@ async function getAccounts() {
     });
   }
 
+  // Cleared balance = the sum of transactions the bank has CONFIRMED. It is
+  // what "cash you actually have" means, and it is the basis of the Buffer;
+  // the register total additionally includes anything still in flight.
+  let clearedById = new Map();
+  let statusById = new Map();
+  try {
+    const { data } = await api.runQuery(
+      api.q('transactions').filter({ cleared: true }).groupBy('account')
+        .select(['account', { cleared: { $sum: '$amount' } }]),
+    );
+    clearedById = new Map(data.map((r) => [r.account, r.cleared ?? 0]));
+  } catch (e) {
+    log('cleared balances unavailable', { error: String(e && e.message) });
+  }
+  try {
+    const { data } = await api.runQuery(
+      api.q('accounts').select(['id', 'bank_sync_status']).filter({ closed: false }),
+    );
+    statusById = new Map(data.map((r) => [r.id, r.bank_sync_status ?? null]));
+  } catch (e) {
+    log('bank_sync_status unavailable', { error: String(e && e.message) });
+  }
+
   const accounts = await api.getAccounts();
   const out = [];
   for (const a of accounts) {
@@ -203,6 +226,8 @@ async function getAccounts() {
       // the wire; the Python side converts once, at the tool boundary.
       balance_cents: await api.getAccountBalance(a.id),
       last_sync: lastSyncById.get(a.id) ?? null,
+      cleared_balance_cents: clearedById.get(a.id) ?? 0,
+      bank_sync_status: statusById.get(a.id) ?? null,
     });
   }
   return out;
@@ -239,6 +264,7 @@ async function getTransactions(start, end) {
         'amount',
         'notes',
         'transfer_id',
+        'cleared',
         'account',
         'account.name',
         'account.offbudget',
@@ -256,6 +282,7 @@ async function getTransactions(start, end) {
     // Non-null transfer_id marks the leg of an account-to-account transfer:
     // real money movement, but not household spend.
     is_transfer: Boolean(t.transfer_id),
+    cleared: Boolean(t.cleared),
     account_id: t.account,
     account_name: t['account.name'] || null,
     account_offbudget: Boolean(t['account.offbudget']),
@@ -396,9 +423,44 @@ async function handle(req, res) {
     if (path === '/payees' && req.method === 'GET') {
       await freshen();
       const payees = await api.getPayees();
+      // Counts make near-duplicate variants ("Monrovia" x4) obvious and let
+      // the caller judge which spelling to keep.
+      const counts = new Map();
+      try {
+        const { data } = await api.runQuery(
+          api.q('transactions').groupBy('payee').select(['payee', { n: { $count: '*' } }]),
+        );
+        for (const r of data) counts.set(r.payee, r.n ?? 0);
+      } catch (e) {
+        log('payee counts unavailable', { error: String(e && e.message) });
+      }
       return send(res, 200, {
-        payees: payees.map((p) => ({ id: p.id, name: p.name, transfer_acct: p.transfer_acct ?? null })),
+        payees: payees.map((p) => ({
+          id: p.id,
+          name: p.name,
+          // A transfer payee is the other side of an account-to-account move,
+          // not a merchant. Merging one would corrupt transfer wiring.
+          transfer_acct: p.transfer_acct ?? null,
+          transaction_count: counts.get(p.id) ?? 0,
+        })),
       });
+    }
+    if (path === '/payees/merge' && req.method === 'POST') {
+      const body = await readJson(req);
+      const keep = body.keep_id;
+      const merge = Array.isArray(body.merge_ids) ? body.merge_ids : [];
+      if (!keep || merge.length === 0) {
+        return send(res, 400, { error: 'keep_id and a non-empty merge_ids[] are required' });
+      }
+      if (merge.includes(keep)) {
+        return send(res, 400, { error: 'keep_id cannot also appear in merge_ids' });
+      }
+      // IRREVERSIBLE: Actual repoints every transaction at `keep` and deletes
+      // the merged payees. There is no undo short of restoring a backup.
+      await api.mergePayees(keep, merge);
+      await api.sync();
+      lastSyncMs = Date.now();
+      return send(res, 200, { merged: true, keep_id: keep, merged_ids: merge });
     }
     if (path === '/rules' && req.method === 'GET') {
       return send(res, 200, { rules: await listRules() });

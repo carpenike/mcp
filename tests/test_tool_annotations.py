@@ -112,6 +112,16 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     # each call creates a NEW rule, so repeating is not a no-op
     "finances_rule_create": (False, False, False),
     "finances_rule_delete": (False, True, True),
+    "finances_payees": (True, False, True),
+    # irreversible: repoints transactions and deletes the merged payees
+    "finances_payee_merge": (False, True, True),
+    "finances_buffer": (True, False, True),
+    "finances_breaches": (True, False, True),
+    "finances_room": (True, False, True),
+    "finances_reconcile": (True, False, True),
+    "finances_subscriptions": (True, False, True),
+    "finances_net_worth": (True, False, True),
+    "finances_payoff_projection": (True, False, True),
     # ── paperless ────────────────────────────────────────────────────
     "paperless_search": (True, False, True),
     "paperless_get": (True, False, True),

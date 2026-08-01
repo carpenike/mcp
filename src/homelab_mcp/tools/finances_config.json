@@ -25,9 +25,7 @@
     "  pulse        non-secret matching policy for pulse-specific aggregates.",
     "  recurring    expected fixed obligations, checked against what posted."
   ],
-
   "hurdle_rate": 5.0,
-
   "debts": {
     "_comment": [
       "rate              APR percent. null means UNKNOWN — the tool refuses to",
@@ -81,14 +79,37 @@
       "the hurdle); it marks them as rates that can move without anyone editing",
       "this file."
     ],
-    "Amex Platinum": { "rate": 29.99, "is_variable": true, "scheduled_payment": null },
-    "Citi Costco": { "rate": 29.99, "is_variable": true, "scheduled_payment": null },
-    "Chase Sapphire": { "rate": 23.49, "is_variable": true, "scheduled_payment": null },
-    "Chase Freedom": { "rate": 20.74, "is_variable": true, "scheduled_payment": null },
-    "Chase Amazon": { "rate": 18.74, "is_variable": true, "scheduled_payment": null },
-    "Apple Card": { "rate": 14.49, "is_variable": true, "scheduled_payment": null }
+    "Amex Platinum": {
+      "rate": 29.99,
+      "is_variable": true,
+      "scheduled_payment": null
+    },
+    "Citi Costco": {
+      "rate": 29.99,
+      "is_variable": true,
+      "scheduled_payment": null
+    },
+    "Chase Sapphire": {
+      "rate": 23.49,
+      "is_variable": true,
+      "scheduled_payment": null
+    },
+    "Chase Freedom": {
+      "rate": 20.74,
+      "is_variable": true,
+      "scheduled_payment": null
+    },
+    "Chase Amazon": {
+      "rate": 18.74,
+      "is_variable": true,
+      "scheduled_payment": null
+    },
+    "Apple Card": {
+      "rate": 14.49,
+      "is_variable": true,
+      "scheduled_payment": null
+    }
   },
-
   "sync": {
     "_comment": [
       "Feed health is judged on `last_sync` — the bank feed's last successful",
@@ -103,7 +124,6 @@
     ],
     "feed_stale_hours": 26,
     "feed_dead_hours": 72,
-
     "default_cadence": "daily",
     "cadence_max_age_days": {
       "daily": 3,
@@ -118,22 +138,21 @@
       "Chase Freedom": "daily",
       "Chase Sapphire": "daily",
       "Citi Costco": "daily",
-
       "Apple Card": "monthly",
       "Synchrony Container Store": "monthly",
       "Synchrony Music & Arts": "monthly",
       "Spectra HELOC": "monthly",
       "Mortgage (NewRez)": "monthly",
-
       "Tesla Loan (Santander)": "manual",
       "House": "manual"
     }
   },
-
   "pulse": {
-    "amazon_match_any": ["amazon", "amzn"]
+    "amazon_match_any": [
+      "amazon",
+      "amzn"
+    ]
   },
-
   "recurring": {
     "_comment": [
       "default_tolerance_pct is the band, as a percent of the expected amount,",
@@ -172,14 +191,19 @@
         "name": "Mortgage — Shellpoint/NewRez",
         "amount": 2735.68,
         "expected_day": 1,
-        "match_any": ["shellpoint", "newrez"],
+        "match_any": [
+          "shellpoint",
+          "newrez"
+        ],
         "ends": null
       },
       {
         "name": "Tesla Model Y — Santander",
         "amount": 652.0,
         "expected_day": 15,
-        "match_any": ["santander"],
+        "match_any": [
+          "santander"
+        ],
         "ends": null
       },
       {
@@ -187,23 +211,38 @@
         "amount": 650.0,
         "tolerance_pct": 25.0,
         "expected_day": 1,
-        "match_any": ["elec ext loan", "ryan holt external", "spectra"],
+        "match_any": [
+          "elec ext loan",
+          "ryan holt external",
+          "spectra"
+        ],
         "ends": null
       },
       {
         "name": "Synchrony — Container Store (master closet)",
         "amount": 291.0,
         "expected_day": 15,
-        "match_any": ["synchrony", "container store"],
-        "accounts": ["Synchrony Container Store"],
+        "match_any": [
+          "synchrony",
+          "container store"
+        ],
+        "accounts": [
+          "Synchrony Container Store"
+        ],
         "ends": "2028-02"
       },
       {
         "name": "Synchrony — Music & Arts (saxophone)",
         "amount": 97.0,
         "expected_day": 1,
-        "match_any": ["synchrony", "music & arts", "music and arts"],
-        "accounts": ["Synchrony Music & Arts"],
+        "match_any": [
+          "synchrony",
+          "music & arts",
+          "music and arts"
+        ],
+        "accounts": [
+          "Synchrony Music & Arts"
+        ],
         "ends": "2026-11"
       },
       {
@@ -211,14 +250,19 @@
         "amount": 270.0,
         "tolerance_pct": 20.0,
         "expected_day": null,
-        "match_any": ["t-mobile", "tmobile"],
+        "match_any": [
+          "t-mobile",
+          "tmobile"
+        ],
         "ends": null
       },
       {
         "name": "Phone/watch — Verizon",
         "amount": 95.0,
         "expected_day": null,
-        "match_any": ["verizon"],
+        "match_any": [
+          "verizon"
+        ],
         "ends": null
       },
       {
@@ -226,7 +270,11 @@
         "amount": 608.0,
         "tolerance_pct": 55.0,
         "expected_day": null,
-        "match_any": ["firstenergy", "first energy", "potomac edison"],
+        "match_any": [
+          "firstenergy",
+          "first energy",
+          "potomac edison"
+        ],
         "ends": null,
         "note": "Genuinely seasonal (summer AC / winter heat), so the band is wide. The delta is still surfaced under notable_variances whenever it exceeds the default band — a wide band must never mean a silent price rise."
       },
@@ -235,14 +283,21 @@
         "amount": 70.0,
         "tolerance_pct": 20.0,
         "expected_day": null,
-        "match_any": ["starlink", "spacex"],
+        "match_any": [
+          "starlink",
+          "spacex"
+        ],
         "ends": null
       },
       {
         "name": "USAA P&C insurance",
         "amount": 215.47,
         "expected_day": 1,
-        "match_any": ["usaa p&c", "usaa property and casualty", "usaa gen indemnity"],
+        "match_any": [
+          "usaa p&c",
+          "usaa property and casualty",
+          "usaa gen indemnity"
+        ],
         "ends": null,
         "note": "ONE combined monthly draft covering two policies: auto $198.89/mo ($1,193.32 per 6-month term, both vehicles) plus jewelry personal-property $16.58/mo ($199/yr). 198.89 + 16.58 = 215.47 exactly. The jewelry policy WAS the entire draft until 2026-05-01, which is why the old baseline was $16.58; the auto policy joined it when Tesla Insurance was dropped. Observed: 16.58/mo Oct 2025-Apr 2026, then 215.51 (5/1), 215.47 (6/2), 215.47 (7/1). The auto side REPRICES ~Nov 2026 — the amount will change then, and that is expected rather than an anomaly. Tolerance is deliberately the standard 10%: unlike FirstEnergy this draft is contractually flat between repricings, so any variance is signal."
       },
@@ -250,8 +305,14 @@
         "name": "USAA life insurance",
         "amount": 44.15,
         "expected_day": 28,
-        "window_slip_days": { "before": 3, "after": 4 },
-        "match_any": ["usaa life insurance", "usaa.com pay int life"],
+        "window_slip_days": {
+          "before": 3,
+          "after": 4
+        },
+        "match_any": [
+          "usaa life insurance",
+          "usaa.com pay int life"
+        ],
         "ends": null,
         "note": "Drafts on the 28th and posts anywhere from the 28th to the 3rd of the following month, so its billing window is anchored on the 28th rather than the calendar month. Under calendar months the observed series (9/30, 10/30, 12/2, 12/30, 1/30, 3/3, 3/31, 4/30, 6/1, 6/30) read as three MISSING months (Nov, Feb, May) with three other months holding two payments — the charge attributed to the month it CLEARED rather than the one it is for. Consecutive anchored windows cannot overlap, so a slipped payment is claimable by exactly one month. Two payee forms: the clean 'USAA Life Insurance' and the raw descriptor 'USAA.COM PAY INT LIFE' + masked account, which lands in the NOTES field; matching spans payee and notes, substring and case-insensitive."
       },
@@ -259,9 +320,96 @@
         "name": "MacBook Pro installment (Apple Card)",
         "amount": 200.33,
         "expected_day": null,
-        "match_any": ["apple card monthly installment", "installment", "apple.com"],
-        "accounts": ["Apple Card"],
+        "match_any": [
+          "apple card monthly installment",
+          "installment",
+          "apple.com"
+        ],
+        "accounts": [
+          "Apple Card"
+        ],
         "ends": "2027-03"
+      }
+    ]
+  },
+  "buffer": {
+    "_comment": [
+      "PLAN.md's fear metric, verbatim: cleared USAA Checking - all revolving",
+      "card balances - the next mortgage payment. Checking ONLY. No HYSA (it is",
+      "earmarked for the Kubota loan), no brokerage, no anything else —",
+      "'operations run on checking, full stop'.",
+      "",
+      "CLEARED, not register: the buffer answers 'could we clear the decks",
+      "today', and money the bank has not confirmed cannot clear anything.",
+      "",
+      "Only NEGATIVE card balances count. A card carrying a credit is not cash",
+      "you owe, and adding it as cash would overstate the buffer.",
+      "",
+      "Synchrony is deliberately absent: those are fixed 0% instalments on a",
+      "schedule, not revolving balances that could be called tomorrow."
+    ],
+    "cash_accounts": [
+      "USAA Checking"
+    ],
+    "card_accounts": [
+      "Amex Platinum",
+      "Apple Card",
+      "Chase Amazon",
+      "Chase Freedom",
+      "Chase Sapphire",
+      "Citi Costco"
+    ],
+    "mortgage_obligation": "Mortgage — Shellpoint/NewRez",
+    "lookahead_days": 14
+  },
+  "income_payees": {
+    "_comment": [
+      "Deposits into checking whose payee matches NONE of these are breach",
+      "candidates: money arriving from HYSA, brokerage or the HELOC to cover",
+      "operational spending. The May 2026 $30.7k brokerage sale is the",
+      "canonical case. Detection only — the tool never clears or judges one.",
+      "",
+      "Substring match, case-insensitive, against payee and notes. Keep this",
+      "list tight: a too-broad entry silently suppresses a real breach."
+    ],
+    "allow_substrings": [
+      "microsoft",
+      "msft payroll",
+      "payroll",
+      "irs",
+      "us treasury",
+      "tax ref",
+      "refund",
+      "interest",
+      "dividend",
+      "mobile deposit",
+      "mobile check deposit",
+      "remote deposit"
+    ]
+  },
+  "lumpy": {
+    "_comment": [
+      "Annual/irregular costs amortized at 1/12 into the gap. PLAN.md DEFINES",
+      "the Bonus Dependence Gap with amortization ('monthly baseline spend,",
+      "including 1/12 of annual lumpy expenses'), so the raw monthly gap",
+      "understates it in every month one of these does not happen to land.",
+      "",
+      "annual_amount null means NOT YET QUANTIFIED: the entry is listed so it",
+      "is not forgotten, and excluded from the arithmetic so it cannot invent",
+      "a number. Fill it from statements, don't estimate it here."
+    ],
+    "items": [
+      {
+        "name": "Jayme's baseball membership",
+        "annual_amount": 2500.0,
+        "category": "Kids",
+        "note": "Paid by Zelle to Dustin Pease in instalments to stay under the daily Zelle limit; $2,500 observed (PLAN.md)."
+      },
+      {
+        "name": "Dental (Natural Dentist Associates)",
+        "annual_amount": null,
+        "category": "Health",
+        "note": "$9.1k observed across May-Jul 2026 (ortho/implants?) — that is a treatment episode, not a known annual run-rate. Quantify from the treatment plan before amortizing; guessing would move the household's headline metric on a fiction."
       }
     ]
   }
