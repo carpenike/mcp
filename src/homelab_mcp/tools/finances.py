@@ -2015,43 +2015,55 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         # Same matcher finances_recurring uses — not a copy of it.
         obligations, _ = _match_obligations(cfg, rows, month, first, last, today)
 
-        mtd = 0
+        # Bucketed by month so the trailing figures below run on exactly the
+        # same consumption basis as the current month, rather than a second
+        # definition of "variable spend" that could drift from this one.
+        consumption_by_month: dict[str, int] = defaultdict(int)
+        consumption_ids_by_month: dict[str, set[str]] = defaultdict(set)
         savings_mtd = 0
-        consumption_ids: set[str] = set()
         per_month_cat: dict[str, int] = defaultdict(int)
         cat_mtd = 0
+        this_month = first.strftime("%Y-%m")
         for t in rows:
             if not _is_spend(t, income_names):
                 continue
+            bucket = t["date"][:7]
             in_month = first.isoformat() <= t["date"] <= last.isoformat()
             name = t["category_name"] or "(uncategorized)"
             amount = -t["amount_cents"]
-            if in_month:
-                if name == SAVINGS_CATEGORY:
+            if name == SAVINGS_CATEGORY:
+                if in_month:
                     savings_mtd += amount
-                else:
-                    mtd += amount
-                    consumption_ids.add(t["id"])
-                if category and name == category:
+            else:
+                consumption_by_month[bucket] += amount
+                consumption_ids_by_month[bucket].add(t["id"])
+            if category and name == category:
+                if in_month:
                     cat_mtd += amount
-            elif category and name == category:
-                per_month_cat[t["date"][:7]] += amount
+                else:
+                    per_month_cat[bucket] += amount
+
+        mtd = consumption_by_month.get(this_month, 0)
+        consumption_ids = consumption_ids_by_month.get(this_month, set())
 
         # Which obligations bear on the CONSUMPTION floor at all. A debt-service
         # leg on a liability account (the Synchrony instalments) posts as a
         # transfer, never as consumption spend, so counting it as committed
         # would understate room against a floor it never touches.
-        def _hits_floor(row: dict[str, Any], item: dict[str, Any]) -> bool:
+        items_by_name = {
+            str(i.get("name")): i for i in (cfg.get("recurring") or {}).get("items", [])
+        }
+
+        def _hits_floor(
+            row: dict[str, Any], item: dict[str, Any], ids: set[str] | None = None
+        ) -> bool:
             txn_id = row.get("transaction_id")
             if txn_id is not None:
-                return txn_id in consumption_ids
+                return txn_id in (consumption_ids if ids is None else ids)
             # Not yet posted: infer from the item. Items pinned to a specific
             # (liability) account are matched on their transfer leg.
             return not item.get("accounts")
 
-        items_by_name = {
-            str(i.get("name")): i for i in (cfg.get("recurring") or {}).get("items", [])
-        }
         committed: list[dict[str, Any]] = []
         fixed_expected_total = 0.0
         fixed_posted = 0.0
@@ -2081,6 +2093,42 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         remaining_committed = round(sum(float(c["expected_amount"]) for c in committed), 2)
         fixed_expected_total = round(fixed_expected_total, 2)
         fixed_posted = round(fixed_posted, 2)
+
+        def _variable_daily(month_start: date) -> float | None:
+            """Average daily VARIABLE spend for a complete prior month.
+
+            Runs the same obligation matcher and the same consumption/fixed
+            split as the current month, so `typical_remaining_pace` is
+            comparable to `required_remaining_pace` rather than a differently
+            derived number that happens to share a name.
+            """
+            label = month_start.strftime("%Y-%m")
+            if label not in consumption_by_month:
+                return None
+            m_last = date(
+                month_start.year,
+                month_start.month,
+                calendar.monthrange(month_start.year, month_start.month)[1],
+            )
+            m_rows, _ = _match_obligations(cfg, rows, label, month_start, m_last, today)
+            ids = consumption_ids_by_month.get(label, set())
+            fixed = 0.0
+            for r in m_rows:
+                if r["status"] in ("MATCHED", "CHANGED") and _hits_floor(
+                    r, items_by_name.get(str(r["name"])) or {}, ids
+                ):
+                    fixed += float(r.get("actual_amount") or 0.0)
+            variable = _d(consumption_by_month[label]) - fixed
+            return round(variable / ((m_last - month_start).days + 1), 2)
+
+        trailing_dailies = [
+            d
+            for d in (_variable_daily(_shift_month(today, i)) for i in range(1, 7))
+            if d is not None
+        ]
+        typical_remaining_pace = (
+            round(sum(trailing_dailies) / len(trailing_dailies), 2) if trailing_dailies else None
+        )
 
         days_in_month = (last - first).days + 1
         days_elapsed = (today - first).days + 1
@@ -2131,9 +2179,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "variable_floor",
                 "variable_floor_to_date",
                 "variable_pace_delta",
+                "required_remaining_pace",
+                "recovery_delta",
             ):
                 result[key] = None
             result["note"] = "No floor configured (HOMELAB_MCP_FINANCES_FLOOR)."
+            # Independent of the floor, so it is still worth reporting.
+            result["typical_remaining_pace"] = typical_remaining_pace
         else:
             # Headline: what is genuinely left, after everything already
             # committed for the rest of the month. May be negative.
@@ -2149,6 +2201,35 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             # Positive = spending variable faster than the floor allows.
             result["variable_pace_delta"] = round(variable_mtd - variable_to_date, 2)
             result["pace"] = "ahead" if variable_mtd > variable_to_date else "on_or_under"
+
+            # ── recovery math ────────────────────────────────────────
+            # PULSE.md's tone rule: an over-pace week gets a number to aim at,
+            # never a bare verdict. Negative values are reported, not clamped —
+            # a negative required pace is the honest statement that the floor
+            # is already spent, and hiding it would be the verdict this is
+            # meant to replace.
+            #
+            # On the last day days_remaining is 0; the divisor floors at 1, so
+            # the figure reads "what would have to fit in today" instead of
+            # blowing up.
+            remaining_days = max(days_in_month - days_elapsed, 1)
+            required = round(float(result["room_this_month"]) / remaining_days, 2)
+            result["required_remaining_pace"] = required
+            result["typical_remaining_pace"] = typical_remaining_pace
+            result["recovery_delta"] = (
+                round(typical_remaining_pace - required, 2)
+                if typical_remaining_pace is not None
+                else None
+            )
+            result["recovery_basis"] = (
+                "required_remaining_pace is dollars/day of variable spend that "
+                "lands the month exactly on floor. typical_remaining_pace is the "
+                "trailing 6-month average daily variable spend on the same basis. "
+                "recovery_delta positive = must run tighter than typical by that "
+                "much per day; negative = cushion. Divisor floors at 1 day so the "
+                "last day of the month is defined."
+            )
+            result["trailing_months_used"] = len(trailing_dailies)
 
             # Kept for continuity; measured on total consumption, so it spikes
             # on the 1st. variable_pace_delta is the one to quote.

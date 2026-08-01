@@ -2262,3 +2262,150 @@ async def test_room_without_a_floor_reports_nulls_not_guesses(
         assert out[key] is None
     # Committed bills are still computable and still reported.
     assert out["remaining_committed"] == 2600.0
+
+
+# ── room: glide / recovery math ──────────────────────────────────────
+# PULSE.md's tone rule is "recovery math, never a bare verdict", so these
+# pin the arithmetic a caller would otherwise have to do itself.
+
+
+@pytest.fixture
+def frozen_midmonth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Day 21 of 31 — the week-3 over-pace moment this exists for."""
+    import homelab_mcp.tools.finances as fin
+
+    class D(fin.date):  # type: ignore[misc,valid-type]
+        @classmethod
+        def today(cls) -> Any:
+            return fin.date(2026, 7, 21)
+
+    class DT(fin.datetime):  # type: ignore[misc,valid-type]
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            return fin.datetime(2026, 7, 21, 12, 0, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(fin, "date", D)
+    monkeypatch.setattr(fin, "datetime", DT)
+
+
+async def test_required_pace_hand_calc_when_over_pace(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_midmonth: None
+) -> None:
+    """Day 21/31: $6,000 spent, both bills paid, floor 8400."""
+    _room_mock(
+        httpx_mock,
+        [
+            _txn(
+                id="m",
+                date="2026-07-01",
+                amount_cents=-200_000,
+                payee_name="Shellpoint Mortgage",
+                category_name="Fixed",
+            ),
+            _txn(
+                id="t",
+                date="2026-07-15",
+                amount_cents=-60_000,
+                payee_name="Santander",
+                category_name="Fixed",
+            ),
+            _txn(id="v", date="2026-07-10", amount_cents=-340_000, category_name="Amazon"),
+        ],
+    )
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["consumption_mtd"] == 6000.0
+    assert out["remaining_committed"] == 0.0  # both floor-bearing bills posted
+    assert out["room_this_month"] == pytest.approx(2400.0)  # 8400 - 6000 - 0
+    assert out["days_remaining"] == 10
+    # 2400 / 10 days
+    assert out["required_remaining_pace"] == pytest.approx(240.0)
+
+
+async def test_required_pace_is_negative_when_room_is_negative(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_midmonth: None
+) -> None:
+    """A blown floor must be reported as a negative, not clamped to zero.
+
+    Clamping would turn the number into the bare verdict it replaces.
+    """
+    _room_mock(
+        httpx_mock,
+        [_txn(id="v", date="2026-07-10", amount_cents=-1_000_000, category_name="Amazon")],
+    )
+    out = await _room_tools(tmp_path)["finances_room"]()
+    # 8400 - 10000 - 2600 still committed.
+    assert out["room_this_month"] == pytest.approx(-4200.0)
+    assert out["required_remaining_pace"] == pytest.approx(-420.0)
+    assert out["required_remaining_pace"] < 0
+
+
+async def test_recovery_delta_relates_typical_to_required(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_midmonth: None
+) -> None:
+    """recovery_delta = typical − required, on the same variable basis."""
+    prior = [
+        # A prior month with $3,100 of variable spend and its fixed bills paid.
+        _txn(
+            id="pm",
+            date="2026-06-01",
+            amount_cents=-200_000,
+            payee_name="Shellpoint Mortgage",
+            category_name="Fixed",
+        ),
+        _txn(id="pv", date="2026-06-10", amount_cents=-310_000, category_name="Amazon"),
+    ]
+    _room_mock(
+        httpx_mock,
+        [*prior, _txn(id="v", date="2026-07-10", amount_cents=-340_000, category_name="Amazon")],
+    )
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["trailing_months_used"] >= 1
+    typical = out["typical_remaining_pace"]
+    required = out["required_remaining_pace"]
+    assert typical is not None
+    # June: 3,100 variable over 30 days.
+    assert typical == pytest.approx(103.33, abs=0.02)
+    assert out["recovery_delta"] == pytest.approx(round(typical - required, 2))
+
+
+async def test_last_day_of_month_does_not_divide_by_zero(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Day 31/31: days_remaining is 0; the divisor floors at 1."""
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["days_remaining"] == 0
+    # room / 1, not a ZeroDivisionError and not an infinity.
+    assert out["required_remaining_pace"] == pytest.approx(out["room_this_month"])
+    assert "floors at 1 day" in out["recovery_basis"]
+
+
+async def test_glide_fields_are_null_without_a_floor(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_midmonth: None
+) -> None:
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path, finances_floor=None)["finances_room"]()
+    assert out["required_remaining_pace"] is None
+    assert out["recovery_delta"] is None
+    # Typical pace needs no floor, so it is still reported.
+    assert "typical_remaining_pace" in out
+
+
+async def test_glide_fields_are_additive(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_midmonth: None
+) -> None:
+    """Existing consumers must be unaffected."""
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path)["finances_room"]()
+    for key in (
+        "room_this_month",
+        "room_this_month_naive",
+        "remaining_committed",
+        "variable_floor",
+        "variable_mtd",
+        "variable_pace_delta",
+        "pace",
+        "consumption_mtd",
+        "savings_mtd",
+    ):
+        assert key in out, f"pre-existing field {key} disappeared"
