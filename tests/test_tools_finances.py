@@ -1640,7 +1640,11 @@ async def test_room_arithmetic_and_savings_exclusion(
     assert out["days_elapsed"] == 31 and out["days_in_month"] == 31
     assert out["floor_to_date"] == pytest.approx(8400.0)
     assert out["pace_delta"] == pytest.approx(1000.0 - 8400.0)
-    assert out["room_this_month"] == pytest.approx(7400.0)
+    # Room is now net of the fixed bills that have not posted, so it is NOT
+    # the naive 7400. Both figures are returned; the naive one is labelled.
+    assert out["room_this_month_naive"] == pytest.approx(7400.0)
+    assert out["room_this_month"] == pytest.approx(7400.0 - out["remaining_committed"])
+    assert out["remaining_committed"] > 0
 
 
 # ── amortization ──────────────────────────────────────────────────────
@@ -1840,3 +1844,217 @@ async def test_subscriptions_requires_min_months(tmp_path: Any, httpx_mock: HTTP
     assert spotify["months_present"] == 4
     assert spotify["fixed_amount"] is True
     assert spotify["first_seen"] == "2026-01-10"
+
+
+# ── room: committed-bill correction ──────────────────────────────────
+
+
+def _room_cfg(tmp_path: Any) -> str:
+    """Two fixed bills: one on the 1st, one mid-month."""
+    cfg = tmp_path / "room.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "buffer": {"cash_accounts": ["USAA Checking"], "card_accounts": []},
+                "recurring": {
+                    "default_tolerance_pct": 10.0,
+                    "min_tolerance": 5.0,
+                    "items": [
+                        {
+                            "name": "Mortgage",
+                            "amount": 2000.0,
+                            "expected_day": 1,
+                            "match_any": ["shellpoint"],
+                            "ends": None,
+                        },
+                        {
+                            "name": "Tesla",
+                            "amount": 600.0,
+                            "expected_day": 15,
+                            "match_any": ["santander"],
+                            "ends": None,
+                        },
+                        # Debt service on a liability account: posts as a
+                        # transfer, so it never touches the consumption floor.
+                        {
+                            "name": "Synchrony",
+                            "amount": 300.0,
+                            "expected_day": 15,
+                            "match_any": ["synchrony"],
+                            "accounts": ["Synchrony Container Store"],
+                            "ends": None,
+                        },
+                    ],
+                },
+            }
+        )
+    )
+    return str(cfg)
+
+
+def _room_tools(tmp_path: Any, **over: Any) -> Any:
+    kw: dict[str, Any] = {
+        "_env_file": None,
+        "oauth_required": False,
+        "finances_sidecar_base_url": BASE,
+        "finances_config_path": _room_cfg(tmp_path),
+        "finances_floor": 8400.0,
+    }
+    kw.update(over)
+    mcp = CapturingMCP()
+    register(mcp, Settings(**kw))  # type: ignore[arg-type]
+    return mcp.tools
+
+
+def _room_mock(httpx_mock: HTTPXMock, txns: list[dict[str, Any]]) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": txns}
+    )
+
+
+async def test_room_is_net_of_bills_not_yet_posted(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """The headline defect: naive floor-minus-spend overstates room early."""
+    # Nothing posted yet. Both floor-bearing bills are still to come.
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["remaining_committed"] == 2600.0  # 2000 + 600, NOT the Synchrony 300
+    assert out["room_this_month"] == pytest.approx(8400.0 - 0.0 - 2600.0)
+    assert out["room_this_month_naive"] == 8400.0
+    assert out["room_this_month"] < out["room_this_month_naive"]
+
+
+async def test_room_committed_items_are_itemized(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Callers must be able to say '$X after $Y of upcoming bills'."""
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path)["finances_room"]()
+    names = [c["name"] for c in out["remaining_committed_items"]]
+    assert names == ["Mortgage", "Tesla"]
+    assert sum(c["expected_amount"] for c in out["remaining_committed_items"]) == 2600.0
+    assert "never the naive" in out["presentation_note"]
+
+
+async def test_room_drops_a_bill_from_committed_once_it_posts(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    _room_mock(
+        httpx_mock,
+        [
+            _txn(
+                id="m",
+                date="2026-07-01",
+                amount_cents=-200_000,
+                payee_name="Shellpoint Mortgage",
+                category_name="Fixed",
+            )
+        ],
+    )
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert [c["name"] for c in out["remaining_committed_items"]] == ["Tesla"]
+    assert out["remaining_committed"] == 600.0
+    assert out["fixed_posted"] == 2000.0
+    # 8400 - 2000 spent - 600 still to come.
+    assert out["room_this_month"] == pytest.approx(5800.0)
+
+
+@pytest.fixture
+def frozen_early(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Day 2 of the month — where the 1st-of-month mortgage distorts pace."""
+    import homelab_mcp.tools.finances as fin
+
+    class D(fin.date):  # type: ignore[misc,valid-type]
+        @classmethod
+        def today(cls) -> Any:
+            return fin.date(2026, 7, 2)
+
+    class DT(fin.datetime):  # type: ignore[misc,valid-type]
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            return fin.datetime(2026, 7, 2, 12, 0, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(fin, "date", D)
+    monkeypatch.setattr(fin, "datetime", DT)
+
+
+async def test_pace_is_measured_on_variable_spend_only(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_early: None
+) -> None:
+    """Pacing on the total makes the 1st-of-month mortgage a false spike."""
+    _room_mock(
+        httpx_mock,
+        [
+            _txn(
+                id="m",
+                date="2026-07-01",
+                amount_cents=-200_000,
+                payee_name="Shellpoint Mortgage",
+                category_name="Fixed",
+            ),
+            _txn(id="v", date="2026-07-02", amount_cents=-10_000, category_name="Amazon"),
+        ],
+    )
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["consumption_mtd"] == 2100.0
+    assert out["fixed_posted"] == 2000.0
+    assert out["variable_mtd"] == 100.0
+    # variable floor = 8400 - (2000 + 600) = 5800; the Synchrony 300 is excluded.
+    assert out["variable_floor"] == 5800.0
+    # Day 2 of 31. Variable pacing says fine: $100 spent against $374 allowed.
+    assert out["variable_floor_to_date"] == pytest.approx(round(5800.0 * 2 / 31, 2))
+    assert out["variable_pace_delta"] < 0
+    assert out["pace"] == "on_or_under"
+    # Total-based pacing on the same day screams overspend purely because the
+    # mortgage landed on the 1st. THIS is why pace is measured on variable.
+    assert out["pace_delta"] > 0
+    assert out["pace_delta"] > out["variable_pace_delta"]
+
+
+async def test_room_excludes_debt_service_legs_from_the_floor(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Synchrony posts as a transfer; it never touches consumption spend."""
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path)["finances_room"]()
+    assert out["obligations_excluded_from_floor"] == ["Synchrony"]
+    assert out["fixed_expected_total"] == 2600.0
+
+
+async def test_room_and_recurring_agree_on_what_has_posted(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Both call the same matcher, so their views can never diverge."""
+    txns = [
+        _txn(
+            id="m",
+            date="2026-07-01",
+            amount_cents=-200_000,
+            payee_name="Shellpoint Mortgage",
+            category_name="Fixed",
+        )
+    ]
+    _room_mock(httpx_mock, txns)
+    tools = _room_tools(tmp_path)
+    room = await tools["finances_room"]()
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": txns}
+    )
+    rec = await tools["finances_recurring"](month="2026-07")
+    posted = {o["name"] for o in rec["obligations"] if o["status"] in ("MATCHED", "CHANGED")}
+    still_due = {c["name"] for c in room["remaining_committed_items"]}
+    assert "Mortgage" in posted
+    assert "Mortgage" not in still_due
+
+
+async def test_room_without_a_floor_reports_nulls_not_guesses(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    _room_mock(httpx_mock, [])
+    out = await _room_tools(tmp_path, finances_floor=None)["finances_room"]()
+    for key in ("room_this_month", "variable_floor", "variable_pace_delta"):
+        assert out[key] is None
+    # Committed bills are still computable and still reported.
+    assert out["remaining_committed"] == 2600.0

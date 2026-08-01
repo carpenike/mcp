@@ -186,7 +186,7 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_payees` / `finances_payee_merge` | Payees with transaction counts to spot duplicate variants; merge folds them into one. Merge is **irreversible** and refuses transfer payees |
 | Finances | `finances_buffer` | PLAN.md's fear metric: cleared checking − card debt − next mortgage, plus the 14-day look-ahead. Components and totals, so it can be checked by hand |
 | Finances | `finances_breaches` | Non-income deposits into checking — money arriving from HYSA/brokerage/HELOC to fund operations. Detection only |
-| Finances | `finances_room` | The "can we spend this?" arithmetic: elapsed %, pro-rated floor, pace delta, room left, optional per-category trailing average |
+| Finances | `finances_room` | The "can we spend this?" arithmetic, **net of fixed bills not yet posted**: room, itemized `remaining_committed`, `variable_floor`/`variable_mtd`, and pace measured on variable spend only. Present as "$X after $Y of upcoming fixed bills" — never the naive figure |
 | Finances | `finances_reconcile` | Register vs cleared balance per account, feed status and age, drift classified |
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
 | Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only) |
