@@ -196,6 +196,7 @@ async function getAccounts() {
   // the register total additionally includes anything still in flight.
   let clearedById = new Map();
   let statusById = new Map();
+  let simplefinById = new Map();
   try {
     const { data } = await api.runQuery(
       api.q('transactions').filter({ cleared: true }).groupBy('account')
@@ -207,9 +208,10 @@ async function getAccounts() {
   }
   try {
     const { data } = await api.runQuery(
-      api.q('accounts').select(['id', 'bank_sync_status']).filter({ closed: false }),
+      api.q('accounts').select(['id', 'bank_sync_status', 'account_id']).filter({ closed: false }),
     );
     statusById = new Map(data.map((r) => [r.id, r.bank_sync_status ?? null]));
+    simplefinById = new Map(data.map((r) => [r.id, r.account_id ?? null]));
   } catch (e) {
     log('bank_sync_status unavailable', { error: String(e && e.message) });
   }
@@ -228,6 +230,8 @@ async function getAccounts() {
       last_sync: lastSyncById.get(a.id) ?? null,
       cleared_balance_cents: clearedById.get(a.id) ?? 0,
       bank_sync_status: statusById.get(a.id) ?? null,
+      // SimpleFin's own account id — the join key to /simplefin-balances.
+      simplefin_id: simplefinById.get(a.id) ?? null,
     });
   }
   return out;
@@ -461,6 +465,36 @@ async function handle(req, res) {
       await api.sync();
       lastSyncMs = Date.now();
       return send(res, 200, { merged: true, keep_id: keep, merged_ids: merge });
+    }
+    if (path === '/simplefin-balances' && req.method === 'GET') {
+      // The bank's OWN reported balance per linked account. Actual exposes it
+      // only through this internal channel — it is not in the ActualQL
+      // `accounts` model — and it is what makes reconcile able to see a
+      // register that has drifted from reality while fully cleared.
+      //
+      // Deliberately does NOT call freshen() or runBankSync(): this reads
+      // already-synced server state, and a bank pull per reconcile would be
+      // slow and rate-limited for no gain.
+      let payload;
+      try {
+        payload = await api.internal.send('simplefin-accounts');
+      } catch (e) {
+        // Degrade honestly — the Python side falls back to cleared-only mode
+        // and says so rather than pretending the comparison happened.
+        log('simplefin-accounts unavailable', { error: String(e && e.message) });
+        return send(res, 503, { error: 'simplefin_unavailable', message: String(e && e.message) });
+      }
+      const rows = ((payload && payload.accounts) || []).map((a) => ({
+        simplefin_id: a.id,
+        name: a.name ?? null,
+        org: (a.org && (a.org.name || a.org.domain)) || null,
+        // Strings on the wire; parsed once here so the Python side gets numbers.
+        balance: a.balance === undefined ? null : Number(a.balance),
+        available_balance:
+          a['available-balance'] === undefined ? null : Number(a['available-balance']),
+        balance_date: a['balance-date'] ?? null,
+      }));
+      return send(res, 200, { accounts: rows, error: payload && payload.error ? String(payload.error) : null });
     }
     if (path === '/rules' && req.method === 'GET') {
       return send(res, 200, { rules: await listRules() });
