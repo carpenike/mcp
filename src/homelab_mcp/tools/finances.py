@@ -1756,13 +1756,52 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         except ToolError as err:
             return err.payload()
 
+        # Cash is what the BANK says is available today. The cleared register
+        # counts money already committed to in-flight payments as spendable —
+        # reconcile measured ~$10k of that optimism on 2026-08-01 — and pairing
+        # cleared-basis cash with register-basis cards double-counts a payment
+        # mid-settlement. Bank-available cash + register cards is
+        # double-count-proof in both directions.
+        bank_by_id: dict[str, dict[str, Any]] = {}
+        degraded_reason: str | None = None
+        try:
+            payload = await _get("/simplefin-balances")
+            for row in (payload or {}).get("accounts") or []:
+                if row.get("simplefin_id"):
+                    bank_by_id[str(row["simplefin_id"])] = row
+        except ToolError as err:
+            degraded_reason = err.message
+
         by_name = {a["name"]: a for a in accounts if not a["closed"]}
-        cash_detail = [
-            {"account": n, "cleared_balance": _d(by_name[n]["cleared_balance_cents"])}
-            for n in cash_names
-            if n in by_name
-        ]
-        cash = round(sum(c["cleared_balance"] for c in cash_detail), 2)
+        cash_detail: list[dict[str, Any]] = []
+        for n in cash_names:
+            a = by_name.get(n)
+            if a is None:
+                continue
+            bank_row = bank_by_id.get(str(a.get("simplefin_id") or ""))
+            available = None
+            if bank_row is not None:
+                # available-balance is the honest "today" figure; some feeds
+                # only carry `balance`.
+                available = bank_row.get("available_balance")
+                if available is None:
+                    available = bank_row.get("balance")
+            cleared = _d(a["cleared_balance_cents"])
+            cash_detail.append(
+                {
+                    "account": n,
+                    "balance_used": round(float(available), 2)
+                    if available is not None
+                    else cleared,
+                    "basis": "bank_available" if available is not None else "cleared_register",
+                    "bank_available_balance": (
+                        round(float(available), 2) if available is not None else None
+                    ),
+                    "cleared_balance": cleared,
+                }
+            )
+        cash = round(sum(float(c["balance_used"]) for c in cash_detail), 2)
+        fell_back = [c["account"] for c in cash_detail if c["basis"] == "cleared_register"]
 
         # Only balances that are OWED reduce the buffer. A card carrying a
         # credit is not cash on hand.
@@ -1832,11 +1871,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         else:
             status = "above_floor"
 
-        return {
+        mode = "cleared_register" if fell_back else "bank_available"
+        result: dict[str, Any] = {
             "as_of": today.isoformat(),
             "buffer": value,
+            "mode": mode,
             "components": {
-                "cleared_cash": cash,
+                "cash": cash,
                 "cash_accounts": cash_detail,
                 "card_debt": card_debt,
                 "card_accounts": card_detail,
@@ -1849,13 +1890,25 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "floor": floor,
             "status": status,
             "basis": (
-                "Cash is the CLEARED checking balance (money the bank has "
-                "confirmed); cards use their register balance, so a payment "
-                "already made counts. Checking only — HYSA, brokerage and every "
-                "other account are excluded by design. Only cards in debt are "
-                "counted; a card carrying a credit is not cash on hand."
+                "Cash is the bank's own AVAILABLE balance — what could actually "
+                "be spent today, net of anything already in flight. Cards use "
+                "their register balance, so a payment already made counts. That "
+                "pairing cannot double-count in either direction. Checking only "
+                "— HYSA, brokerage and every other account are excluded by "
+                "design. Only cards in debt are counted; a card carrying a "
+                "credit is not cash on hand."
             ),
         }
+        if fell_back:
+            result["limitation"] = (
+                "The bank-reported balance was unavailable for "
+                + ", ".join(fell_back)
+                + f", so the cleared register was used instead ({degraded_reason or 'no bank row'})."
+                " That counts money already committed to in-flight payments as"
+                " available, so this buffer may read HIGH. Re-run once the feed"
+                " is reachable."
+            )
+        return result
 
     # ── 11. breaches ─────────────────────────────────────────────────
     @mcp.tool(

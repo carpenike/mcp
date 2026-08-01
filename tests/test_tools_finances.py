@@ -1528,7 +1528,7 @@ def _buffer_accounts() -> dict[str, Any]:
     return {
         "accounts": [
             # Register and cleared deliberately differ, to pin which is used.
-            _acct("USAA Checking", 5_000_000, 4_648_201),
+            _acct("USAA Checking", 5_000_000, 4_648_201, simplefin_id="ACT-usaa"),
             _acct("Amex Savings (HYSA)", 315_993, 315_993),
             _acct("Apple Card", -9_308, -9_308),
             _acct("Chase Freedom", -10_767, 2_120),
@@ -1538,17 +1538,62 @@ def _buffer_accounts() -> dict[str, Any]:
     }
 
 
-async def test_buffer_uses_cleared_cash_and_register_cards(
+def _bank_balances(available: float = 36_404.03) -> dict[str, Any]:
+    return {
+        "accounts": [
+            {
+                "simplefin_id": "ACT-usaa",
+                "balance": available,
+                "available_balance": available,
+                "balance_date": 1785508459,
+                "name": "USAA CHECKING",
+                "org": "USAA",
+            }
+        ]
+    }
+
+
+async def test_buffer_uses_bank_available_cash_and_register_cards(
     tmp_path: Any, httpx_mock: HTTPXMock
 ) -> None:
-    """PLAN.md qualifies only the cash side as cleared."""
+    """Cash is what the bank says is spendable today; cards stay register."""
     httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
     out = await _v2_tools(tmp_path)["finances_buffer"]()
     c = out["components"]
-    assert c["cleared_cash"] == 46_482.01  # cleared, not the 50,000 register
+    assert out["mode"] == "bank_available"
+    # The bank's figure, NOT the 46,482.01 cleared register nor the 50,000 one.
+    assert c["cash"] == 36_404.03
+    assert c["cash_accounts"][0]["basis"] == "bank_available"
+    assert c["cash_accounts"][0]["cleared_balance"] == 46_482.01
     # Only cards in debt: 93.08 + 107.67. Sapphire's credit is not cash.
     assert c["card_debt"] == pytest.approx(200.75)
-    assert out["buffer"] == pytest.approx(46_482.01 - 200.75 - 2_735.68)
+    assert out["buffer"] == pytest.approx(36_404.03 - 200.75 - 2_735.68)
+    assert "limitation" not in out
+
+
+async def test_buffer_degrades_to_cleared_register_and_says_so(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Never silently fall back — a cleared-basis buffer reads HIGH."""
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(
+        url=f"{BASE}/simplefin-balances", status_code=503, json={"error": "unavailable"}
+    )
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    assert out["mode"] == "cleared_register"
+    assert out["components"]["cash"] == 46_482.01
+    assert out["components"]["cash_accounts"][0]["basis"] == "cleared_register"
+    assert "may read HIGH" in out["limitation"]
+
+
+async def test_buffer_lookahead_uses_the_same_basis(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
+    out = await _v2_tools(tmp_path)["finances_buffer"]()
+    assert out["buffer_after_scheduled"] == pytest.approx(
+        out["buffer"] - out["scheduled_outflows_total"]
+    )
 
 
 async def test_buffer_excludes_hysa_and_instalment_debt(
@@ -1556,6 +1601,7 @@ async def test_buffer_excludes_hysa_and_instalment_debt(
 ) -> None:
     """Operations run on checking; Synchrony is a schedule, not revolving."""
     httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
     out = await _v2_tools(tmp_path)["finances_buffer"]()
     cash = {a["account"] for a in out["components"]["cash_accounts"]}
     cards = {a["account"] for a in out["components"]["card_accounts"]}
@@ -1568,6 +1614,7 @@ async def test_buffer_reports_no_floor_until_one_is_set(
     tmp_path: Any, httpx_mock: HTTPXMock
 ) -> None:
     httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
     out = await _v2_tools(tmp_path)["finances_buffer"]()
     assert out["floor"] is None
     assert out["status"] == "no_floor"
@@ -1575,6 +1622,7 @@ async def test_buffer_reports_no_floor_until_one_is_set(
 
 async def test_buffer_flags_below_floor(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
     out = await _v2_tools(tmp_path, finances_buffer_floor=90_000.0)["finances_buffer"]()
     assert out["status"] == "below_floor"
 
@@ -1584,6 +1632,7 @@ async def test_buffer_lookahead_never_exceeds_the_buffer(
 ) -> None:
     """Scheduled outflows only ever reduce it — an autopay pull is not income."""
     httpx_mock.add_response(url=f"{BASE}/accounts", json=_buffer_accounts())
+    httpx_mock.add_response(url=f"{BASE}/simplefin-balances", json=_bank_balances())
     out = await _v2_tools(tmp_path)["finances_buffer"]()
     assert out["buffer_after_scheduled"] <= out["buffer"]
     assert out["scheduled_outflows_total"] >= 0
