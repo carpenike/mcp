@@ -178,6 +178,11 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_recurring` | Expected fixed obligations vs. what posted — MATCHED / CHANGED / MISSING / PENDING_STATEMENT / ENDED, on proportional (±%) tolerance bands, plus notable variances and genuinely new payees over the configured review threshold |
 | Finances | `finances_trend` | Per-category monthly spend series + income series over the last N months; flags the current partial month |
 | Finances | `finances_debt_status` | Every liability including off-budget loans, each with rate, 7/30-day deltas and an accelerate/ride classification against a configured hurdle rate; accelerate/ride/unknown totals, total debt, home equity, and a loud flag when a debt's class changes between runs |
+| Finances | `finances_transactions` | List individual transactions with filters (uncategorized_only, account, date range, payee substring, amount range, category); reports `total` so a partial page is visible. The read half of the categorization loop |
+| Finances | `finances_categorize` | Batch-assign category and/or notes to existing transactions, one sync per batch. **Category and notes are the only fields it can reach** — no parameter exists for amount, payee, account or date |
+| Finances | `finances_rules_list` | Actual's auto-categorization rules: what each matches, which category it sets |
+| Finances | `finances_rule_create` | Create a set-category rule matching payee ids OR an imported-payee regex; the action is built server-side so it cannot rewrite payees or amounts |
+| Finances | `finances_rule_delete` | Delete a rule; refuses any rule that does more than set a category |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
@@ -265,6 +270,36 @@ Only `actual_txn` is written here (by `paperless_link`); `actual_account` is
 the statement-level half of the join and is expected to be stamped by
 paperless-ai per the finances repo's ARCHITECTURE.md.
 
+### The advisor write layer
+
+`finances_categorize` and the rule tools exist so an interactive Claude session
+can work a categorization queue: `finances_sync_status(trigger_sync=true)` →
+`finances_transactions(uncategorized_only=true)` → `finances_categorize(...)` →
+`finances_rule_create(...)` when a payee recurs.
+
+The finances repo's ARCHITECTURE.md sets the trust boundary: the advisor writes
+**categorizations, notes and rules** — never amounts, payees, accounts, or
+anything that moves money. That is enforced structurally, in three places:
+
+- **The `Assignment` model is `extra="forbid"`** and has exactly three fields.
+  A caller sending `amount` gets a validation error, and the tool re-validates
+  at its own boundary rather than trusting the transport to have done it.
+- **The sidecar builds its update payload key by key** — never a spread of the
+  request — so `updateTransaction` can only ever receive `category` and `notes`.
+- **Rule actions are constructed server-side** as a single set-category. No
+  action parameter is exposed, so a payee-rewriting rule cannot be built through
+  this path, and `finances_rule_delete` refuses any rule that does more than set
+  a category.
+
+`addTransactions`, `importTransactions` and `deleteTransaction` are deliberately
+not wired into the sidecar at all.
+
+Passing `category: null` clears a categorization — without it a mis-categorized
+transaction would be unfixable through this interface. "Starting Balance" rows
+(Actual's opening-balance entries) are kept out of the uncategorized worklist by
+default: they are not decisions to make, and categorizing one on an on-budget
+account would inject a phantom five-figure "spend".
+
 ### Restricted credentials (tool allowlisting)
 
 `HOMELAB_MCP_RESTRICTED_SCOPES` maps an OAuth scope to the exact tools a token
@@ -284,6 +319,13 @@ advisor sessions — keep full access. This makes the agent's compose-and-send-o
 remit structural rather than a prompt instruction. Configured restricted-scope
 names are also advertised in OAuth discovery so standards-compliant clients can
 request them explicitly.
+
+A second scope, `advisor`, covers Ryan's interactive sessions: every finances
+tool (reads plus the write layer above), all three `paperless_*` tools, and
+`signal_send`. It **narrows** rather than grants — an advisor token cannot reach
+Home Assistant, the recipe writers, or anything else outside the financial
+surface. `hermes` is unchanged by its addition, and a test asserts hermes is
+refused on every one of the new tools.
 
 ### Home Assistant posture
 

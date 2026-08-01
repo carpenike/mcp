@@ -235,3 +235,86 @@ def test_json_body_without_tools_list_result_passes_through_unchanged() -> None:
     client = _app("hermes")
     resp = _call(client, "finances_sync_status")
     assert json.loads(resp.content)["result"] == {"ok": True}
+
+
+# ── advisor scope (the interactive write layer) ──────────────────────
+
+ADVISOR_TOOLS = {
+    "finances_sync_status",
+    "finances_monthly_summary",
+    "finances_recurring",
+    "finances_trend",
+    "finances_debt_status",
+    "finances_transactions",
+    "finances_categorize",
+    "finances_rules_list",
+    "finances_rule_create",
+    "finances_rule_delete",
+    "paperless_search",
+    "paperless_get",
+    "paperless_link",
+    "signal_send",
+}
+
+# Everything the advisor layer added. hermes must reach none of it.
+NEW_WRITE_TOOLS = [
+    "finances_transactions",
+    "finances_categorize",
+    "finances_rules_list",
+    "finances_rule_create",
+    "finances_rule_delete",
+]
+
+
+def test_advisor_scope_resolves_to_the_financial_surface() -> None:
+    allowed = resolve_allowlist({"scope": "advisor"}, _settings().restricted_scopes)
+    assert allowed == ADVISOR_TOOLS
+
+
+def test_advisor_scope_excludes_the_physical_control_plane() -> None:
+    """Narrowing, not granting: an advisor token cannot actuate the house."""
+    allowed = resolve_allowlist({"scope": "advisor"}, _settings().restricted_scopes)
+    assert allowed is not None
+    for tool in ("ha_call_service", "cooklang_delete_recipe", "grocy_stock_item"):
+        assert tool not in allowed
+
+
+def test_hermes_scope_is_unchanged_by_the_advisor_addition() -> None:
+    """hermes keeps exactly its four read summaries — no drift."""
+    allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
+    assert allowed == {
+        "finances_sync_status",
+        "finances_monthly_summary",
+        "finances_recurring",
+        "finances_debt_status",
+    }
+
+
+@pytest.mark.parametrize("tool", NEW_WRITE_TOOLS)
+def test_hermes_is_403_on_every_new_advisor_tool(tool: str) -> None:
+    """The unattended agent must not reach raw transactions or any writer."""
+    resp = _call(_app("hermes"), tool)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == -32601
+
+
+@pytest.mark.parametrize("tool", sorted(ADVISOR_TOOLS))
+def test_advisor_can_call_each_of_its_tools(tool: str) -> None:
+    resp = _call(_app("advisor"), tool)
+    assert resp.status_code == 200
+
+
+def test_advisor_is_still_refused_outside_its_surface() -> None:
+    for tool in ("ha_call_service", "arc_log_raid", "cooklang_create_recipe"):
+        assert _call(_app("advisor"), tool).status_code == 403
+
+
+def test_hermes_reads_still_work_alongside_the_new_scope() -> None:
+    """Adding a scope must not disturb the existing one."""
+    for tool in (
+        "finances_sync_status",
+        "finances_monthly_summary",
+        "finances_recurring",
+        "finances_debt_status",
+    ):
+        assert _call(_app("hermes"), tool).status_code == 200

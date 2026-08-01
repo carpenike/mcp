@@ -1196,3 +1196,269 @@ async def test_items_without_a_slip_keep_calendar_month_scope(
     # August's charge must not be pulled back into July.
     out = await tools["finances_recurring"](month="2026-07")
     assert out["obligations"][0]["status"] == "MISSING"
+
+
+# ── advisor write layer ──────────────────────────────────────────────
+
+
+def _adv_tools(tmp_path: Any) -> Any:
+    mcp = CapturingMCP()
+    register(
+        mcp,  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            oauth_required=False,
+            finances_sidecar_base_url=BASE,
+        ),
+    )
+    return mcp.tools
+
+
+def _cats() -> dict[str, Any]:
+    return {
+        "categories": [
+            {"id": "c1", "name": "Fixed", "group_name": "Household", "is_income": False},
+            {"id": "c2", "name": "Amazon", "group_name": "Household", "is_income": False},
+        ]
+    }
+
+
+# --- the structural guarantee -----------------------------------------
+
+
+def test_assignment_rejects_every_field_but_category_and_notes() -> None:
+    """The trust boundary, enforced by the type rather than by discipline.
+
+    The advisor may categorize and annotate; it may never move money. These
+    fields don't exist on the model, so there is no code path to them.
+    """
+    import pydantic
+
+    from homelab_mcp.tools.finances import Assignment
+
+    assert set(Assignment.model_fields) == {"transaction_id", "category", "notes"}
+    for forbidden in ("amount", "payee", "payee_name", "account", "date", "cleared", "id"):
+        with pytest.raises(pydantic.ValidationError):
+            Assignment(transaction_id="t1", category="Fixed", **{forbidden: "x"})
+
+
+def test_categorize_tool_exposes_no_money_moving_parameter(tmp_path: Any) -> None:
+    """Belt-and-braces at the tool surface, not just the item model."""
+    import inspect
+
+    params = set(inspect.signature(_adv_tools(tmp_path)["finances_categorize"]).parameters)
+    assert params == {"assignments"}
+
+
+def test_clearing_a_category_is_distinguishable_from_omitting_it() -> None:
+    """Explicit null means 'un-categorize'; omission means 'leave alone'.
+
+    Without this an advisor could categorize but never undo, making a
+    mis-categorization permanent through this interface.
+    """
+    from homelab_mcp.tools.finances import Assignment
+
+    cleared = Assignment(transaction_id="t1", category=None)
+    assert cleared.touches("category") is True
+    assert cleared.touches("notes") is False
+
+    notes_only = Assignment(transaction_id="t1", notes="hi")
+    assert notes_only.touches("category") is False
+    assert notes_only.touches("notes") is True
+
+
+# --- categorize --------------------------------------------------------
+
+
+async def test_categorize_sends_only_resolved_category_and_notes(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(
+        url=f"{BASE}/transactions/categorize",
+        method="POST",
+        json={"results": [{"transaction_id": "t1", "ok": True}], "changed": 1},
+    )
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[{"transaction_id": "t1", "category": "Fixed", "notes": "n"}]
+    )
+    assert out["applied"] == 1
+    sent = json.loads([r for r in httpx_mock.get_requests() if r.method == "POST"][0].content)[
+        "assignments"
+    ][0]
+    # Name resolved to an id, and nothing else travels.
+    assert sent == {"transaction_id": "t1", "category_id": "c1", "notes": "n"}
+
+
+async def test_categorize_rejects_unknown_category_with_the_valid_list(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[{"transaction_id": "t1", "category": "Nope"}]
+    )
+    assert out["error"]["code"] == "finances_unknown_category"
+    assert "Amazon" in out["error"]["hint"] and "Fixed" in out["error"]["hint"]
+    # Nothing was written.
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+async def test_categorize_clear_sends_explicit_null(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(
+        url=f"{BASE}/transactions/categorize",
+        method="POST",
+        json={"results": [{"transaction_id": "t1", "ok": True}], "changed": 1},
+    )
+    await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[{"transaction_id": "t1", "category": None}]
+    )
+    sent = json.loads([r for r in httpx_mock.get_requests() if r.method == "POST"][0].content)[
+        "assignments"
+    ][0]
+    assert sent == {"transaction_id": "t1", "category_id": None}
+
+
+async def test_categorize_refuses_an_oversized_batch(tmp_path: Any) -> None:
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[{"transaction_id": f"t{i}", "category": "Fixed"} for i in range(201)]
+    )
+    assert out["error"]["code"] == "finances_batch_too_large"
+
+
+# --- transactions ------------------------------------------------------
+
+
+def _rows() -> dict[str, Any]:
+    return {
+        "transactions": [
+            _txn(
+                id="a", date="2026-07-29", amount_cents=-2_912, payee_name="AMC", category_name=None
+            ),
+            _txn(
+                id="b",
+                date="2026-07-28",
+                amount_cents=-13_183,
+                payee_name="Shoes",
+                category_name="Fixed",
+            ),
+            _txn(
+                id="setup",
+                date="2026-07-31",
+                amount_cents=-4_368_588,
+                payee_name="Starting Balance",
+                category_name=None,
+            ),
+        ]
+    }
+
+
+async def test_transactions_worklist_excludes_account_setup_rows(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """Categorizing an opening balance would inject phantom spend."""
+    httpx_mock.add_response(url=re.compile(re.escape(BASE) + r"/transactions.*"), json=_rows())
+    out = await _adv_tools(tmp_path)["finances_transactions"](uncategorized_only=True)
+    ids = [t["id"] for t in out["transactions"]]
+    assert ids == ["a"]
+    assert out["total"] == 1
+
+
+async def test_transactions_can_opt_into_account_setup_rows(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=re.compile(re.escape(BASE) + r"/transactions.*"), json=_rows())
+    out = await _adv_tools(tmp_path)["finances_transactions"](
+        uncategorized_only=True, include_account_setup=True
+    )
+    ids = {t["id"] for t in out["transactions"]}
+    assert ids == {"a", "setup"}
+    assert {t["id"]: t["account_setup"] for t in out["transactions"]}["setup"] is True
+
+
+async def test_transactions_reports_truncation(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=re.compile(re.escape(BASE) + r"/transactions.*"), json=_rows())
+    out = await _adv_tools(tmp_path)["finances_transactions"](limit=1)
+    assert (out["returned"], out["total"], out["truncated"]) == (1, 3, True)
+
+
+# --- rules -------------------------------------------------------------
+
+
+def _rules_payload() -> dict[str, Any]:
+    return {
+        "rules": [
+            {
+                "id": "r1",
+                "conditions": [{"op": "matches", "field": "imported_payee", "value": "AMC"}],
+                "conditions_op": "and",
+                "actions": [{"op": "set", "field": "category", "value": "c1"}],
+                "sets_category_only": True,
+            },
+            {
+                "id": "r2",
+                "conditions": [],
+                "conditions_op": "and",
+                "actions": [{"op": "set", "field": "payee", "value": "p9"}],
+                "sets_category_only": False,
+            },
+        ]
+    }
+
+
+async def test_rule_create_builds_a_set_category_action_only(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(url=f"{BASE}/rules", method="POST", json={"rule": {"id": "new"}})
+    out = await _adv_tools(tmp_path)["finances_rule_create"](
+        category="Fixed", imported_payee_regex="AMC|Regal"
+    )
+    assert out["created"] is True and out["rule_id"] == "new"
+    sent = json.loads([r for r in httpx_mock.get_requests() if r.method == "POST"][0].content)
+    # The caller cannot supply actions; only the category id travels.
+    assert "actions" not in sent
+    assert sent["category_id"] == "c1"
+    assert sent["conditions"][0]["field"] == "imported_payee"
+
+
+async def test_rule_create_requires_exactly_one_matcher(tmp_path: Any) -> None:
+    tools = _adv_tools(tmp_path)
+    both = await tools["finances_rule_create"](
+        category="Fixed", payee_ids=["p1"], imported_payee_regex="x"
+    )
+    neither = await tools["finances_rule_create"](category="Fixed")
+    assert both["error"]["code"] == "finances_rule_bad_match"
+    assert neither["error"]["code"] == "finances_rule_bad_match"
+
+
+async def test_rule_create_rejects_an_invalid_regex(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    out = await _adv_tools(tmp_path)["finances_rule_create"](
+        category="Fixed", imported_payee_regex="([unclosed"
+    )
+    assert out["error"]["code"] == "finances_rule_bad_regex"
+
+
+async def test_rule_delete_refuses_a_rule_that_does_more_than_categorize(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A payee-rewriting rule must be removed where its full effect is visible."""
+    httpx_mock.add_response(url=f"{BASE}/rules", method="GET", json=_rules_payload())
+    out = await _adv_tools(tmp_path)["finances_rule_delete"](rule_id="r2")
+    assert out["error"]["code"] == "finances_rule_not_deletable"
+    assert not [r for r in httpx_mock.get_requests() if r.method == "DELETE"]
+
+
+async def test_rule_delete_removes_a_set_category_rule(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/rules", method="GET", json=_rules_payload())
+    httpx_mock.add_response(url=f"{BASE}/rules/r1", method="DELETE", json={"deleted": True})
+    out = await _adv_tools(tmp_path)["finances_rule_delete"](rule_id="r1")
+    assert out["deleted"] is True
+
+
+async def test_rule_delete_unknown_id(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/rules", method="GET", json=_rules_payload())
+    out = await _adv_tools(tmp_path)["finances_rule_delete"](rule_id="nope")
+    assert out["error"]["code"] == "finances_rule_not_found"

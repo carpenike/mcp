@@ -26,8 +26,27 @@
  *
  * Exposure: binds loopback only and requires a shared token, so a local
  * unprivileged process can't read the household's finances by curling a port.
- * Read-only by construction — no endpoint mutates budget data. `/bank-sync`
- * asks Actual to pull from the banks; it writes nothing itself.
+ *
+ * WRITE BOUNDARY. Most endpoints are reads. The three that write are
+ * deliberately narrow, because the advisor's remit (see the finances repo's
+ * ARCHITECTURE.md) is to categorize and annotate — never to move money:
+ *
+ *   POST /transactions/categorize  sets ONLY `category` and `notes`, on
+ *                                  transactions that already exist. The update
+ *                                  payload is built field-by-field here, so
+ *                                  there is no path by which an amount, payee,
+ *                                  account or date can be altered even if the
+ *                                  caller sends one.
+ *   POST /rules                    creates a rule whose actions are
+ *                                  constructed server-side as a single
+ *                                  set-category. Caller-supplied actions are
+ *                                  never forwarded, so no payee-rewriting or
+ *                                  amount-modifying rule can be built.
+ *   DELETE /rules/:id              removes a rule. Rules are derived
+ *                                  automation, not financial records.
+ *
+ * Nothing here creates or deletes a transaction; `addTransactions`,
+ * `importTransactions` and `deleteTransaction` are deliberately not wired up.
  */
 
 'use strict';
@@ -246,9 +265,81 @@ async function getTransactions(start, end) {
   }));
 }
 
+/**
+ * Apply category/notes to existing transactions, then push once.
+ *
+ * The payload is assembled key-by-key rather than spread from the request, so
+ * an unexpected field cannot reach `updateTransaction`. One `sync()` for the
+ * whole batch: per-item syncing would multiply round-trips to the Actual
+ * server for no benefit.
+ */
+async function categorize(assignments) {
+  const results = [];
+  let changed = 0;
+  for (const a of assignments) {
+    const id = a && a.transaction_id;
+    if (!id) {
+      results.push({ transaction_id: null, ok: false, error: 'missing transaction_id' });
+      continue;
+    }
+    // Whitelist, explicitly. Never `...a`.
+    const fields = {};
+    if (a.category_id !== undefined) fields.category = a.category_id;
+    if (a.notes !== undefined) fields.notes = a.notes;
+    if (Object.keys(fields).length === 0) {
+      results.push({ transaction_id: id, ok: false, error: 'nothing to set' });
+      continue;
+    }
+    try {
+      await api.updateTransaction(id, fields);
+      changed += 1;
+      results.push({ transaction_id: id, ok: true, set: Object.keys(fields) });
+    } catch (e) {
+      results.push({ transaction_id: id, ok: false, error: String(e && e.message) });
+    }
+  }
+  if (changed > 0) {
+    await api.sync();
+    lastSyncMs = Date.now();
+  }
+  return { results, changed };
+}
+
+/** Rules, projected to the shape the Python side reasons about. */
+async function listRules() {
+  await freshen();
+  const rules = await api.getRules();
+  return rules.map((r) => ({
+    id: r.id,
+    stage: r.stage ?? null,
+    conditions_op: r.conditionsOp,
+    conditions: r.conditions,
+    actions: r.actions,
+    // Surfaced so the Python layer can refuse to delete a rule that does
+    // anything other than set a category.
+    sets_category_only:
+      Array.isArray(r.actions) &&
+      r.actions.length > 0 &&
+      r.actions.every((x) => x.op === 'set' && x.field === 'category'),
+  }));
+}
+
 // ── HTTP plumbing ────────────────────────────────────────────────────
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Read and parse a JSON request body, bounded so a bad caller can't OOM us. */
+async function readJson(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 2 * 1024 * 1024) throw new Error('request body too large');
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
 
 function send(res, status, body) {
   const payload = JSON.stringify(body);
@@ -301,6 +392,51 @@ async function handle(req, res) {
         return send(res, 400, { error: 'start and end must be YYYY-MM-DD' });
       }
       return send(res, 200, { transactions: await getTransactions(start, end) });
+    }
+    if (path === '/payees' && req.method === 'GET') {
+      await freshen();
+      const payees = await api.getPayees();
+      return send(res, 200, {
+        payees: payees.map((p) => ({ id: p.id, name: p.name, transfer_acct: p.transfer_acct ?? null })),
+      });
+    }
+    if (path === '/rules' && req.method === 'GET') {
+      return send(res, 200, { rules: await listRules() });
+    }
+    if (path === '/rules' && req.method === 'POST') {
+      const body = await readJson(req);
+      const conditions = Array.isArray(body.conditions) ? body.conditions : null;
+      const categoryId = body.category_id;
+      if (!conditions || !conditions.length || !categoryId) {
+        return send(res, 400, { error: 'conditions[] and category_id are required' });
+      }
+      // Actions are built HERE, never taken from the request: this is what
+      // makes "set-category only" a property of the service rather than a
+      // convention the caller is trusted to follow.
+      const created = await api.createRule({
+        stage: body.stage ?? null,
+        conditionsOp: body.conditions_op === 'or' ? 'or' : 'and',
+        conditions,
+        actions: [{ op: 'set', field: 'category', value: categoryId }],
+      });
+      await api.sync();
+      lastSyncMs = Date.now();
+      return send(res, 200, { rule: created });
+    }
+    if (path.startsWith('/rules/') && req.method === 'DELETE') {
+      const id = decodeURIComponent(path.slice('/rules/'.length));
+      if (!id) return send(res, 400, { error: 'rule id required' });
+      await api.deleteRule(id);
+      await api.sync();
+      lastSyncMs = Date.now();
+      return send(res, 200, { deleted: true, id });
+    }
+    if (path === '/transactions/categorize' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!Array.isArray(body.assignments) || body.assignments.length === 0) {
+        return send(res, 400, { error: 'assignments[] is required' });
+      }
+      return send(res, 200, await categorize(body.assignments));
     }
     if (path === '/bank-sync' && req.method === 'POST') {
       // Asks Actual to pull from the banks (SimpleFin). Slow; the Python tool

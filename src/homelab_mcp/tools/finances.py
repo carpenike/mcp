@@ -22,14 +22,16 @@ import calendar
 import json
 import logging
 import pathlib
+import re
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError as PydanticValidationError
 
-from homelab_mcp.tools._http import ToolError, make_client, request_json
+from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
     import httpx
@@ -38,6 +40,8 @@ if TYPE_CHECKING:
     from homelab_mcp.config import Settings
 
 log = logging.getLogger(__name__)
+# Writes are invisible to RequestLogMiddleware (it only sees POST /mcp).
+audit = logging.getLogger("homelab_mcp.audit")
 
 _RO = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
@@ -47,6 +51,20 @@ _RO = ToolAnnotations(
 # the outbound bank fetch happens on the Actual server, not from here.
 _RO_SYNC = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+
+# Categorizing converges: applying the same category twice leaves the same
+# state, so it is idempotent but decidedly not read-only.
+_WRITE_IDEMPOTENT = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+# Each call creates a NEW rule, so repeating it is not a no-op.
+_WRITE_CREATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+# Removal is destructive; repeating it converges on "gone".
+_WRITE_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
 )
 
 # The housekeeping category. Credit-card payments and inter-account moves are
@@ -80,6 +98,36 @@ never narrative. Notes that apply across all of them:
 - `gap_vs_floor` is null until a floor is configured. Null means "not decided
   yet"; do not substitute a guess.
 """
+
+
+class Assignment(BaseModel):
+    """One categorization instruction.
+
+    `extra="forbid"` is the load-bearing line. The advisor's remit is to
+    categorize and annotate, never to move money, and this is what makes that
+    a property of the interface rather than a rule someone has to remember:
+    a caller that sends `amount`, `payee`, `account` or `date` gets a
+    validation error, because those fields do not exist here at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: str = Field(min_length=1, description="Existing transaction id.")
+    category: str | None = Field(
+        default=None,
+        description="Category name or id to assign. Pass null to CLEAR the category.",
+    )
+    notes: str | None = Field(default=None, description="Note to set. Pass null or '' to clear it.")
+
+    def touches(self, field: str) -> bool:
+        """Whether the caller explicitly supplied `field`.
+
+        Distinguishes "leave it alone" (omitted) from "clear it" (explicit
+        null). Without this an advisor could categorize a transaction but
+        never undo it, which would make a mis-categorization permanent
+        through this interface.
+        """
+        return field in self.model_fields_set
 
 
 def _d(cents: int) -> float:
@@ -130,6 +178,18 @@ def _billing_window(item: dict[str, Any], first: date, last: date) -> tuple[date
     # Clamp so expected_day=31 still resolves in a 30-day month.
     anchor = first.replace(day=min(int(day), calendar.monthrange(first.year, first.month)[1]))
     return anchor - timedelta(days=before), anchor + timedelta(days=after)
+
+
+def _is_account_setup(txn: dict[str, Any]) -> bool:
+    """True for Actual's opening-balance entry, which is not real activity.
+
+    Linking an account writes one 'Starting Balance' transaction for its whole
+    balance. Counted as activity it reads as the household taking on the
+    entire amount that month; categorized, it would land in a spend total.
+    """
+    return (txn.get("payee_name") or "").strip().lower() == "starting balance" or (
+        txn.get("category_name") or ""
+    ).strip().lower() == "starting balances"
 
 
 def _classify(rate: float | None, hurdle: float) -> str:
@@ -225,6 +285,37 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "Check that the homelab-mcp-actual-sidecar service is running "
                 "and that HOMELAB_MCP_FINANCES_SIDECAR_BASE_URL points at it."
             ),
+        )
+
+    async def _post(path: str, payload: dict[str, Any]) -> Any:
+        if not base:
+            raise ToolError(
+                "finances_not_configured",
+                "The Actual sidecar is not configured.",
+                "Set HOMELAB_MCP_FINANCES_SIDECAR_BASE_URL (and its token).",
+            )
+        return await request_json(
+            client,
+            "POST",
+            f"{base}{path}",
+            service="actual",
+            json=payload,
+            unreachable_hint="Check that the Actual sidecar is running.",
+        )
+
+    async def _delete(path: str) -> Any:
+        if not base:
+            raise ToolError(
+                "finances_not_configured",
+                "The Actual sidecar is not configured.",
+                "Set HOMELAB_MCP_FINANCES_SIDECAR_BASE_URL (and its token).",
+            )
+        return await request_json(
+            client,
+            "DELETE",
+            f"{base}{path}",
+            service="actual",
+            unreachable_hint="Check that the Actual sidecar is running.",
         )
 
     async def _accounts() -> list[dict[str, Any]]:
@@ -906,18 +997,6 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         except ToolError as err:
             return err.payload()
 
-        def _is_account_setup(t: dict[str, Any]) -> bool:
-            """True for Actual's opening-balance entry, which isn't debt movement.
-
-            Linking an account writes a single 'Starting Balance' transaction
-            for its whole balance. Counted as activity, a newly-linked loan
-            reads as the household taking on the entire debt this month — the
-            Tesla loan showed a $43,685.88 30-day 'change' the day it was added.
-            """
-            return (t.get("payee_name") or "").strip().lower() == "starting balance" or (
-                t.get("category_name") or ""
-            ).strip().lower() == "starting balances"
-
         # Reconstruct historical balances by unwinding recent activity from the
         # current balance. Actual has no as-of-date balance API, and deriving it
         # this way stays correct regardless of when the account last synced.
@@ -1083,3 +1162,357 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             if unlisted
             else None,
         }
+
+    # ── 6. transactions (the read side of the iteration loop) ────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_transactions",
+        description=(
+            "List individual transactions, filtered. This is the read half of "
+            "the categorization loop: call it with uncategorized_only=true to "
+            "find what needs attention, then pass the ids to "
+            "finances_categorize. Filters: uncategorized_only, account name, "
+            "date range, payee substring, amount range (dollars, signed — "
+            "spend is negative), and category name. Returns id, date, account, "
+            "payee, amount, category and notes per row, plus the total match "
+            "count so you can tell when you are seeing a partial answer. "
+            "Defaults to the last 90 days when no date range is given."
+        ),
+    )
+    async def transactions(
+        uncategorized_only: Annotated[
+            bool, Field(description="Only transactions with no category assigned.")
+        ] = False,
+        account: Annotated[str | None, Field(description="Account name (exact).")] = None,
+        date_from: Annotated[str | None, Field(description="Earliest date, 'YYYY-MM-DD'.")] = None,
+        date_to: Annotated[str | None, Field(description="Latest date, 'YYYY-MM-DD'.")] = None,
+        payee_contains: Annotated[
+            str | None, Field(description="Case-insensitive substring of payee or notes.")
+        ] = None,
+        amount_min: Annotated[
+            float | None, Field(description="Minimum amount in dollars (signed).")
+        ] = None,
+        amount_max: Annotated[
+            float | None, Field(description="Maximum amount in dollars (signed).")
+        ] = None,
+        category: Annotated[str | None, Field(description="Category name (exact).")] = None,
+        include_account_setup: Annotated[
+            bool,
+            Field(description="Include 'Starting Balance' rows in an uncategorized worklist."),
+        ] = False,
+        limit: Annotated[int, Field(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
+        try:
+            today = date.today()
+            start = date.fromisoformat(date_from) if date_from else today - timedelta(days=90)
+            end = date.fromisoformat(date_to) if date_to else today
+            rows = await _transactions(start, end)
+        except ValueError:
+            return ToolError(
+                "finances_bad_date",
+                "date_from and date_to must be 'YYYY-MM-DD'.",
+                "",
+            ).payload()
+        except ToolError as err:
+            return err.payload()
+
+        needle = (payee_contains or "").lower()
+        matched = []
+        for t in rows:
+            setup = _is_account_setup(t)
+            # A "Starting Balance" row is how Actual records an account's
+            # opening position. It is uncategorized by nature and is NOT a
+            # decision anyone needs to make; worse, categorizing one on an
+            # on-budget account would inject a phantom five-figure "spend"
+            # into the month. Keep them out of the worklist unless asked for.
+            if setup and uncategorized_only and not include_account_setup:
+                continue
+            if uncategorized_only and t.get("category_name"):
+                continue
+            if account and t.get("account_name") != account:
+                continue
+            if category and t.get("category_name") != category:
+                continue
+            if needle:
+                hay = f"{t.get('payee_name') or ''} {t.get('notes') or ''}".lower()
+                if needle not in hay:
+                    continue
+            amt = _d(t["amount_cents"])
+            if amount_min is not None and amt < amount_min:
+                continue
+            if amount_max is not None and amt > amount_max:
+                continue
+            matched.append(t)
+
+        matched.sort(key=lambda t: (t["date"], t["id"]), reverse=True)
+        page = matched[:limit]
+        return {
+            "returned": len(page),
+            "total": len(matched),
+            "truncated": len(matched) > len(page),
+            "date_from": start.isoformat(),
+            "date_to": end.isoformat(),
+            "transactions": [
+                {
+                    "id": t["id"],
+                    "date": t["date"],
+                    "account": t.get("account_name"),
+                    "payee": t.get("payee_name"),
+                    "amount": _d(t["amount_cents"]),
+                    "category": t.get("category_name"),
+                    "notes": t.get("notes"),
+                    # Flagged rather than hidden: an advisor should not
+                    # categorize these, and should know why they look odd.
+                    "account_setup": _is_account_setup(t),
+                }
+                for t in page
+            ],
+        }
+
+    # ── 7. categorize (the write side) ───────────────────────────────
+    @mcp.tool(
+        annotations=_WRITE_IDEMPOTENT,
+        name="finances_categorize",
+        description=(
+            "Assign categories (and optionally notes) to existing transactions, "
+            "in one batch. Each assignment takes a transaction_id, a category "
+            "name or id, and optional notes — those are the ONLY fields it can "
+            "change. It cannot create or delete a transaction, and cannot touch "
+            "an amount, payee, account or date; there is no parameter for them. "
+            "Unknown category names are rejected with the list of valid ones "
+            "rather than guessed at. The whole batch is committed with a single "
+            "sync, so prefer one call with many assignments over many calls. "
+            "Returns a per-assignment result so a partial failure is visible."
+        ),
+    )
+    async def categorize(
+        assignments: Annotated[
+            list[Assignment],
+            Field(description="Up to 200 {transaction_id, category, notes?} items."),
+        ],
+    ) -> dict[str, Any]:
+        try:
+            if not assignments:
+                raise ToolError(
+                    "finances_empty_batch", "No assignments supplied.", "Pass at least one."
+                )
+            if len(assignments) > 200:
+                raise ToolError(
+                    "finances_batch_too_large",
+                    f"{len(assignments)} assignments; the limit is 200.",
+                    "Split the work across calls.",
+                )
+            # Re-validate at the tool boundary rather than trusting the
+            # transport to have done it. This is what makes "cannot touch an
+            # amount" a property of the tool itself: an unexpected key raises
+            # here even if a client bypassed the JSON-schema layer.
+            try:
+                items = [
+                    a if isinstance(a, Assignment) else Assignment.model_validate(a)
+                    for a in assignments
+                ]
+            except PydanticValidationError as exc:
+                bad = sorted(
+                    {str(e["loc"][-1]) for e in exc.errors() if e.get("type") == "extra_forbidden"}
+                )
+                raise ToolError(
+                    "finances_forbidden_field",
+                    (
+                        f"Assignments may not set {', '.join(bad)}."
+                        if bad
+                        else "Invalid assignment."
+                    ),
+                    "Only transaction_id, category and notes may be set. This tool "
+                    "cannot change an amount, payee, account or date.",
+                ) from exc
+
+            cats = await _categories()
+            by_name = {c["name"]: c["id"] for c in cats}
+            by_id = {c["id"]: c["name"] for c in cats}
+
+            resolved: list[dict[str, Any]] = []
+            for a in items:
+                if not (a.touches("category") or a.touches("notes")):
+                    raise ToolError(
+                        "finances_nothing_to_set",
+                        f"Assignment for {a.transaction_id} sets neither category nor notes.",
+                        "Supply category (or null to clear) and/or notes.",
+                    )
+                item: dict[str, Any] = {"transaction_id": a.transaction_id}
+                if a.touches("category"):
+                    if a.category is None:
+                        item["category_id"] = None  # explicit clear
+                    else:
+                        cat_id = by_name.get(a.category) or (
+                            a.category if a.category in by_id else None
+                        )
+                        if cat_id is None:
+                            raise ToolError(
+                                "finances_unknown_category",
+                                f"No category named {a.category!r}.",
+                                "Valid categories: " + ", ".join(sorted(by_name)),
+                            )
+                        item["category_id"] = cat_id
+                if a.touches("notes"):
+                    item["notes"] = a.notes
+                resolved.append(item)
+
+            data = await _post("/transactions/categorize", {"assignments": resolved})
+        except ToolError as err:
+            return err.payload()
+
+        results = list((data or {}).get("results") or [])
+        for r, a in zip(results, items, strict=False):
+            r["category"] = a.category
+        ok = sum(1 for r in results if r.get("ok"))
+        audit.info("finances_categorize applied=%d failed=%d", ok, len(results) - ok)
+        return {
+            "applied": ok,
+            "failed": len(results) - ok,
+            "synced": bool((data or {}).get("changed")),
+            "results": results,
+        }
+
+    # ── 8. rules ─────────────────────────────────────────────────────
+    def _shape_rule(r: dict[str, Any], cat_names: dict[str, str]) -> dict[str, Any]:
+        targets = [
+            cat_names.get(str(a.get("value")), str(a.get("value")))
+            for a in (r.get("actions") or [])
+            if a.get("field") == "category"
+        ]
+        return {
+            "id": r.get("id"),
+            "conditions": r.get("conditions"),
+            "conditions_op": r.get("conditions_op"),
+            "sets_category": targets[0] if targets else None,
+            "sets_category_only": r.get("sets_category_only"),
+        }
+
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_rules_list",
+        description=(
+            "List Actual's auto-categorization rules: what each one matches and "
+            "which category it assigns. Use before creating a rule, to avoid "
+            "duplicating one that already covers the payee. Rules this server "
+            "did not create may do more than set a category; those are marked "
+            "sets_category_only=false and cannot be deleted through here."
+        ),
+    )
+    async def rules_list() -> dict[str, Any]:
+        try:
+            cats = await _categories()
+            data = await _get("/rules")
+        except ToolError as err:
+            return err.payload()
+        names = {c["id"]: c["name"] for c in cats}
+        rules = [_shape_rule(r, names) for r in (data or {}).get("rules") or []]
+        return {"returned": len(rules), "total": len(rules), "truncated": False, "rules": rules}
+
+    @mcp.tool(
+        annotations=_WRITE_CREATE,
+        name="finances_rule_create",
+        description=(
+            "Create an auto-categorization rule that assigns one category. "
+            "Match EITHER by payee ids (exact, from finances_transactions) OR "
+            "by a regular expression against the raw imported payee string — "
+            "give exactly one. The rule's only effect is setting the category; "
+            "it cannot rewrite payees or alter amounts, because the action is "
+            "constructed server-side and no action parameter is exposed. Prefer "
+            "a rule over repeated manual categorization when a payee recurs."
+        ),
+    )
+    async def rule_create(
+        category: Annotated[str, Field(description="Category name or id to assign.")],
+        payee_ids: Annotated[
+            list[str] | None, Field(description="Exact payee ids to match.")
+        ] = None,
+        imported_payee_regex: Annotated[
+            str | None, Field(description="Regex matched against the raw imported payee.")
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            if bool(payee_ids) == bool(imported_payee_regex):
+                raise ToolError(
+                    "finances_rule_bad_match",
+                    "Give exactly one of payee_ids or imported_payee_regex.",
+                    "",
+                )
+            if imported_payee_regex:
+                try:
+                    re.compile(imported_payee_regex)
+                except re.error as exc:
+                    raise ToolError(
+                        "finances_rule_bad_regex",
+                        f"Invalid regular expression: {exc}",
+                        "",
+                    ) from exc
+
+            cats = await _categories()
+            by_name = {c["name"]: c["id"] for c in cats}
+            by_id = {c["id"]: c["name"] for c in cats}
+            cat_id = by_name.get(category) or (category if category in by_id else None)
+            if cat_id is None:
+                raise ToolError(
+                    "finances_unknown_category",
+                    f"No category named {category!r}.",
+                    "Valid categories: " + ", ".join(sorted(by_name)),
+                )
+
+            # Shapes copied from the rules already live in this budget: an id
+            # match carries a list, a regex match carries a string.
+            condition: dict[str, Any]
+            if payee_ids:
+                condition = {"op": "oneOf", "field": "payee", "value": payee_ids, "type": "id"}
+            else:
+                condition = {
+                    "op": "matches",
+                    "field": "imported_payee",
+                    "value": str(imported_payee_regex),
+                    "type": "string",
+                }
+            data = await _post(
+                "/rules", {"conditions": [condition], "category_id": cat_id, "conditions_op": "and"}
+            )
+        except ToolError as err:
+            return err.payload()
+
+        rule = (data or {}).get("rule") or {}
+        audit.info("finances_rule_create id=%s category=%s", rule.get("id"), category)
+        return {"created": True, "rule_id": rule.get("id"), "sets_category": category}
+
+    @mcp.tool(
+        annotations=_WRITE_DESTRUCTIVE,
+        name="finances_rule_delete",
+        description=(
+            "Delete an auto-categorization rule by id (from finances_rules_list). "
+            "Refuses to delete a rule that does anything beyond setting a "
+            "category, so a rule with side effects this server can't reason "
+            "about has to be removed in Actual's own UI. Deleting a rule does "
+            "not re-categorize transactions it already applied to."
+        ),
+    )
+    async def rule_delete(
+        rule_id: Annotated[str, Field(min_length=1, description="Rule id to delete.")],
+    ) -> dict[str, Any]:
+        try:
+            data = await _get("/rules")
+            existing = {r.get("id"): r for r in (data or {}).get("rules") or []}
+            rule = existing.get(rule_id)
+            if rule is None:
+                raise ToolError(
+                    "finances_rule_not_found",
+                    f"No rule with id {rule_id!r}.",
+                    "Call finances_rules_list for current ids.",
+                )
+            if not rule.get("sets_category_only"):
+                raise ToolError(
+                    "finances_rule_not_deletable",
+                    "That rule does more than set a category.",
+                    "Remove it in Actual's UI, where its full effect is visible.",
+                )
+            await _delete(f"/rules/{enc(rule_id)}")
+        except ToolError as err:
+            return err.payload()
+        audit.info("finances_rule_delete id=%s", rule_id)
+        return {"deleted": True, "rule_id": rule_id}
