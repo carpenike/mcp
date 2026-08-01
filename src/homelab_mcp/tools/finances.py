@@ -227,6 +227,186 @@ def _lumpy_monthly(cfg: dict[str, Any]) -> tuple[float, list[dict[str, Any]]]:
     return round(total, 2), detail
 
 
+def _match_obligations(
+    cfg: dict[str, Any],
+    txns: list[dict[str, Any]],
+    target: str,
+    first: date,
+    last: date,
+    today: date,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Match configured obligations against posted transactions.
+
+    Lifted out of `finances_recurring` so `finances_room` can reuse the SAME
+    matching rather than a copy of it — two implementations of "has the
+    mortgage posted yet?" would drift, and room's arithmetic is only as
+    trustworthy as its agreement with the checklist.
+
+    Returns the obligation rows and the set of transaction ids they claimed.
+    """
+    rec_cfg = cfg.get("recurring") or {}
+    cadence_of: dict[str, str] = dict(((cfg.get("sync") or {}).get("accounts")) or {})
+    default_pct = float(rec_cfg.get("default_tolerance_pct", 10.0))
+    min_tol = float(rec_cfg.get("min_tolerance", 5.0))
+    items = rec_cfg.get("items") or []
+    in_progress = first <= today <= last
+
+    def _tolerance(item: dict[str, Any], expected: float) -> tuple[float, float]:
+        """(tolerance_dollars, pct_used) for an item."""
+        pct = float(item.get("tolerance_pct", default_pct))
+        return max(abs(expected) * pct / 100.0, min_tol), pct
+
+    # Accounts whose feed is a monthly statement drop. An obligation on one
+    # of these has simply not been reported yet between drops — that is not
+    # the same as unpaid, and calling it MISSING every month is what trained
+    # the alert away.
+    monthly_accounts = {n.lower() for n, c in cadence_of.items() if c == "monthly"}
+    accounts_with_activity = {
+        (t.get("account_name") or "").lower()
+        for t in txns
+        if t.get("account_name") and first.isoformat() <= t["date"] <= last.isoformat()
+    }
+
+    def _awaiting_statement(acct_filter: list[str]) -> bool:
+        """True if this item lives on a monthly account that hasn't reported yet."""
+        if not in_progress or not acct_filter:
+            return False
+        return any(
+            any(a in account for a in acct_filter) and account not in accounts_with_activity
+            for account in monthly_accounts
+        )
+
+    # Sign depends on which side of the obligation we observe. A bill paid
+    # from checking is a NEGATIVE amount there. The same obligation seen on
+    # the liability account it services (Synchrony, a card) is a POSITIVE
+    # amount — paying down a balance is an inflow to that account. Both are
+    # kept here; each item picks the side it cares about below.
+    candidates = [t for t in txns if not t["account_offbudget"] and t["amount_cents"] != 0]
+    claimed: set[str] = set()
+    rows: list[dict[str, Any]] = []
+
+    for item in items:
+        name = str(item.get("name", "?"))
+        ends = item.get("ends")
+        if ends and target > str(ends):
+            rows.append({"name": name, "status": "ENDED", "ended_after": ends})
+            continue
+
+        expected = float(item.get("amount", 0.0))
+        tol, pct_used = _tolerance(item, expected)
+        win_start, win_end = _billing_window(item, first, last)
+        win_lo, win_hi = win_start.isoformat(), win_end.isoformat()
+        needles = [str(s).lower() for s in (item.get("match_any") or [])]
+        acct_filter = [str(s).lower() for s in (item.get("accounts") or [])]
+
+        best: dict[str, Any] | None = None
+        for t in candidates:
+            if t["id"] in claimed:
+                continue
+            if not (win_lo <= t["date"] <= win_hi):
+                continue
+            # A dedicated account (Synchrony Container Store, Apple Card)
+            # narrows the search; it never widens it.
+            if acct_filter:
+                if not any(a in (t.get("account_name") or "").lower() for a in acct_filter):
+                    continue
+                # On the obligation's own account the servicing payment is
+                # the positive leg, so compare on magnitude.
+                amt = _d(abs(t["amount_cents"]))
+            else:
+                # Elsewhere, only money leaving an account can pay a bill.
+                if t["amount_cents"] >= 0:
+                    continue
+                amt = _d(-t["amount_cents"])
+            hay = f"{t.get('payee_name') or ''} {t.get('notes') or ''}".lower()
+            # Identify by payee, OR — on an account dedicated to this one
+            # obligation — by the amount landing in the tolerance band.
+            # SimpleFin payee strings for these financed accounts are
+            # inconsistent ("SYNCHRONY BANK" vs the merchant name), so
+            # requiring a payee hit reported every such payment as MISSING.
+            if not any(n in hay for n in needles) and not (
+                acct_filter and abs(amt - expected) <= tol
+            ):
+                continue
+            # Prefer the candidate closest to the expected amount, so a
+            # $9 Apple Store charge can't claim the $200.33 installment.
+            if best is None or abs(amt - expected) < abs(best["_amt"] - expected):
+                best = {**t, "_amt": amt}
+
+        if best is None:
+            # On a monthly-statement account with no activity yet this
+            # month, the charge hasn't been REPORTED — which is not
+            # evidence it wasn't paid. Only say MISSING once the statement
+            # has actually dropped, or the month is over.
+            pending = _awaiting_statement(acct_filter)
+            rows.append(
+                {
+                    "name": name,
+                    "status": "PENDING_STATEMENT" if pending else "MISSING",
+                    "expected_amount": expected,
+                    "expected_day": item.get("expected_day"),
+                    **(
+                        {
+                            "note": (
+                                "This account reports on a monthly statement export; "
+                                "nothing has posted yet this cycle. Not evidence of "
+                                "a missed payment."
+                            )
+                        }
+                        if pending
+                        else {}
+                    ),
+                }
+            )
+            continue
+
+        claimed.add(best["id"])
+        actual_amt = best["_amt"]
+        delta = round(actual_amt - expected, 2)
+        delta_pct = round((delta / expected * 100.0), 1) if expected else None
+        within = abs(delta) <= tol
+        posted = date.fromisoformat(best["date"])
+        # A widened band must never mean a silent price rise: anything past
+        # the DEFAULT band is called out even when its own override keeps
+        # the status MATCHED.
+        notable = delta_pct is not None and abs(delta_pct) > default_pct
+        rows.append(
+            {
+                "name": name,
+                "status": "MATCHED" if within else "CHANGED",
+                "expected_amount": expected,
+                "actual_amount": actual_amt,
+                "delta": delta,
+                "delta_pct": delta_pct,
+                "tolerance": round(tol, 2),
+                "tolerance_pct": pct_used,
+                "notable_variance": notable,
+                "expected_day": item.get("expected_day"),
+                "posted_date": best["date"],
+                "posted_day": posted.day,
+                "billing_window": [win_lo, win_hi],
+                # True when the charge cleared outside the calendar month
+                # it belongs to — normal for a draft near a boundary.
+                "posted_outside_month": not (first.isoformat() <= best["date"] <= last.isoformat()),
+                "account": best.get("account_name"),
+                "payee": best.get("payee_name"),
+            }
+        )
+
+    order = {"MISSING": 0, "CHANGED": 1, "PENDING_STATEMENT": 2, "MATCHED": 3, "ENDED": 4}
+    rows.sort(key=lambda r: (order.get(str(r["status"]), 9), str(r["name"])))
+    return rows, claimed
+
+
+def _recurring_padding(cfg: dict[str, Any]) -> tuple[int, int]:
+    """(days before, days after) the calendar month any obligation may post in."""
+    slips = [i.get("window_slip_days") or {} for i in (cfg.get("recurring") or {}).get("items", [])]
+    return (
+        max((int(x.get("before", 0)) for x in slips), default=0),
+        max((int(x.get("after", 0)) for x in slips), default=0),
+    )
+
+
 def _classify(rate: float | None, hurdle: float) -> str:
     """Bucket a debt by cost: worth accelerating, or cheap enough to ride.
 
@@ -722,15 +902,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             rec_cfg = cfg.get("recurring") or {}
             new_payee_threshold = float(rec_cfg.get("new_payee_threshold", 500.0))
             new_payee_lookback_days = int(rec_cfg.get("new_payee_lookback_days", 365))
-            cadence_of: dict[str, str] = dict(((cfg.get("sync") or {}).get("accounts")) or {})
-            # Fetch wide enough to cover the most boundary-slipping item, then
-            # narrow per item. Items without a slip keep calendar-month scope.
-            slips = [
-                i.get("window_slip_days") or {}
-                for i in (cfg.get("recurring") or {}).get("items", [])
-            ]
-            pad_before = max((int(s.get("before", 0)) for s in slips), default=0)
-            pad_after = max((int(s.get("after", 0)) for s in slips), default=0)
+            # Fetch wide enough to cover the most boundary-slipping item; the
+            # matcher narrows per item.
+            pad_before, pad_after = _recurring_padding(cfg)
             history_start = min(
                 first - timedelta(days=pad_before),
                 first - timedelta(days=new_payee_lookback_days),
@@ -739,154 +913,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         except ToolError as err:
             return err.payload()
 
+        rows, claimed = _match_obligations(cfg, txns, target, first, last, date.today())
         default_pct = float(rec_cfg.get("default_tolerance_pct", 10.0))
-        min_tol = float(rec_cfg.get("min_tolerance", 5.0))
-        items = rec_cfg.get("items") or []
         in_progress = first <= date.today() <= last
-
-        def _tolerance(item: dict[str, Any], expected: float) -> tuple[float, float]:
-            """(tolerance_dollars, pct_used) for an item."""
-            pct = float(item.get("tolerance_pct", default_pct))
-            return max(abs(expected) * pct / 100.0, min_tol), pct
-
-        # Accounts whose feed is a monthly statement drop. An obligation on one
-        # of these has simply not been reported yet between drops — that is not
-        # the same as unpaid, and calling it MISSING every month is what trained
-        # the alert away.
-        monthly_accounts = {n.lower() for n, c in cadence_of.items() if c == "monthly"}
-        accounts_with_activity = {
-            (t.get("account_name") or "").lower()
-            for t in txns
-            if t.get("account_name") and first.isoformat() <= t["date"] <= last.isoformat()
-        }
-
-        def _awaiting_statement(acct_filter: list[str]) -> bool:
-            """True if this item lives on a monthly account that hasn't reported yet."""
-            if not in_progress or not acct_filter:
-                return False
-            return any(
-                any(a in account for a in acct_filter) and account not in accounts_with_activity
-                for account in monthly_accounts
-            )
-
-        # Sign depends on which side of the obligation we observe. A bill paid
-        # from checking is a NEGATIVE amount there. The same obligation seen on
-        # the liability account it services (Synchrony, a card) is a POSITIVE
-        # amount — paying down a balance is an inflow to that account. Both are
-        # kept here; each item picks the side it cares about below.
-        candidates = [t for t in txns if not t["account_offbudget"] and t["amount_cents"] != 0]
-        claimed: set[str] = set()
-        rows: list[dict[str, Any]] = []
-
-        for item in items:
-            name = str(item.get("name", "?"))
-            ends = item.get("ends")
-            if ends and target > str(ends):
-                rows.append({"name": name, "status": "ENDED", "ended_after": ends})
-                continue
-
-            expected = float(item.get("amount", 0.0))
-            tol, pct_used = _tolerance(item, expected)
-            win_start, win_end = _billing_window(item, first, last)
-            win_lo, win_hi = win_start.isoformat(), win_end.isoformat()
-            needles = [str(s).lower() for s in (item.get("match_any") or [])]
-            acct_filter = [str(s).lower() for s in (item.get("accounts") or [])]
-
-            best: dict[str, Any] | None = None
-            for t in candidates:
-                if t["id"] in claimed:
-                    continue
-                if not (win_lo <= t["date"] <= win_hi):
-                    continue
-                # A dedicated account (Synchrony Container Store, Apple Card)
-                # narrows the search; it never widens it.
-                if acct_filter:
-                    if not any(a in (t.get("account_name") or "").lower() for a in acct_filter):
-                        continue
-                    # On the obligation's own account the servicing payment is
-                    # the positive leg, so compare on magnitude.
-                    amt = _d(abs(t["amount_cents"]))
-                else:
-                    # Elsewhere, only money leaving an account can pay a bill.
-                    if t["amount_cents"] >= 0:
-                        continue
-                    amt = _d(-t["amount_cents"])
-                hay = f"{t.get('payee_name') or ''} {t.get('notes') or ''}".lower()
-                # Identify by payee, OR — on an account dedicated to this one
-                # obligation — by the amount landing in the tolerance band.
-                # SimpleFin payee strings for these financed accounts are
-                # inconsistent ("SYNCHRONY BANK" vs the merchant name), so
-                # requiring a payee hit reported every such payment as MISSING.
-                if not any(n in hay for n in needles) and not (
-                    acct_filter and abs(amt - expected) <= tol
-                ):
-                    continue
-                # Prefer the candidate closest to the expected amount, so a
-                # $9 Apple Store charge can't claim the $200.33 installment.
-                if best is None or abs(amt - expected) < abs(best["_amt"] - expected):
-                    best = {**t, "_amt": amt}
-
-            if best is None:
-                # On a monthly-statement account with no activity yet this
-                # month, the charge hasn't been REPORTED — which is not
-                # evidence it wasn't paid. Only say MISSING once the statement
-                # has actually dropped, or the month is over.
-                pending = _awaiting_statement(acct_filter)
-                rows.append(
-                    {
-                        "name": name,
-                        "status": "PENDING_STATEMENT" if pending else "MISSING",
-                        "expected_amount": expected,
-                        "expected_day": item.get("expected_day"),
-                        **(
-                            {
-                                "note": (
-                                    "This account reports on a monthly statement export; "
-                                    "nothing has posted yet this cycle. Not evidence of "
-                                    "a missed payment."
-                                )
-                            }
-                            if pending
-                            else {}
-                        ),
-                    }
-                )
-                continue
-
-            claimed.add(best["id"])
-            actual_amt = best["_amt"]
-            delta = round(actual_amt - expected, 2)
-            delta_pct = round((delta / expected * 100.0), 1) if expected else None
-            within = abs(delta) <= tol
-            posted = date.fromisoformat(best["date"])
-            # A widened band must never mean a silent price rise: anything past
-            # the DEFAULT band is called out even when its own override keeps
-            # the status MATCHED.
-            notable = delta_pct is not None and abs(delta_pct) > default_pct
-            rows.append(
-                {
-                    "name": name,
-                    "status": "MATCHED" if within else "CHANGED",
-                    "expected_amount": expected,
-                    "actual_amount": actual_amt,
-                    "delta": delta,
-                    "delta_pct": delta_pct,
-                    "tolerance": round(tol, 2),
-                    "tolerance_pct": pct_used,
-                    "notable_variance": notable,
-                    "expected_day": item.get("expected_day"),
-                    "posted_date": best["date"],
-                    "posted_day": posted.day,
-                    "billing_window": [win_lo, win_hi],
-                    # True when the charge cleared outside the calendar month
-                    # it belongs to — normal for a draft near a boundary.
-                    "posted_outside_month": not (
-                        first.isoformat() <= best["date"] <= last.isoformat()
-                    ),
-                    "account": best.get("account_name"),
-                    "payee": best.get("payee_name"),
-                }
-            )
 
         order = {"MISSING": 0, "CHANGED": 1, "PENDING_STATEMENT": 2, "MATCHED": 3, "ENDED": 4}
         rows.sort(key=lambda r: (order.get(str(r["status"]), 9), str(r["name"])))
@@ -1917,17 +1946,25 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         ] = None,
     ) -> dict[str, Any]:
         try:
+            cfg = _config()
             today = date.today()
-            first, last = _month_bounds(today.strftime("%Y-%m"))
+            month = today.strftime("%Y-%m")
+            first, last = _month_bounds(month)
+            _, pad_after = _recurring_padding(cfg)
             categories = await _categories()
             income_names = _income_category_names(categories)
-            # Six prior months plus this one, for the trailing average.
-            rows = await _transactions(_shift_month(today, 6), last)
+            # Six prior months for the trailing average, and far enough past
+            # month-end to cover a boundary-slipping obligation.
+            rows = await _transactions(_shift_month(today, 6), last + timedelta(days=pad_after))
         except ToolError as err:
             return err.payload()
 
+        # Same matcher finances_recurring uses — not a copy of it.
+        obligations, _ = _match_obligations(cfg, rows, month, first, last, today)
+
         mtd = 0
         savings_mtd = 0
+        consumption_ids: set[str] = set()
         per_month_cat: dict[str, int] = defaultdict(int)
         cat_mtd = 0
         for t in rows:
@@ -1941,19 +1978,66 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     savings_mtd += amount
                 else:
                     mtd += amount
+                    consumption_ids.add(t["id"])
                 if category and name == category:
                     cat_mtd += amount
             elif category and name == category:
                 per_month_cat[t["date"][:7]] += amount
 
+        # Which obligations bear on the CONSUMPTION floor at all. A debt-service
+        # leg on a liability account (the Synchrony instalments) posts as a
+        # transfer, never as consumption spend, so counting it as committed
+        # would understate room against a floor it never touches.
+        def _hits_floor(row: dict[str, Any], item: dict[str, Any]) -> bool:
+            txn_id = row.get("transaction_id")
+            if txn_id is not None:
+                return txn_id in consumption_ids
+            # Not yet posted: infer from the item. Items pinned to a specific
+            # (liability) account are matched on their transfer leg.
+            return not item.get("accounts")
+
+        items_by_name = {
+            str(i.get("name")): i for i in (cfg.get("recurring") or {}).get("items", [])
+        }
+        committed: list[dict[str, Any]] = []
+        fixed_expected_total = 0.0
+        fixed_posted = 0.0
+        excluded: list[str] = []
+        for row in obligations:
+            if row["status"] == "ENDED":
+                continue
+            item = items_by_name.get(str(row["name"])) or {}
+            if not _hits_floor(row, item):
+                excluded.append(str(row["name"]))
+                continue
+            expected = float(row.get("expected_amount") or 0.0)
+            fixed_expected_total += expected
+            if row["status"] in ("MISSING", "PENDING_STATEMENT"):
+                committed.append(
+                    {
+                        "name": row["name"],
+                        "expected_amount": expected,
+                        "expected_day": row.get("expected_day"),
+                        "status": row["status"],
+                    }
+                )
+            else:
+                fixed_posted += float(row.get("actual_amount") or 0.0)
+
+        committed.sort(key=lambda r: (r["expected_day"] or 99, -float(r["expected_amount"])))
+        remaining_committed = round(sum(float(c["expected_amount"]) for c in committed), 2)
+        fixed_expected_total = round(fixed_expected_total, 2)
+        fixed_posted = round(fixed_posted, 2)
+
         days_in_month = (last - first).days + 1
         days_elapsed = (today - first).days + 1
         elapsed_pct = round(days_elapsed / days_in_month * 100.0, 1)
         floor = settings.finances_floor
+        variable_mtd = round(_d(mtd) - fixed_posted, 2)
 
         result: dict[str, Any] = {
             "as_of": today.isoformat(),
-            "month": today.strftime("%Y-%m"),
+            "month": month,
             "days_elapsed": days_elapsed,
             "days_in_month": days_in_month,
             "days_remaining": days_in_month - days_elapsed,
@@ -1961,23 +2045,63 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "consumption_mtd": _d(mtd),
             "savings_mtd": _d(savings_mtd),
             "floor": floor,
+            # Fixed obligations still to land this month. Room is only
+            # meaningful net of these: early in the month almost none have
+            # posted, so floor - MTD alone reads as far more headroom than
+            # actually exists.
+            "remaining_committed": remaining_committed,
+            "remaining_committed_items": committed,
+            "fixed_expected_total": fixed_expected_total,
+            "fixed_posted": fixed_posted,
+            "variable_mtd": variable_mtd,
+            "obligations_excluded_from_floor": excluded,
             "basis": (
                 f"Consumption only; {SAVINGS_CATEGORY!r} is excluded and reported "
-                "separately. The floor governs consumption, not wealth-building."
+                "separately. Room is net of fixed obligations that have not yet "
+                "posted, and pace is measured on VARIABLE spend only — pacing on "
+                "the total makes the 1st-of-month mortgage look like an overspend "
+                "spike. Debt-service legs that post as transfers never touch the "
+                "consumption floor and are listed under "
+                "obligations_excluded_from_floor."
+            ),
+            "presentation_note": (
+                "Present room as '$X after $Y of upcoming fixed bills', never the "
+                "naive floor-minus-spend figure."
             ),
         }
+
         if floor is None:
-            result["floor_to_date"] = None
-            result["pace_delta"] = None
-            result["room_this_month"] = None
+            for key in (
+                "floor_to_date",
+                "pace_delta",
+                "room_this_month",
+                "variable_floor",
+                "variable_floor_to_date",
+                "variable_pace_delta",
+            ):
+                result[key] = None
             result["note"] = "No floor configured (HOMELAB_MCP_FINANCES_FLOOR)."
         else:
+            # Headline: what is genuinely left, after everything already
+            # committed for the rest of the month. May be negative.
+            result["room_this_month"] = round(floor - _d(mtd) - remaining_committed, 2)
+            result["room_this_month_naive"] = round(floor - _d(mtd), 2)
+
+            # The true discretionary floor: what remains once every fixed
+            # obligation for the month is paid.
+            variable_floor = round(floor - fixed_expected_total, 2)
+            variable_to_date = round(variable_floor * days_elapsed / days_in_month, 2)
+            result["variable_floor"] = variable_floor
+            result["variable_floor_to_date"] = variable_to_date
+            # Positive = spending variable faster than the floor allows.
+            result["variable_pace_delta"] = round(variable_mtd - variable_to_date, 2)
+            result["pace"] = "ahead" if variable_mtd > variable_to_date else "on_or_under"
+
+            # Kept for continuity; measured on total consumption, so it spikes
+            # on the 1st. variable_pace_delta is the one to quote.
             floor_to_date = round(floor * days_elapsed / days_in_month, 2)
             result["floor_to_date"] = floor_to_date
-            # Positive = spending faster than the floor allows at this point.
             result["pace_delta"] = round(_d(mtd) - floor_to_date, 2)
-            # May be negative: the floor is already spent.
-            result["room_this_month"] = round(floor - _d(mtd), 2)
 
         if category:
             months = sorted(per_month_cat)
