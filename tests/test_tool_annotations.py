@@ -105,6 +105,13 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "finances_recurring": (True, False, True),
     "finances_trend": (True, False, True),
     "finances_debt_status": (True, False, True),
+    "finances_transactions": (True, False, True),
+    # writes: category + notes only, converges on repeat
+    "finances_categorize": (False, False, True),
+    "finances_rules_list": (True, False, True),
+    # each call creates a NEW rule, so repeating is not a no-op
+    "finances_rule_create": (False, False, False),
+    "finances_rule_delete": (False, True, True),
     # ── paperless ────────────────────────────────────────────────────
     "paperless_search": (True, False, True),
     "paperless_get": (True, False, True),

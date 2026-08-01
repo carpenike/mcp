@@ -67,7 +67,10 @@ def test_as_metadata_returns_spec_clean_fields(settings: Settings) -> None:
     assert body["grant_types_supported"] == ["authorization_code", "refresh_token"]
     assert body["code_challenge_methods_supported"] == ["S256"]
     assert "token_endpoint_auth_methods_supported" in body
-    assert body["scopes_supported"] == ["openid", "email", "profile", "hermes"]
+    # Restricted scopes are advertised so a client can request one by name.
+    # Sorted after the OIDC basics; "advisor" is the interactive write layer,
+    # "hermes" the unattended pulse agent.
+    assert body["scopes_supported"] == ["openid", "email", "profile", "advisor", "hermes"]
 
 
 def test_register_rate_limit_returns_429(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

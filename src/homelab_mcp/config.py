@@ -514,6 +514,28 @@ class Settings(BaseSettings):
             # native Signal gateway. It needs four read summaries and nothing
             # else: no raw transactions, documents, messaging tools, or writes.
             # Enforced at dispatch in `scopes.py`, not merely by convention.
+            # Ryan's interactive advisor sessions (claude.ai / mobile). The
+            # full financial surface — reads, the categorization loop, rules,
+            # documents and the Signal transport — and deliberately nothing
+            # else: an advisor token cannot reach the house's physical control
+            # plane or the recipe writers. Tokens with NO restricted scope
+            # remain unrestricted, so this narrows rather than grants.
+            "advisor": [
+                "finances_sync_status",
+                "finances_monthly_summary",
+                "finances_recurring",
+                "finances_trend",
+                "finances_debt_status",
+                "finances_transactions",
+                "finances_categorize",
+                "finances_rules_list",
+                "finances_rule_create",
+                "finances_rule_delete",
+                "paperless_search",
+                "paperless_get",
+                "paperless_link",
+                "signal_send",
+            ],
             "hermes": [
                 "finances_sync_status",
                 "finances_monthly_summary",
