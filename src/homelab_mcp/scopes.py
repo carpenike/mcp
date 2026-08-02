@@ -41,6 +41,30 @@ audit = logging.getLogger("homelab_mcp.audit")
 _MAX_BODY = 1024 * 1024
 
 
+def resolve_resource_prefixes(
+    claims: dict[str, Any] | None, restricted_resources: dict[str, list[str]]
+) -> list[str] | None:
+    """URI prefixes this token may list/read, or None if unrestricted.
+
+    Resources are URI-addressed rather than named, so they need their own map.
+    A restricted token whose scope has no entry gets an EMPTY list, not None —
+    fail closed. Returning None here would silently hand every resource to a
+    scope nobody granted resources to.
+    """
+    if not claims:
+        return None
+    raw = claims.get("scope") or ""
+    if not isinstance(raw, str):
+        return None
+    present = [s for s in raw.split() if s in restricted_resources]
+    if present:
+        prefixes: list[str] = []
+        for name in present:
+            prefixes.extend(restricted_resources[name])
+        return prefixes
+    return None
+
+
 def resolve_allowlist(
     claims: dict[str, Any] | None, restricted_scopes: dict[str, list[str]]
 ) -> set[str] | None:
@@ -103,6 +127,11 @@ class ToolScopeMiddleware:
         if allowed is None:
             await self.app(scope, receive, send)
             return
+        # A token restricted on tools is restricted on resources too. If its
+        # scope grants no prefixes, it gets none — the alternative would be a
+        # scope-limited agent reading every document on the server.
+        prefixes = resolve_resource_prefixes(claims, self.settings.restricted_scope_resources)
+        resource_prefixes: list[str] = prefixes if prefixes is not None else []
 
         body, more = b"", True
         messages: list[Message] = []
@@ -116,7 +145,9 @@ class ToolScopeMiddleware:
             if len(body) > _MAX_BODY:
                 break
 
-        blocked = self._blocked_call(body, allowed)
+        blocked = self._blocked_call(body, allowed) or self._blocked_resource(
+            body, resource_prefixes
+        )
         if blocked is not None:
             request_id, tool = blocked
             email = user.get("email") if isinstance(user, dict) else None
@@ -157,6 +188,8 @@ class ToolScopeMiddleware:
             send,
             allowed,
             filter_tools_list=self._is_tools_list(body),
+            resource_prefixes=resource_prefixes,
+            filter_resources_list=self._is_resources_list(body),
         )
 
     @staticmethod
@@ -168,6 +201,36 @@ class ToolScopeMiddleware:
             return False
         requests = parsed if isinstance(parsed, list) else [parsed]
         return any(isinstance(req, dict) and req.get("method") == "tools/list" for req in requests)
+
+    @staticmethod
+    def _is_resources_list(body: bytes) -> bool:
+        """Whether the body asks for a resource catalog."""
+        try:
+            parsed = json.loads(body or b"{}")
+        except ValueError:
+            return False
+        requests = parsed if isinstance(parsed, list) else [parsed]
+        return any(
+            isinstance(r, dict)
+            and str(r.get("method", "")).startswith(("resources/list", "resources/templates/list"))
+            for r in requests
+        )
+
+    @staticmethod
+    def _blocked_resource(body: bytes, prefixes: list[str]) -> tuple[Any, str] | None:
+        """Return (id, uri) if the body reads a resource outside the allowed prefixes."""
+        try:
+            parsed = json.loads(body or b"{}")
+        except ValueError:
+            return None
+        for req in parsed if isinstance(parsed, list) else [parsed]:
+            if not isinstance(req, dict) or req.get("method") != "resources/read":
+                continue
+            params = req.get("params")
+            uri = params.get("uri") if isinstance(params, dict) else None
+            if isinstance(uri, str) and not any(uri.startswith(p) for p in prefixes):
+                return req.get("id"), uri
+        return None
 
     @staticmethod
     def _blocked_call(body: bytes, allowed: set[str]) -> tuple[Any, str] | None:
@@ -194,11 +257,14 @@ class ToolScopeMiddleware:
         allowed: set[str],
         *,
         filter_tools_list: bool,
+        resource_prefixes: list[str] | None = None,
+        filter_resources_list: bool = False,
     ) -> None:
         """Pass the request through, filtering any tools/list result on the way out."""
         start: Message | None = None
         chunks: list[bytes] = []
         buffer_mode: str | None = None
+        wants_filter = filter_tools_list or filter_resources_list
 
         async def _send(message: Message) -> None:
             nonlocal start, buffer_mode
@@ -208,7 +274,7 @@ class ToolScopeMiddleware:
                 ctype = headers.get(b"content-type", b"")
                 if ctype.startswith(b"application/json"):
                     buffer_mode = "json"
-                elif filter_tools_list and ctype.startswith(b"text/event-stream"):
+                elif wants_filter and ctype.startswith(b"text/event-stream"):
                     # Streamable HTTP frames even finite tools/list responses as
                     # SSE. Buffer only this known finite response; tool-call SSE
                     # streams continue passing through without delay.
@@ -227,9 +293,9 @@ class ToolScopeMiddleware:
 
             raw = b"".join(chunks)
             out = (
-                self._filter_tools_list(raw, allowed)
+                self._filter_tools_list(raw, allowed, resource_prefixes or [])
                 if buffer_mode == "json"
-                else self._filter_sse_tools_list(raw, allowed)
+                else self._filter_sse_tools_list(raw, allowed, resource_prefixes or [])
             )
             assert start is not None
             # Rebuild Content-Length: filtering shortens the body, and a stale
@@ -244,7 +310,7 @@ class ToolScopeMiddleware:
         await self.app(scope, receive, _send)
 
     @classmethod
-    def _filter_sse_tools_list(cls, raw: bytes, allowed: set[str]) -> bytes:
+    def _filter_sse_tools_list(cls, raw: bytes, allowed: set[str], prefixes: list[str]) -> bytes:
         """Filter compact JSON payloads in SSE data fields."""
         output: list[bytes] = []
         for line in raw.splitlines(keepends=True):
@@ -263,12 +329,12 @@ class ToolScopeMiddleware:
                 payload, ending = payload[:-2], b"\r\n"
             elif payload.endswith(b"\n"):
                 payload, ending = payload[:-1], b"\n"
-            output.append(prefix + cls._filter_tools_list(payload, allowed) + ending)
+            output.append(prefix + cls._filter_tools_list(payload, allowed, prefixes) + ending)
         return b"".join(output)
 
     @staticmethod
-    def _filter_tools_list(raw: bytes, allowed: set[str]) -> bytes:
-        """Drop non-allowed entries from a tools/list result; pass anything else through."""
+    def _filter_tools_list(raw: bytes, allowed: set[str], prefixes: list[str]) -> bytes:
+        """Drop non-allowed entries from a tools or resources catalog."""
         try:
             parsed = json.loads(raw)
         except ValueError:
@@ -280,7 +346,9 @@ class ToolScopeMiddleware:
             if not isinstance(obj, dict):
                 return obj
             result = obj.get("result")
-            if isinstance(result, dict) and isinstance(result.get("tools"), list):
+            if not isinstance(result, dict):
+                return obj
+            if isinstance(result.get("tools"), list):
                 kept = [
                     t
                     for t in result["tools"]
@@ -289,6 +357,24 @@ class ToolScopeMiddleware:
                 if len(kept) != len(result["tools"]):
                     changed = True
                     result["tools"] = kept
+            # Resource catalogs are URI-keyed. A restricted token with no
+            # granted prefixes sees an empty list, not the full catalog.
+            for key in ("resources", "resourceTemplates"):
+                entries = result.get(key)
+                if not isinstance(entries, list):
+                    continue
+                kept_r = [
+                    e
+                    for e in entries
+                    if not isinstance(e, dict)
+                    or any(
+                        str(e.get("uri") or e.get("uriTemplate") or "").startswith(p)
+                        for p in prefixes
+                    )
+                ]
+                if len(kept_r) != len(entries):
+                    changed = True
+                    result[key] = kept_r
             return obj
 
         parsed = [_filter(o) for o in parsed] if isinstance(parsed, list) else _filter(parsed)

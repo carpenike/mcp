@@ -19,7 +19,11 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from homelab_mcp.config import Settings
-from homelab_mcp.scopes import ToolScopeMiddleware, resolve_allowlist
+from homelab_mcp.scopes import (
+    ToolScopeMiddleware,
+    resolve_allowlist,
+    resolve_resource_prefixes,
+)
 
 HERMES_TOOLS = {
     "finances_sync_status",
@@ -239,6 +243,14 @@ def test_json_body_without_tools_list_result_passes_through_unchanged() -> None:
 
 # ── advisor scope (the interactive write layer) ──────────────────────
 
+# The governance-doc layer: reads plus the two append tools. Advisor only —
+# hermes's context is baked into its persona and it composes from numbers.
+ADVISOR_DOCS = {
+    "finances_docs_get",
+    "finances_decision_append",
+    "finances_planned_append",
+}
+
 ADVISOR_ADDED_V2 = {
     "finances_payees",
     "finances_payee_merge",
@@ -269,6 +281,7 @@ ADVISOR_TOOLS = {
     "paperless_link",
     "signal_send",
     *ADVISOR_ADDED_V2,
+    *ADVISOR_DOCS,
 }
 
 # Everything the advisor layer added. hermes must reach none of it.
@@ -310,7 +323,7 @@ def test_hermes_scope_is_exactly_its_seven() -> None:
     assert len(allowed) == 7
 
 
-@pytest.mark.parametrize("tool", sorted(ADVISOR_ADDED_V2 - HERMES_ADDED_V2))
+@pytest.mark.parametrize("tool", sorted((ADVISOR_ADDED_V2 | ADVISOR_DOCS) - HERMES_ADDED_V2))
 def test_hermes_is_403_on_every_advisor_only_tool(tool: str) -> None:
     """The balance sheet, the payee writer and the raw scans stay out of reach."""
     resp = _call(_app("hermes"), tool)
@@ -359,3 +372,92 @@ def test_hermes_reads_still_work_alongside_the_new_scope() -> None:
         "finances_debt_status",
     ):
         assert _call(_app("hermes"), tool).status_code == 200
+
+
+# ── resource scoping ─────────────────────────────────────────────────
+# Resources are URI-addressed, so they need their own gate. Before this the
+# middleware ignored resources/* entirely and any authenticated token could
+# have read every governance document.
+
+
+def test_advisor_resolves_the_finances_prefix() -> None:
+    got = resolve_resource_prefixes({"scope": "advisor"}, _settings().restricted_scope_resources)
+    assert got == ["finances://"]
+
+
+def test_hermes_resolves_no_resource_prefixes() -> None:
+    """Fail closed: a scope with no entry gets nothing, not everything."""
+    got = resolve_resource_prefixes({"scope": "hermes"}, _settings().restricted_scope_resources)
+    assert got is None  # no entry -> the middleware substitutes an empty list
+
+
+def test_unrestricted_token_is_unaffected() -> None:
+    assert (
+        resolve_resource_prefixes({"scope": "openid"}, _settings().restricted_scope_resources)
+        is None
+    )
+
+
+def _read(client: TestClient, uri: str) -> Any:
+    return client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": uri}},
+    )
+
+
+def test_advisor_may_read_a_finances_resource() -> None:
+    assert _read(_app("advisor"), "finances://PLAN.md").status_code == 200
+
+
+@pytest.mark.parametrize(
+    "uri",
+    ["finances://PLAN.md", "finances://DECISIONS.md", "finances://PLANNED.md"],
+)
+def test_hermes_is_403_on_every_finances_resource(uri: str) -> None:
+    resp = _read(_app("hermes"), uri)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == -32601
+
+
+def test_restricted_token_cannot_reach_an_unlisted_scheme() -> None:
+    """Even advisor is confined to its granted prefixes."""
+    assert _read(_app("advisor"), "file:///etc/passwd").status_code == 403
+    assert _read(_app("advisor"), "secrets://token").status_code == 403
+
+
+def test_resource_catalog_is_filtered_for_hermes() -> None:
+    """hermes must not even see that the documents exist."""
+
+    async def endpoint(request: Any) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {
+                    "resources": [
+                        {"uri": "finances://PLAN.md", "name": "PLAN.md"},
+                        {"uri": "finances://DECISIONS.md", "name": "DECISIONS.md"},
+                    ]
+                },
+            }
+        )
+
+    app = Starlette(routes=[Route("/mcp", endpoint, methods=["POST"])])
+
+    class Inject:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] == "http":
+                scope["user"] = {"email": "h@x", "claims": {"scope": "hermes"}}
+            await self.inner(scope, receive, send)
+
+    app.add_middleware(ToolScopeMiddleware, settings=_settings())
+    app.add_middleware(Inject)
+    resp = TestClient(app).post(
+        "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "resources/list"}
+    )
+    assert resp.json()["result"]["resources"] == []
+    assert int(resp.headers["content-length"]) == len(resp.content)
