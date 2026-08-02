@@ -321,6 +321,10 @@ in
         # Private clone of the finances governance repo, kept lazily fresh.
         # Inside the 0700 StateDirectory: it holds household financial planning.
         HOMELAB_MCP_FINANCES_REPO_PATH = "/var/lib/homelab-mcp/finances";
+        # Transaction-context store: what humans said about a transaction, in
+        # their own words. Its own file — household financial context must not
+        # share a blast radius with the OAuth state.
+        HOMELAB_MCP_FINANCES_CONTEXT_DB_PATH = "/var/lib/homelab-mcp/finances-context.db";
       } // lib.mapAttrs (_n: v: toString v) cfg.settings;
 
       serviceConfig = {

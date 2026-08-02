@@ -245,6 +245,16 @@ def test_json_body_without_tools_list_result_passes_through_unchanged() -> None:
 
 # The governance-doc layer: reads plus the two append tools. Advisor only —
 # hermes's context is baked into its persona and it composes from numbers.
+# The transaction-context store. hermes may SCRIBE and READ here — its only
+# writable surface anywhere — but may not consume, because consuming asserts
+# that a human-judged categorization already happened in the ledger.
+CONTEXT_SHARED = {
+    "finances_context_add",
+    "finances_context_list",
+    "finances_clarify_candidates",
+}
+CONTEXT_ADVISOR_ONLY = {"finances_context_consume"}
+
 ADVISOR_DOCS = {
     "finances_docs_get",
     "finances_decision_append",
@@ -282,6 +292,8 @@ ADVISOR_TOOLS = {
     "signal_send",
     *ADVISOR_ADDED_V2,
     *ADVISOR_DOCS,
+    *CONTEXT_SHARED,
+    *CONTEXT_ADVISOR_ONLY,
 }
 
 # Everything the advisor layer added. hermes must reach none of it.
@@ -313,17 +325,23 @@ HERMES_TOOLS = {
     "finances_recurring",
     "finances_debt_status",
     *HERMES_ADDED_V2,
+    *CONTEXT_SHARED,
 }
 
 
-def test_hermes_scope_is_exactly_its_seven() -> None:
-    """Four read summaries plus the three the pulse needs. Nothing more."""
+def test_hermes_scope_is_exactly_its_ten() -> None:
+    """Seven reads plus the three context tools it may scribe/read with."""
     allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
     assert allowed == HERMES_TOOLS
-    assert len(allowed) == 7
+    assert len(allowed) == 10
 
 
-@pytest.mark.parametrize("tool", sorted((ADVISOR_ADDED_V2 | ADVISOR_DOCS) - HERMES_ADDED_V2))
+@pytest.mark.parametrize(
+    "tool",
+    sorted(
+        (ADVISOR_ADDED_V2 | ADVISOR_DOCS | CONTEXT_ADVISOR_ONLY) - HERMES_ADDED_V2 - CONTEXT_SHARED
+    ),
+)
 def test_hermes_is_403_on_every_advisor_only_tool(tool: str) -> None:
     """The balance sheet, the payee writer and the raw scans stay out of reach."""
     resp = _call(_app("hermes"), tool)
@@ -461,3 +479,32 @@ def test_resource_catalog_is_filtered_for_hermes() -> None:
     )
     assert resp.json()["result"]["resources"] == []
     assert int(resp.headers["content-length"]) == len(resp.content)
+
+
+# ── transaction-context scoping ──────────────────────────────────────
+
+
+def test_hermes_may_scribe_and_read_context() -> None:
+    """Recording what someone replied is hermes's one writable capability."""
+    for tool in sorted(CONTEXT_SHARED):
+        assert _call(_app("hermes"), tool).status_code == 200
+
+
+def test_hermes_may_not_consume_context() -> None:
+    """Consuming asserts a human-judged categorization already happened.
+
+    hermes never touches the ledger, so it can never be the one to say so.
+    """
+    resp = _call(_app("hermes"), "finances_context_consume")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == -32601
+
+
+def test_advisor_may_consume_context() -> None:
+    assert _call(_app("advisor"), "finances_context_consume").status_code == 200
+
+
+def test_context_tools_do_not_grant_ledger_writes_to_hermes() -> None:
+    """The store is not a side door into Actual."""
+    for tool in ("finances_categorize", "finances_rule_create", "finances_payee_merge"):
+        assert _call(_app("hermes"), tool).status_code == 403

@@ -23,6 +23,7 @@ import json
 import logging
 import pathlib
 import re
+import sqlite3
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
@@ -31,6 +32,13 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 
+from homelab_mcp.finances_context import (
+    SOURCES,
+    STATUSES,
+    ContextStore,
+    RateLimitedError,
+    matches_ref,
+)
 from homelab_mcp.tools._http import ToolError, enc, make_client, request_json
 
 if TYPE_CHECKING:
@@ -2787,5 +2795,229 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 "Interest accrues monthly on the outstanding balance at the "
                 "configured rate, held constant. A variable rate will not stay "
                 "where it is, so treat a variable-rate projection as a scenario."
+            ),
+        }
+
+    # ── 17. transaction context ──────────────────────────────────────
+    store: ContextStore | None = None
+    try:
+        store = ContextStore(
+            settings.finances_context_db_path, settings.finances_context_daily_limit
+        )
+    except sqlite3.Error:
+        log.exception("finances context store unavailable — context tools disabled")
+
+    def _need_store() -> ContextStore:
+        if store is None:
+            raise ToolError(
+                "finances_context_unavailable",
+                "The transaction-context store could not be opened.",
+                "Check HOMELAB_MCP_FINANCES_CONTEXT_DB_PATH and its directory.",
+            )
+        return store
+
+    @mcp.tool(
+        annotations=_WRITE_CREATE,
+        name="finances_context_add",
+        description=(
+            "Record what someone said about a transaction, in their own words. "
+            "The ledger knows $266.14 went to Bavarian Inn; only a person knows "
+            "it was a birthday dinner, and that sentence is usually available "
+            "for about a day. Capture it verbatim — do not summarize or "
+            "interpret it into a category. The reference is a HINT (date, "
+            "amount, payee fragment), not an Actual transaction id: use this "
+            "even when the purchase has not posted to the bank feed yet, which "
+            "is exactly when a statement would otherwise be lost. Rate-limited "
+            "per author per day."
+        ),
+    )
+    async def context_add(
+        note: Annotated[str, Field(min_length=1, max_length=500, description="Verbatim words.")],
+        author: Annotated[str, Field(min_length=1, max_length=120, description="Who said it.")],
+        source: Annotated[
+            str, Field(description="pulse_clarify (answering a prompt) or volunteered.")
+        ] = "volunteered",
+        ref_date: Annotated[str | None, Field(description="Approx date, 'YYYY-MM-DD'.")] = None,
+        ref_amount: Annotated[float | None, Field(description="Approx amount in dollars.")] = None,
+        ref_payee: Annotated[str | None, Field(description="Payee fragment.")] = None,
+    ) -> dict[str, Any]:
+        try:
+            st = _need_store()
+            if source not in SOURCES:
+                raise ToolError(
+                    "finances_bad_source",
+                    f"source must be one of {', '.join(SOURCES)}.",
+                    "",
+                )
+            if ref_date:
+                try:
+                    date.fromisoformat(ref_date)
+                except ValueError as exc:
+                    raise ToolError(
+                        "finances_bad_date", "ref_date must be 'YYYY-MM-DD'.", ""
+                    ) from exc
+            row = await st.add(
+                author=author.strip(),
+                note=note.strip(),
+                source=source,
+                ref_date=ref_date,
+                ref_amount=ref_amount,
+                ref_payee=(ref_payee or "").strip() or None,
+            )
+        except RateLimitedError as exc:
+            return ToolError(
+                "finances_context_rate_limited",
+                f"{exc.author} has already recorded {exc.used} entries today (limit {exc.limit}).",
+                "The cap bounds a stuck loop, not normal use. Try again tomorrow, "
+                "or raise HOMELAB_MCP_FINANCES_CONTEXT_DAILY_LIMIT.",
+            ).payload()
+        except ToolError as err:
+            return err.payload()
+        audit.info("finances_context_add id=%s author=%s", row["id"], row["author"])
+        return {
+            "added": True,
+            "entry": row,
+            "remaining_today": await st.remaining_today(row["author"]),
+        }
+
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_context_list",
+        description=(
+            "List recorded transaction context. Read this BEFORE asking anyone "
+            "about a transaction — someone may already have explained it, and "
+            "re-asking is how a channel trains people to ignore it. Defaults to "
+            "open entries (awaiting use); pass status='consumed' for ones "
+            "already applied, or 'aged_out' for those nobody claimed within the "
+            "window. Aged-out entries are retired, never deleted, so a later "
+            "review can still find them."
+        ),
+    )
+    async def context_list(
+        status: Annotated[
+            str | None, Field(description="open (default), consumed, aged_out, or null for all.")
+        ] = "open",
+        limit: Annotated[int, Field(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
+        try:
+            st = _need_store()
+            if status is not None and status not in STATUSES:
+                raise ToolError(
+                    "finances_bad_status", f"status must be one of {', '.join(STATUSES)}.", ""
+                )
+            rows, aged = await st.list_entries(status, limit)
+        except ToolError as err:
+            return err.payload()
+        return {
+            "returned": len(rows),
+            "total": len(rows),
+            "truncated": len(rows) >= limit,
+            "status_filter": status,
+            "aged_out_this_call": aged,
+            "entries": rows,
+        }
+
+    @mcp.tool(
+        annotations=_WRITE_IDEMPOTENT,
+        name="finances_context_consume",
+        description=(
+            "Mark context entries as used, AFTER the categorization they "
+            "informed has actually been made in the ledger. This closes the "
+            "loop so nobody is asked about the same transaction twice. Only "
+            "open entries transition; ids already consumed or aged out are "
+            "reported back rather than silently ignored. Optionally attach a "
+            "note recording what was done with the information."
+        ),
+    )
+    async def context_consume(
+        ids: Annotated[list[int], Field(description="Entry ids from finances_context_list.")],
+        note: Annotated[str | None, Field(max_length=300, description="What was done.")] = None,
+        consumed_by: Annotated[str, Field(description="Who/what applied it.")] = "advisor",
+    ) -> dict[str, Any]:
+        try:
+            st = _need_store()
+            if not ids:
+                raise ToolError("finances_context_no_ids", "No ids supplied.", "")
+            result = await st.consume(ids, consumed_by, (note or "").strip() or None)
+        except ToolError as err:
+            return err.payload()
+        audit.info("finances_context_consume ids=%s by=%s", result["consumed"], consumed_by)
+        return {
+            "consumed": result["consumed"],
+            "already_closed": result["not_open"],
+            "not_found": result["missing"],
+        }
+
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_clarify_candidates",
+        description=(
+            "Pick the transactions most worth asking a human about: "
+            "uncategorized, over the threshold, old enough to have settled but "
+            "recent enough to remember, and not already covered by open "
+            "context. Selection is deterministic — largest first — so the same "
+            "ledger always yields the same question and a model never chooses "
+            "what to ask. Intended for the weekly pulse's appendix; keep the "
+            "count small, because a channel that asks too much gets ignored."
+        ),
+    )
+    async def clarify_candidates(
+        max_items: Annotated[int, Field(ge=1, le=10)] = 3,
+        min_amount: Annotated[float, Field(ge=0)] = 50.0,
+        min_age_days: Annotated[int, Field(ge=0, le=90)] = 2,
+        max_age_days: Annotated[int, Field(ge=1, le=365)] = 10,
+    ) -> dict[str, Any]:
+        try:
+            st = _need_store()
+            today = date.today()
+            rows = await _transactions(today - timedelta(days=max_age_days), today)
+            open_rows = await st.open_refs()
+        except ToolError as err:
+            return err.payload()
+
+        newest = (today - timedelta(days=min_age_days)).isoformat()
+        pool: list[dict[str, Any]] = []
+        for t in rows:
+            if t["account_offbudget"] or t["is_transfer"] or t.get("category_name"):
+                continue
+            if _is_account_setup(t) or t["amount_cents"] >= 0:
+                continue
+            if t["date"] > newest:
+                continue  # too fresh to have settled, and the card may still repost it
+            if _d(-t["amount_cents"]) < min_amount:
+                continue
+            pool.append(
+                {
+                    "id": t["id"],
+                    "date": t["date"],
+                    "amount": _d(t["amount_cents"]),
+                    "payee": t.get("payee_name"),
+                    "account": t.get("account_name"),
+                }
+            )
+
+        already = 0
+        candidates: list[dict[str, Any]] = []
+        for cand in sorted(pool, key=lambda r: (-abs(float(r["amount"])), r["date"])):
+            if any(matches_ref(r["txn_ref"], cand) for r in open_rows):
+                already += 1
+                continue
+            candidates.append(cand)
+
+        return {
+            "returned": min(len(candidates), max_items),
+            "total": len(candidates),
+            "truncated": len(candidates) > max_items,
+            "candidates": candidates[:max_items],
+            "excluded_with_open_context": already,
+            "window": {
+                "min_amount": min_amount,
+                "from": (today - timedelta(days=max_age_days)).isoformat(),
+                "to": newest,
+            },
+            "selection": (
+                "Deterministic: uncategorized on-budget outflows in the window, "
+                "over the threshold, minus anything already covered by open "
+                "context, ordered by size."
             ),
         }
