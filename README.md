@@ -194,6 +194,10 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
 | Finances docs | `finances_decision_append` | Append a dated entry to DECISIONS.md (newest-first), commit and push. Append-only |
 | Finances docs | `finances_planned_append` | Append a row to PLANNED.md's spending queue, commit and push. Append-only |
+| Finances context | `finances_context_add` | Record what someone said about a transaction, verbatim. `txn_ref` is a **hint**, not an Actual id — usable before the purchase posts. Rate-limited per author/day |
+| Finances context | `finances_context_list` | Open / consumed / aged-out context. Read before asking anyone about a transaction |
+| Finances context | `finances_context_consume` | Close entries after the categorization they informed actually happened. **Advisor only** |
+| Finances context | `finances_clarify_candidates` | Deterministic pick of transactions worth asking about — uncategorized, over threshold, settled but recent, minus anything with open context |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
@@ -332,6 +336,29 @@ plan gives advice the household has already considered and rejected.
   session-with-git work where a human sees the diff.
 - The token needs `contents: write` for the append tools; a read-only token
   serves the docs and fails those two explicitly.
+
+### Transaction context (the first data-shaped store)
+
+The ledger records that $266.14 went to Bavarian Inn; only a person knows it
+was a birthday dinner, and that sentence is available for about a day. This
+captures it verbatim, in SQLite (arcraiders precedent — data-shaped and
+append-heavy, unlike the governance docs which are prose).
+
+- **`txn_ref` is a hint, not a foreign key** — date, amount, payee fragment.
+  The point is capturing a statement *before* the purchase posts, so there may
+  be no transaction to reference yet.
+- **Aging is lazy and non-destructive.** Open rows past 45 days become
+  `aged_out` when something next reads them — no background job. Never
+  deleted, so silence can mean "nobody remembers" without the queue growing
+  forever.
+- **hermes may write here and nowhere else.** `add` / `list` /
+  `clarify_candidates` are its only writable and context-reading surface;
+  `consume` is advisor-only, because consuming asserts a human-judged
+  categorization already happened in the ledger — and hermes never touches
+  the ledger.
+- **`clarify_candidates` is deterministic** (largest first, fixed filters) so
+  a model never chooses what to ask, and excludes anything already covered by
+  open context — re-asking is how a channel trains people to ignore it.
 
 ### Restricted credentials (tool allowlisting)
 

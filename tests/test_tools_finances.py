@@ -2550,3 +2550,252 @@ async def test_net_worth_fields_are_additive(tmp_path: Any, httpx_mock: HTTPXMoc
         "debts",
     ):
         assert key in out, f"pre-existing field {key} disappeared"
+
+
+# ── transaction context ──────────────────────────────────────────────
+
+
+def _ctx_tools(tmp_path: Any, limit: int = 20) -> Any:
+    mcp = CapturingMCP()
+    register(
+        mcp,  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            oauth_required=False,
+            finances_sidecar_base_url=BASE,
+            finances_config_path=_v2_cfg(tmp_path),
+            finances_context_db_path=str(tmp_path / "ctx.db"),
+            finances_context_daily_limit=limit,
+        ),
+    )
+    return mcp.tools
+
+
+async def test_context_add_list_consume_round_trip(tmp_path: Any) -> None:
+    tools = _ctx_tools(tmp_path)
+    added = await tools["finances_context_add"](
+        note="Jayme's birthday dinner — the whole family went.",
+        author="+1240...",
+        source="pulse_clarify",
+        ref_date="2026-07-27",
+        ref_amount=266.14,
+        ref_payee="Bavarian Inn",
+    )
+    assert added["added"] is True
+    entry = added["entry"]
+    assert entry["status"] == "open"
+    # Stored verbatim — not summarized into a category.
+    assert entry["note"].startswith("Jayme's birthday dinner")
+    assert entry["txn_ref"] == {
+        "date": "2026-07-27",
+        "amount": 266.14,
+        "payee_hint": "Bavarian Inn",
+    }
+
+    listed = await tools["finances_context_list"]()
+    assert [e["id"] for e in listed["entries"]] == [entry["id"]]
+
+    done = await tools["finances_context_consume"](
+        ids=[entry["id"]], note="Categorized as Dining & Fun."
+    )
+    assert done["consumed"] == [entry["id"]]
+    # Consuming removes it from the open queue, so nobody is re-asked.
+    assert (await tools["finances_context_list"]())["entries"] == []
+    closed = await tools["finances_context_list"](status="consumed")
+    assert closed["entries"][0]["consumed_by"] == "advisor"
+    assert "Categorized as Dining & Fun." in closed["entries"][0]["note"]
+
+
+async def test_context_stores_a_statement_with_no_posted_transaction(
+    tmp_path: Any,
+) -> None:
+    """The pre-posting case — the whole reason txn_ref is a hint, not an id.
+
+    Someone says "I just bought X" before the card feed has it. That sentence
+    is available for about a day; the transaction may take three.
+    """
+    tools = _ctx_tools(tmp_path)
+    added = await tools["finances_context_add"](
+        note="Just ordered the mixer — this is the queued WANT, not an impulse.",
+        author="ryan",
+        source="volunteered",
+    )
+    assert added["added"] is True
+    assert added["entry"]["txn_ref"] == {"date": None, "amount": None, "payee_hint": None}
+    listed = await tools["finances_context_list"]()
+    assert listed["entries"][0]["id"] == added["entry"]["id"]
+
+
+async def test_consume_reports_ids_it_did_not_change(tmp_path: Any) -> None:
+    """Silently ignoring a bad id would hide a caller's mistake."""
+    tools = _ctx_tools(tmp_path)
+    e = (await tools["finances_context_add"](note="x", author="a"))["entry"]
+    await tools["finances_context_consume"](ids=[e["id"]])
+    again = await tools["finances_context_consume"](ids=[e["id"], 9999])
+    assert again["consumed"] == []
+    assert again["already_closed"] == [e["id"]]
+    assert again["not_found"] == [9999]
+
+
+async def test_rate_limit_is_enforced_per_author(tmp_path: Any) -> None:
+    tools = _ctx_tools(tmp_path, limit=3)
+    for i in range(3):
+        assert (await tools["finances_context_add"](note=f"n{i}", author="loop"))["added"]
+    blocked = await tools["finances_context_add"](note="one too many", author="loop")
+    assert blocked["error"]["code"] == "finances_context_rate_limited"
+    # Per-author: someone else is unaffected.
+    assert (await tools["finances_context_add"](note="fine", author="other"))["added"]
+
+
+async def test_remaining_today_counts_down(tmp_path: Any) -> None:
+    tools = _ctx_tools(tmp_path, limit=5)
+    first = await tools["finances_context_add"](note="a", author="z")
+    assert first["remaining_today"] == 4
+
+
+async def test_backdated_entry_ages_out_on_next_list(tmp_path: Any) -> None:
+    """Silence may mean 'nobody remembers' without the queue growing forever."""
+    import time as _t
+
+    from homelab_mcp.finances_context import AGE_OUT_SECONDS, ContextStore
+
+    store = ContextStore(str(tmp_path / "aging.db"))
+    old = await store.add(
+        author="a",
+        note="stale",
+        source="volunteered",
+        ref_date=None,
+        ref_amount=None,
+        ref_payee=None,
+        created_at=_t.time() - AGE_OUT_SECONDS - 60,
+    )
+    fresh = await store.add(
+        author="a",
+        note="recent",
+        source="volunteered",
+        ref_date=None,
+        ref_amount=None,
+        ref_payee=None,
+    )
+    open_rows, aged = await store.list_entries("open", 50)
+    assert aged == 1
+    assert [r["id"] for r in open_rows] == [fresh["id"]]
+    # Retired, never deleted — triage can still find it.
+    retired, _ = await store.list_entries("aged_out", 50)
+    assert [r["id"] for r in retired] == [old["id"]]
+
+
+# ── clarify candidates ───────────────────────────────────────────────
+
+
+def _cand_txns() -> list[dict[str, Any]]:
+    return [
+        _txn(
+            id="big",
+            date="2026-07-27",
+            amount_cents=-26_614,
+            payee_name="Bavarian Inn",
+            category_name=None,
+        ),
+        _txn(
+            id="mid",
+            date="2026-07-26",
+            amount_cents=-13_183,
+            payee_name="Off Broadway Shoes",
+            category_name=None,
+        ),
+        # Under the threshold.
+        _txn(
+            id="small",
+            date="2026-07-26",
+            amount_cents=-1_200,
+            payee_name="Coffee",
+            category_name=None,
+        ),
+        # Already categorized.
+        _txn(
+            id="done",
+            date="2026-07-25",
+            amount_cents=-50_000,
+            payee_name="Known",
+            category_name="Fixed",
+        ),
+        # Too fresh to have settled.
+        _txn(
+            id="fresh",
+            date="2026-07-31",
+            amount_cents=-90_000,
+            payee_name="Today",
+            category_name=None,
+        ),
+        # Account-setup artifact.
+        _txn(
+            id="sb",
+            date="2026-07-26",
+            amount_cents=-500_000,
+            payee_name="Starting Balance",
+            category_name=None,
+        ),
+    ]
+
+
+async def test_clarify_candidates_selection_is_deterministic(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": _cand_txns()},
+    )
+    out = await _ctx_tools(tmp_path)["finances_clarify_candidates"]()
+    ids = [c["id"] for c in out["candidates"]]
+    # Largest first; small/categorized/fresh/setup all excluded.
+    assert ids == ["big", "mid"]
+
+
+async def test_clarify_candidates_excludes_refs_with_open_context(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Re-asking is how a channel trains people to ignore it."""
+    tools = _ctx_tools(tmp_path)
+    await tools["finances_context_add"](
+        note="Birthday dinner.",
+        author="a",
+        ref_date="2026-07-27",
+        ref_amount=266.14,
+        ref_payee="Bavarian",
+    )
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": _cand_txns()},
+    )
+    out = await tools["finances_clarify_candidates"]()
+    assert [c["id"] for c in out["candidates"]] == ["mid"]
+    assert out["excluded_with_open_context"] == 1
+
+
+async def test_a_ref_with_no_hints_never_suppresses_a_candidate(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """A pre-posting note is worth storing but must not blank the queue."""
+    tools = _ctx_tools(tmp_path)
+    await tools["finances_context_add"](note="bought something", author="a")
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": _cand_txns()},
+    )
+    out = await tools["finances_clarify_candidates"]()
+    assert [c["id"] for c in out["candidates"]] == ["big", "mid"]
+    assert out["excluded_with_open_context"] == 0
+
+
+async def test_clarify_candidates_respects_max(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": _cand_txns()},
+    )
+    out = await _ctx_tools(tmp_path)["finances_clarify_candidates"](max_items=1)
+    assert out["returned"] == 1
+    assert out["total"] == 2
+    assert out["truncated"] is True

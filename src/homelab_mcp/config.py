@@ -468,6 +468,30 @@ class Settings(BaseSettings):
         ),
     )
 
+    finances_context_db_path: str = Field(
+        default="/var/lib/homelab-mcp/finances-context.db",
+        description=(
+            "SQLite file for the transaction-context store — what humans said "
+            "about a transaction, in their own words. Deliberately separate "
+            "from the OAuth state.db and the arcraiders store: household "
+            "financial context and auth state must not share a file, a backup "
+            "story, or a blast radius. Lives in the same systemd "
+            "StateDirectory. Set to ':memory:' (or empty) for an ephemeral "
+            "store, which loses context on restart."
+        ),
+    )
+    finances_context_daily_limit: int = Field(
+        default=20,
+        ge=1,
+        le=1000,
+        description=(
+            "Maximum context entries one author may add per rolling day. Bounds "
+            "the blast radius of a stuck agent or a retry loop; it sits far "
+            "above anything a person would type in a day, so it never bites "
+            "normal use."
+        ),
+    )
+
     # ── Finances governance docs (git repo) ──────────────────────────
     finances_repo_url: str = Field(
         default="",
@@ -611,6 +635,10 @@ class Settings(BaseSettings):
                 "finances_net_worth",
                 "finances_payoff_projection",
                 "finances_docs_get",
+                "finances_context_add",
+                "finances_context_list",
+                "finances_context_consume",
+                "finances_clarify_candidates",
                 "finances_decision_append",
                 "finances_planned_append",
                 "paperless_search",
@@ -631,6 +659,11 @@ class Settings(BaseSettings):
                 "finances_buffer",
                 "finances_breaches",
                 "finances_room",
+                # The single writable surface hermes has: it may record what
+                # someone replied, and may never act on the ledger with it.
+                "finances_context_add",
+                "finances_context_list",
+                "finances_clarify_candidates",
             ],
         },
         description=(
