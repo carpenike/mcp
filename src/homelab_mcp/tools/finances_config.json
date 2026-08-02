@@ -450,5 +450,33 @@
     "pending_inclusive_accounts": [
       "USAA Checking"
     ]
+  },
+  "concentration": {
+    "_comment": [
+      "Employer-tied asset concentration — the number a fiduciary planner",
+      "opens with. Facts only: this section reports the figure and its",
+      "components. Whether it is acceptable is a judgment for humans and",
+      "professionals, not for a tool.",
+      "",
+      "CRITICAL, and the reason employer_tied_accounts is an explicit list",
+      "rather than a name-match on 'Microsoft': the Microsoft 401(k) is",
+      "invested in a TARGET-DATE FUND. It is NOT employer stock and must",
+      "never be counted as concentration — it is the single largest account,",
+      "so counting it would roughly quintuple the reported figure and make",
+      "the metric worse than useless.",
+      "",
+      "msft_shares_in_brokerage is a DOLLAR value maintained by hand: the",
+      "Fidelity Brokerage holds vested RSUs still in MSFT, and feeds carry",
+      "the account balance but not its positions. Refresh it at monthly",
+      "reviews, like the House valuation. null means UNKNOWN — the tool then",
+      "reports concentration as 'unknown' and still shows the ESPP figure,",
+      "rather than reporting a falsely-low percentage."
+    ],
+    "employer_tied_accounts": [
+      "Microsoft ESPP"
+    ],
+    "msft_shares_in_brokerage": 137000.0,
+    "msft_shares_source_account": "Fidelity Brokerage",
+    "single_employer_income": true
   }
 }
