@@ -189,7 +189,7 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_room` | The "can we spend this?" arithmetic, **net of fixed bills not yet posted**: room, itemized `remaining_committed`, `variable_floor`/`variable_mtd`, and pace measured on variable spend only, plus recovery math (`required_remaining_pace`, `typical_remaining_pace`, `recovery_delta`). Present as "$X after $Y of upcoming fixed bills" — never the naive figure |
 | Finances | `finances_reconcile` | Register vs the **bank's own reported balance** per account; drift classified exact / settlement_window / structural / market_movement / manual. Catches a register that drifted from reality while fully "cleared". Degrades to cleared-only and says so if the bank feed is unavailable |
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
-| Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only) |
+| Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only); employer-stock concentration with components itemized — the 401(k) is a target-date fund and is explicitly excluded |
 | Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
 | Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
 | Finances docs | `finances_decision_append` | Append a dated entry to DECISIONS.md (newest-first), commit and push. Append-only |

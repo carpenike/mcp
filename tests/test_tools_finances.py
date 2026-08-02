@@ -2409,3 +2409,144 @@ async def test_glide_fields_are_additive(
         "savings_mtd",
     ):
         assert key in out, f"pre-existing field {key} disappeared"
+
+
+# ── employer concentration ───────────────────────────────────────────
+
+
+def _conc_accounts() -> dict[str, Any]:
+    return {
+        "accounts": [
+            _acct("USAA Checking", 4_648_201, 4_648_201),
+            # The largest account by far — and a target-date fund, not stock.
+            _acct("Microsoft 401k", 79_285_250, 79_285_250, offbudget=True),
+            _acct("Fidelity Brokerage", 13_678_711, 13_678_711, offbudget=True),
+            _acct("Microsoft ESPP", 224_315, 224_315, offbudget=True),
+            _acct("Fidelity HSA", 4_407_512, 4_407_512, offbudget=True),
+            _acct("House", 85_000_000, 85_000_000, offbudget=True),
+            _acct("Mortgage (NewRez)", -39_217_246, -39_217_246, offbudget=True),
+        ]
+    }
+
+
+def _conc_cfg(tmp_path: Any, msft: float | None = 137_000.0, name: str = "conc.json") -> str:
+    cfg = tmp_path / name
+    cfg.write_text(
+        json.dumps(
+            {
+                "buffer": {"cash_accounts": ["USAA Checking"], "card_accounts": []},
+                "recurring": {"items": []},
+                "debts": {},
+                "concentration": {
+                    "employer_tied_accounts": ["Microsoft ESPP"],
+                    "msft_shares_in_brokerage": msft,
+                    "msft_shares_source_account": "Fidelity Brokerage",
+                    "single_employer_income": True,
+                },
+            }
+        )
+    )
+    return str(cfg)
+
+
+def _conc_tools(tmp_path: Any, **over: Any) -> Any:
+    mcp = CapturingMCP()
+    register(
+        mcp,  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            oauth_required=False,
+            finances_sidecar_base_url=BASE,
+            finances_config_path=_conc_cfg(tmp_path, **over),
+        ),
+    )
+    return mcp.tools
+
+
+def _conc_mock(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/accounts", json=_conc_accounts())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+    )
+
+
+async def test_concentration_excludes_the_401k(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """The 401(k) is a target-date fund, not employer stock.
+
+    It is the largest single account, so counting it would roughly quintuple
+    the reported figure and make the metric worse than useless.
+    """
+    _conc_mock(httpx_mock)
+    out = await _conc_tools(tmp_path)["finances_net_worth"]()
+    conc = out["concentration"]
+    named = {c["account"] for c in conc["components"]}
+    assert "Microsoft 401k" not in named
+    assert conc["employer_tied_assets"] == pytest.approx(137_000.0 + 2_243.15)
+    # And the exclusion is stated, not merely implied by absence.
+    assert any(e["account"] == "Microsoft 401k" for e in conc["excluded"])
+
+
+async def test_concentration_percentage(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _conc_mock(httpx_mock)
+    out = await _conc_tools(tmp_path)["finances_net_worth"]()
+    conc = out["concentration"]
+    # investable = 401k + brokerage + ESPP + HSA (house and cash excluded)
+    investable = 792_852.50 + 136_787.11 + 2_243.15 + 44_075.12
+    assert conc["investable_total"] == pytest.approx(investable)
+    assert conc["concentration_pct"] == pytest.approx(
+        round((137_000.0 + 2_243.15) / investable * 100.0, 1)
+    )
+    assert conc["concentration_pct_status"] == "measured"
+
+
+async def test_unset_brokerage_value_reports_unknown_not_zero(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A falsely-low percentage is worse than an honest 'unmeasured'."""
+    _conc_mock(httpx_mock)
+    out = await _conc_tools(tmp_path, msft=None, name="conc_null.json")["finances_net_worth"]()
+    conc = out["concentration"]
+    assert conc["concentration_pct"] is None
+    assert conc["concentration_pct_status"] == "unknown"
+    assert "not as low" in conc["unknown_reason"]
+    # The ESPP figure is real and still shown; it is just partial.
+    assert conc["employer_tied_assets"] == pytest.approx(2_243.15)
+    assert [c["account"] for c in conc["components"]] == ["Microsoft ESPP"]
+
+
+async def test_income_concentration_is_a_separate_fact(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    _conc_mock(httpx_mock)
+    out = await _conc_tools(tmp_path)["finances_net_worth"]()
+    assert out["concentration"]["single_employer_income"] is True
+
+
+async def test_concentration_components_record_their_source(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """One value is live, one is hand-maintained — the reader should know."""
+    _conc_mock(httpx_mock)
+    conc = (await _conc_tools(tmp_path)["finances_net_worth"]())["concentration"]
+    by = {c["account"]: c for c in conc["components"]}
+    assert by["Microsoft ESPP"]["source"] == "actual"
+    assert by["Fidelity Brokerage"]["source"] == "config"
+    assert "monthly reviews" in by["Fidelity Brokerage"]["note"]
+
+
+async def test_net_worth_fields_are_additive(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _conc_mock(httpx_mock)
+    out = await _conc_tools(tmp_path)["finances_net_worth"]()
+    for key in (
+        "net_worth",
+        "assets_total",
+        "debts_total",
+        "cash",
+        "investable",
+        "property",
+        "home_equity",
+        "home_equity_note",
+        "assets",
+        "debts",
+    ):
+        assert key in out, f"pre-existing field {key} disappeared"

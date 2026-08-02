@@ -2499,7 +2499,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Full balance-sheet rollup across every open account, on-budget and "
             "off: cash, investments, property and all debt, netted. Also "
             "reports the investable total (liquid + retirement, excluding the "
-            "house) and home equity. Home equity is DISPLAY-ONLY per PLAN.md's "
+            "house), home equity, and employer-stock concentration — "
+            "employer-tied assets as a share of investable, with components "
+            "itemized. The 401(k) is a target-date fund and is explicitly NOT "
+            "counted as employer stock. Concentration reports 'unknown' rather "
+            "than a low number when the hand-maintained brokerage figure is "
+            "unset. Facts only; whether a concentration is acceptable is a "
+            "judgment for the household and its advisors. Home equity is DISPLAY-ONLY per PLAN.md's "
             "guardrail — it feeds the net-worth view and the HELOC scoreboard "
             "and must never enter an affordability or spending decision, "
             "because paper equity treated as spendable is how HELOCs happen. "
@@ -2554,9 +2560,73 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 house["balance"] + mortgage["balance"] + (heloc["balance"] if heloc else 0.0), 2
             )
 
+        # ── employer concentration ────────────────────────────────────
+        # Facts only. This reports the figure a fiduciary planner opens with;
+        # whether it is acceptable is a judgment for humans, not for a tool.
+        ccfg = cfg.get("concentration") or {}
+        tied_names = [n for n in (ccfg.get("employer_tied_accounts") or [])]
+        tied_components: list[dict[str, Any]] = []
+        for name in tied_names:
+            acct = next((a for a in assets if a["account"] == name), None)
+            if acct is not None:
+                tied_components.append(
+                    {"account": name, "value": acct["balance"], "source": "actual"}
+                )
+        raw_msft = ccfg.get("msft_shares_in_brokerage")
+        msft_value = float(raw_msft) if raw_msft is not None else None
+        if msft_value is not None:
+            tied_components.append(
+                {
+                    "account": ccfg.get("msft_shares_source_account", "Fidelity Brokerage"),
+                    "value": round(msft_value, 2),
+                    "source": "config",
+                    "note": (
+                        "Vested RSUs still held in employer stock. Feeds carry the "
+                        "account balance but not its positions, so this is "
+                        "maintained by hand and refreshed at monthly reviews."
+                    ),
+                }
+            )
+        tied_total = round(sum(float(c["value"]) for c in tied_components), 2)
+        concentration_pct: float | None = None
+        if msft_value is not None and investable:
+            concentration_pct = round(tied_total / investable * 100.0, 1)
+
+        concentration: dict[str, Any] = {
+            "employer_tied_assets": tied_total,
+            "investable_total": investable,
+            "concentration_pct": concentration_pct,
+            "components": tied_components,
+            # A separate fact from asset concentration, and deliberately
+            # surfaced alongside it: salary, bonuses and every future RSU vest
+            # come from the same employer, so the income and the asset are
+            # exposed to one company at once.
+            "single_employer_income": bool(ccfg.get("single_employer_income")),
+            "excluded": [
+                {
+                    "account": "Microsoft 401k",
+                    "reason": (
+                        "Invested in a target-date fund, not employer stock. It is "
+                        "the largest single account, so counting it would badly "
+                        "overstate concentration."
+                    ),
+                }
+            ],
+        }
+        if concentration_pct is None:
+            concentration["concentration_pct_status"] = "unknown"
+            concentration["unknown_reason"] = (
+                "msft_shares_in_brokerage is not set in config, so the employer-stock "
+                "value held in the brokerage is unknown. The ESPP figure above is "
+                "real but partial — treat the percentage as unmeasured, not as low."
+            )
+        else:
+            concentration["concentration_pct_status"] = "measured"
+
         return {
             "as_of": date.today().isoformat(),
             "net_worth": round(asset_total + debt_total, 2),
+            "concentration": concentration,
             "assets_total": asset_total,
             "debts_total": debt_total,
             "cash": cash_total,
