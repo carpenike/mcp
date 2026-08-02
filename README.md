@@ -191,6 +191,9 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
 | Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only) |
 | Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
+| Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
+| Finances docs | `finances_decision_append` | Append a dated entry to DECISIONS.md (newest-first), commit and push. Append-only |
+| Finances docs | `finances_planned_append` | Append a row to PLANNED.md's spending queue, commit and push. Append-only |
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
@@ -307,6 +310,28 @@ transaction would be unfixable through this interface. "Starting Balance" rows
 (Actual's opening-balance entries) are kept out of the uncategorized worklist by
 default: they are not decisions to make, and categorizing one on an on-budget
 account would inject a phantom five-figure "spend".
+
+### Governance docs (MCP resources)
+
+The finances repo's reasoning — PLAN.md's targets and guardrails, DECISIONS.md's
+dated log of *why* — is served as `finances://` resources from a private clone
+the server keeps lazily fresh. A session that can read the ledger but not the
+plan gives advice the household has already considered and rejected.
+
+- **Resource access is scoped separately from tools.** Resources are
+  URI-addressed, so `restricted_scope_resources` maps a scope to allowed URI
+  prefixes. `advisor` gets `finances://`; **hermes gets nothing** — a
+  restricted scope with no entry is denied, fail-closed. Before this the
+  middleware ignored `resources/*` entirely and any authenticated token could
+  have read every document.
+- **A failed `git pull` never becomes an error.** The cached copy is served
+  with a leading `> **STALE:**` warning (and `stale: true` from the tool), so
+  the caller can say so rather than quoting a possibly-outdated figure.
+- **Append-only, two shapes, two files.** There is no doc-editing tool and no
+  path that writes PLAN.md: restructuring a governance document is
+  session-with-git work where a human sees the diff.
+- The token needs `contents: write` for the append tools; a read-only token
+  serves the docs and fails those two explicitly.
 
 ### Restricted credentials (tool allowlisting)
 

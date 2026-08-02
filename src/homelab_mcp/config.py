@@ -468,6 +468,47 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Finances governance docs (git repo) ──────────────────────────
+    finances_repo_url: str = Field(
+        default="",
+        description=(
+            "HTTPS clone URL of the finances governance repo, e.g. "
+            "'https://github.com/carpenike/finances.git'. Empty disables the "
+            "finances:// resources and the append tools."
+        ),
+    )
+    finances_repo_path: str = Field(
+        default="/var/lib/homelab-mcp/finances",
+        description=(
+            "Local checkout the server keeps lazily fresh. Lives in the "
+            "systemd StateDirectory (0700) because the repo is private and "
+            "holds household financial planning."
+        ),
+    )
+    finances_repo_token: str = Field(
+        default="",
+        description=(
+            "GitHub token for the finances repo. SECRET — supply via the "
+            "sops-managed EnvironmentFile (HOMELAB_MCP_FINANCES_REPO_TOKEN). "
+            "NOTE: reading the docs needs only `contents: read`, but "
+            "finances_decision_append and finances_planned_append PUSH, so "
+            "they require `contents: write`. With a read-only token the docs "
+            "still serve and the two append tools fail with an explicit "
+            "permission error rather than silently. Passed to git through the "
+            "environment via a credential helper, never in argv."
+        ),
+    )
+    finances_repo_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=86400,
+        description=(
+            "How long the checkout is served before the next access triggers a "
+            "`git pull`. A pull failure never fails the read: the cached copy "
+            "is served with an explicit staleness warning instead."
+        ),
+    )
+
     # ── Paperless-ngx ────────────────────────────────────────────────
     paperless_base_url: str = Field(
         default="",
@@ -522,6 +563,21 @@ class Settings(BaseSettings):
     )
 
     # ── Restricted-scope clients (hermes-agent) ──────────────────────
+    restricted_scope_resources: dict[str, list[str]] = Field(
+        default={
+            # Interactive advisor sessions read the governance docs. hermes
+            # does NOT: its context is baked into its persona, and the pulse
+            # composes from numbers, not from the plan's prose.
+            "advisor": ["finances://"],
+        },
+        description=(
+            "Map of scope name -> URI prefixes a token carrying that scope may "
+            "list and read. Resources are URI-addressed rather than named like "
+            "tools, so they need their own map. A restricted scope with NO "
+            "entry here gets NO resources — fail closed. Tokens with no "
+            "restricted scope are unaffected. Env value is a JSON object."
+        ),
+    )
     restricted_scopes: dict[str, list[str]] = Field(
         default={
             # hermes-agent composes the weekly pulse and delivers it through its
@@ -554,6 +610,9 @@ class Settings(BaseSettings):
                 "finances_subscriptions",
                 "finances_net_worth",
                 "finances_payoff_projection",
+                "finances_docs_get",
+                "finances_decision_append",
+                "finances_planned_append",
                 "paperless_search",
                 "paperless_get",
                 "paperless_link",

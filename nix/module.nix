@@ -36,6 +36,7 @@
 #         # HOMELAB_MCP_FINANCES_FLOOR            = "8400";
 #         # No mortgage setting: it is a synced off-budget account in Actual,
 #         # so finances_debt_status reads it like every other balance.
+#         HOMELAB_MCP_FINANCES_REPO_URL         = "https://github.com/carpenike/finances.git";
 #         HOMELAB_MCP_PAPERLESS_BASE_URL        = "https://paperless.holthome.net";
 #         HOMELAB_MCP_SIGNAL_BASE_URL           = "http://127.0.0.1:8484";
 #         HOMELAB_MCP_SIGNAL_NUMBER             = "<E.164 registered number>";
@@ -165,6 +166,14 @@ in
             Must equal the sidecar's own SIDECAR_TOKEN. Defense in depth
             behind the loopback bind: without it any local process could
             read the household budget off the sidecar port.
+          HOMELAB_MCP_FINANCES_REPO_TOKEN=<GitHub token for the finances repo>
+            Reading the governance docs needs only `contents: read`, but
+            finances_decision_append and finances_planned_append PUSH, so they
+            require `contents: write`. With a read-only token the docs still
+            serve and those two tools fail with an explicit permission error
+            rather than silently. Passed to git via the environment, never in
+            argv. A fine-grained PAT scoped to carpenike/finances alone is the
+            least-privilege choice.
           HOMELAB_MCP_PAPERLESS_TOKEN=<paperless-ngx API token>
             Use a DEDICATED token for a least-privilege `homelab-mcp`
             service user (Django admin -> Tokens, or
@@ -309,6 +318,9 @@ in
         # Created on first start; WAL mode adds -wal/-shm sidecars. Lives
         # in the same StateDirectory (implicitly in ReadWritePaths).
         HOMELAB_MCP_OAUTH_STATE_DB_PATH = "/var/lib/homelab-mcp/state.db";
+        # Private clone of the finances governance repo, kept lazily fresh.
+        # Inside the 0700 StateDirectory: it holds household financial planning.
+        HOMELAB_MCP_FINANCES_REPO_PATH = "/var/lib/homelab-mcp/finances";
       } // lib.mapAttrs (_n: v: toString v) cfg.settings;
 
       serviceConfig = {

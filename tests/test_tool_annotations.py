@@ -122,6 +122,11 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     "finances_subscriptions": (True, False, True),
     "finances_net_worth": (True, False, True),
     "finances_payoff_projection": (True, False, True),
+    # ── finances governance docs (git repo) ──────────────────────────
+    "finances_docs_get": (True, False, True),
+    # each call appends a NEW entry and pushes, so not repeat-safe
+    "finances_decision_append": (False, False, False),
+    "finances_planned_append": (False, False, False),
     # ── paperless ────────────────────────────────────────────────────
     "paperless_search": (True, False, True),
     "paperless_get": (True, False, True),
