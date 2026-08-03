@@ -11,13 +11,14 @@ import asyncio
 import re
 import subprocess
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from homelab_mcp.config import Settings
-from homelab_mcp.tools.finances_docs import DOCS, Repo, register
+from homelab_mcp.tools.finances_docs import DOCS, Repo, parse_ticklers, register
 
 DECISIONS = """# Decision Log
 
@@ -39,6 +40,20 @@ PLANNED = """# Planned Spending — the queue
 ## Rules of the queue
 
 1. Nothing here is bought on credit.
+"""
+
+
+TICKLERS = """# Ticklers — future-dated reminders the sentinel checks every morning
+
+_Strict table format — the parser depends on it._
+
+| id | due | status | message |
+|---|---|---|---|
+| buffer-floor | 2026-10-29 | open | October advance should have landed |
+| usaa-auto-reprice | 2026-11-10 | open | USAA auto policy reprices ~now |
+| kubota-sax-rolloff | 2026-11-20 | open | Kubota + sax financing should be done |
+| irs-estimated-q4 | 2026-12-30 | open | Q4 estimated payment due mid-January |
+| pat-renewal | 2027-07-01 | open | GitHub PAT expires ~Aug 2027 — renew early |
 """
 
 
@@ -67,7 +82,11 @@ def repo_pair(tmp_path: Path) -> tuple[Path, Path]:
     work.mkdir()
     _git("init", "-q", "-b", "main", cwd=work)
     for name in DOCS:
-        body = {"DECISIONS.md": DECISIONS, "PLANNED.md": PLANNED}.get(name, f"# {name}\n")
+        body = {
+            "DECISIONS.md": DECISIONS,
+            "PLANNED.md": PLANNED,
+            "TICKLERS.md": TICKLERS,
+        }.get(name, f"# {name}\n")
         (work / name).write_text(body)
     _git("add", ".", cwd=work)
     _git("commit", "-qm", "seed", cwd=work)
@@ -118,12 +137,12 @@ def _mk(repo_pair: tuple[Path, Path]) -> CapturingMCP:
 # ── resources ─────────────────────────────────────────────────────────
 
 
-def test_all_seven_docs_are_registered(repo_pair: tuple[Path, Path]) -> None:
+def test_every_doc_is_registered_as_a_resource(repo_pair: tuple[Path, Path]) -> None:
     mcp = _mk(repo_pair)
     assert set(mcp.resources) == {f"finances://{d}" for d in DOCS}
-    # The two added 2026-08-02 must be among them.
     assert "finances://OPERATIONS.md" in mcp.resources
     assert "finances://PLANNED.md" in mcp.resources
+    assert "finances://TICKLERS.md" in mcp.resources
 
 
 async def test_resource_returns_current_content(repo_pair: tuple[Path, Path]) -> None:
@@ -298,3 +317,211 @@ def test_token_never_appears_in_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     (tmp_path / "c" / ".git").mkdir(parents=True)
     repo.refresh(force=True)
     assert seen, "expected a git invocation"
+
+
+# ── ticklers ──────────────────────────────────────────────────────────
+
+TODAY = date(2026, 8, 3)
+
+
+def test_parser_reads_the_seeded_table() -> None:
+    out = parse_ticklers(TICKLERS, TODAY)
+    assert [r["id"] for r in out["ticklers"]] == [
+        "buffer-floor",
+        "usaa-auto-reprice",
+        "kubota-sax-rolloff",
+        "irs-estimated-q4",
+        "pat-renewal",
+    ]
+    assert out["malformed"] == []
+    # Earliest is 2026-10-29 — nothing is due yet.
+    assert out["due"] == []
+    assert out["ticklers"][0]["days_until_due"] == 87
+
+
+def test_header_and_delimiter_are_not_data() -> None:
+    """The '|---|' separator must not be mistaken for a broken row."""
+    assert parse_ticklers(TICKLERS, TODAY)["malformed"] == []
+
+
+@pytest.mark.parametrize(
+    ("row", "reason_contains"),
+    [
+        ("| only-three | 2026-01-01 | open |", "found 3"),
+        ("| too | many | 2026-01-01 | open | cells |", "found 5"),
+        ("| bad-date | 29-10-2026 | open | message |", "not YYYY-MM-DD"),
+        ("| bad-date | someday | open | message |", "not YYYY-MM-DD"),
+        ("|  | 2026-01-01 | open | message |", "empty id"),
+        ("| no-status | 2026-01-01 |  | message |", "empty status"),
+        ("| no-message | 2026-01-01 | open |  |", "empty message"),
+    ],
+)
+def test_malformed_rows_are_reported_never_dropped(row: str, reason_contains: str) -> None:
+    """A tickler that fails to parse is a reminder that will never fire."""
+    out = parse_ticklers(TICKLERS + row + "\n", TODAY)
+    assert len(out["ticklers"]) == 5  # the good rows still parse
+    assert len(out["malformed"]) == 1
+    assert reason_contains in out["malformed"][0]["reason"]
+    assert out["malformed"][0]["raw"].startswith("|")
+
+
+def test_duplicate_ids_are_reported_rather_than_silently_deduped() -> None:
+    out = parse_ticklers(TICKLERS + "| pat-renewal | 2027-01-01 | open | dupe |\n", TODAY)
+    assert len(out["malformed"]) == 1
+    assert "duplicate id" in out["malformed"][0]["reason"]
+
+
+def test_due_is_open_and_dated_today_or_earlier() -> None:
+    extra = (
+        "| yesterday | 2026-08-02 | open | should surface |\n"
+        "| today | 2026-08-03 | open | should surface |\n"
+        "| tomorrow | 2026-08-04 | open | should not |\n"
+        "| already-done | 2026-01-01 | done | closed, stays for history |\n"
+        "| snoozed | 2026-01-01 | snoozed | not open |\n"
+    )
+    out = parse_ticklers(TICKLERS + extra, TODAY)
+    assert [r["id"] for r in out["due"]] == ["yesterday", "today"]
+    # Non-open rows are still parsed and returned in the full listing.
+    assert {"already-done", "snoozed"} <= {r["id"] for r in out["ticklers"]}
+
+
+def test_status_matching_is_case_insensitive() -> None:
+    out = parse_ticklers(TICKLERS + "| shouty | 2026-01-01 | OPEN | yes |\n", TODAY)
+    assert [r["id"] for r in out["due"]] == ["shouty"]
+
+
+def test_escaped_pipe_survives_a_round_trip() -> None:
+    out = parse_ticklers(TICKLERS + r"| piped | 2026-01-01 | open | a \| b |" + "\n", TODAY)
+    assert out["malformed"] == []
+    assert next(r for r in out["ticklers"] if r["id"] == "piped")["message"] == "a | b"
+
+
+async def test_ticklers_tool_defaults_to_due_only(repo_pair: tuple[Path, Path]) -> None:
+    out = await _mk(repo_pair).tools["finances_ticklers"]()
+    assert out["due_only"] is True
+    assert out["ticklers"] == []  # earliest is 2026-10-29
+    assert out["total_count"] == 5  # but all five parsed
+    assert out["due_count"] == 0
+    assert out["timezone"] == "America/New_York"
+    assert out["stale"] is False
+
+
+async def test_ticklers_tool_full_listing(repo_pair: tuple[Path, Path]) -> None:
+    out = await _mk(repo_pair).tools["finances_ticklers"](due_only=False)
+    assert len(out["ticklers"]) == 5
+    assert out["ticklers"][0]["id"] == "buffer-floor"
+
+
+async def test_malformed_surfaces_even_when_due_only(repo_pair: tuple[Path, Path]) -> None:
+    """A row we cannot read cannot be known to be un-due."""
+    remote, checkout = repo_pair
+    mcp = _mk(repo_pair)
+    await mcp.tools["finances_ticklers"]()  # clone
+    path = checkout / "TICKLERS.md"
+    path.write_text(path.read_text() + "| broken | not-a-date | open | oh no |\n")
+    out = await mcp.tools["finances_ticklers"]()
+    assert out["ticklers"] == []
+    assert len(out["malformed"]) == 1
+    assert "not YYYY-MM-DD" in out["malformed"][0]["reason"]
+
+
+# ── tickler_append ────────────────────────────────────────────────────
+
+
+async def test_tickler_append_round_trips_to_the_remote(
+    repo_pair: tuple[Path, Path],
+) -> None:
+    remote, checkout = repo_pair
+    mcp = _mk(repo_pair)
+    out = await mcp.tools["finances_tickler_append"](
+        id="new-thing", due="2026-09-30", message="check the thing"
+    )
+    assert out["appended"] is True
+    assert out["status"] == "open"
+    assert out["row"] == "| new-thing | 2026-09-30 | open | check the thing |"
+
+    # It is really on the remote, not just locally. Off-thread: this test is
+    # async and a blocking subprocess would stall the loop.
+    landed = (
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "show", "HEAD:TICKLERS.md"],
+            cwd=remote,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    ).stdout
+    assert "| new-thing | 2026-09-30 | open | check the thing |" in landed
+    # And it parses back out as a real tickler.
+    back = parse_ticklers(landed, date(2026, 10, 1))
+    assert next(r for r in back["ticklers"] if r["id"] == "new-thing")["is_due"] is True
+
+
+async def test_tickler_append_lands_inside_the_table(repo_pair: tuple[Path, Path]) -> None:
+    mcp = _mk(repo_pair)
+    await mcp.tools["finances_tickler_append"](id="appended", due="2027-01-01", message="last row")
+    out = await mcp.tools["finances_ticklers"](due_only=False)
+    assert [r["id"] for r in out["ticklers"]][-1] == "appended"
+    assert out["malformed"] == []
+
+
+async def test_tickler_append_rejects_a_duplicate_id(repo_pair: tuple[Path, Path]) -> None:
+    mcp = _mk(repo_pair)
+    out = await mcp.tools["finances_tickler_append"](
+        id="pat-renewal", due="2027-01-01", message="dupe"
+    )
+    assert out["error"]["code"] == "finances_duplicate_tickler"
+
+
+@pytest.mark.parametrize(
+    "bad_id", ["Has Caps", "under_score", "trailing-", "-leading", "has space", ""]
+)
+async def test_tickler_append_rejects_bad_ids(repo_pair: tuple[Path, Path], bad_id: str) -> None:
+    mcp = _mk(repo_pair)
+    out = await mcp.tools["finances_tickler_append"](id=bad_id, due="2027-01-01", message="x")
+    assert out["error"]["code"] == "finances_bad_tickler_id"
+
+
+async def test_tickler_append_rejects_a_bad_due_date(repo_pair: tuple[Path, Path]) -> None:
+    mcp = _mk(repo_pair)
+    out = await mcp.tools["finances_tickler_append"](id="whenever", due="next tuesday", message="x")
+    assert out["error"]["code"] == "finances_bad_due_date"
+
+
+async def test_tickler_append_escapes_a_pipe_rather_than_corrupting_the_table(
+    repo_pair: tuple[Path, Path],
+) -> None:
+    mcp = _mk(repo_pair)
+    await mcp.tools["finances_tickler_append"](
+        id="pipey", due="2027-01-01", message="rate is 5|6 percent"
+    )
+    out = await mcp.tools["finances_ticklers"](due_only=False)
+    assert out["malformed"] == []
+    assert next(r for r in out["ticklers"] if r["id"] == "pipey")["message"] == (
+        "rate is 5|6 percent"
+    )
+
+
+async def test_tickler_append_refuses_on_a_stale_checkout(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Appending onto a stale checkout risks a lost reminder."""
+    mcp = _mk(repo_pair)
+    await mcp.tools["finances_ticklers"]()  # clone first
+    monkeypatch.setattr(Repo, "refresh", lambda self, force=False: "remote unreachable")
+    out = await mcp.tools["finances_tickler_append"](id="doomed", due="2027-01-01", message="x")
+    assert out["error"]["code"] == "finances_repo_stale"
+
+
+async def test_no_tool_can_mark_a_tickler_done(repo_pair: tuple[Path, Path]) -> None:
+    """Acknowledgement is meant to cost one deliberate human edit."""
+    names = set(_mk(repo_pair).tools)
+    assert names & {"finances_ticklers", "finances_tickler_append"}
+    for forbidden in (
+        "finances_tickler_done",
+        "finances_tickler_update",
+        "finances_tickler_snooze",
+        "finances_tickler_delete",
+    ):
+        assert forbidden not in names

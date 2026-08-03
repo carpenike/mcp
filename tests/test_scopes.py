@@ -40,7 +40,7 @@ def _settings() -> Settings:
 # ── allowlist resolution ─────────────────────────────────────────────
 
 
-def test_hermes_scope_resolves_to_exactly_four_tools() -> None:
+def test_hermes_scope_resolves_to_its_allowlist() -> None:
     allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
     assert allowed == HERMES_TOOLS
 
@@ -261,6 +261,11 @@ ADVISOR_DOCS = {
     "finances_planned_append",
 }
 
+# The morning sentinel must see what has come due, so the reader is in BOTH
+# scopes; scheduling a reminder stays a human/advisor act.
+TICKLERS_SHARED = {"finances_ticklers"}
+TICKLERS_ADVISOR_ONLY = {"finances_tickler_append"}
+
 ADVISOR_ADDED_V2 = {
     "finances_payees",
     "finances_payee_merge",
@@ -294,6 +299,8 @@ ADVISOR_TOOLS = {
     *ADVISOR_DOCS,
     *CONTEXT_SHARED,
     *CONTEXT_ADVISOR_ONLY,
+    *TICKLERS_SHARED,
+    *TICKLERS_ADVISOR_ONLY,
 }
 
 # Everything the advisor layer added. hermes must reach none of it.
@@ -326,20 +333,24 @@ HERMES_TOOLS = {
     "finances_debt_status",
     *HERMES_ADDED_V2,
     *CONTEXT_SHARED,
+    *TICKLERS_SHARED,
 }
 
 
-def test_hermes_scope_is_exactly_its_ten() -> None:
-    """Seven reads plus the three context tools it may scribe/read with."""
+def test_hermes_scope_is_exactly_its_eleven() -> None:
+    """Seven reads, the three context tools it scribes with, and the ticklers."""
     allowed = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
     assert allowed == HERMES_TOOLS
-    assert len(allowed) == 10
+    assert len(allowed) == 11
 
 
 @pytest.mark.parametrize(
     "tool",
     sorted(
-        (ADVISOR_ADDED_V2 | ADVISOR_DOCS | CONTEXT_ADVISOR_ONLY) - HERMES_ADDED_V2 - CONTEXT_SHARED
+        (ADVISOR_ADDED_V2 | ADVISOR_DOCS | CONTEXT_ADVISOR_ONLY | TICKLERS_ADVISOR_ONLY)
+        - HERMES_ADDED_V2
+        - CONTEXT_SHARED
+        - TICKLERS_SHARED
     ),
 )
 def test_hermes_is_403_on_every_advisor_only_tool(tool: str) -> None:
@@ -508,3 +519,34 @@ def test_context_tools_do_not_grant_ledger_writes_to_hermes() -> None:
     """The store is not a side door into Actual."""
     for tool in ("finances_categorize", "finances_rule_create", "finances_payee_merge"):
         assert _call(_app("hermes"), tool).status_code == 403
+
+
+# ── ticklers scoping ──────────────────────────────────────────────────
+
+
+def test_hermes_may_read_ticklers() -> None:
+    """The sentinel cannot raise what is due if it cannot see the file."""
+    assert _call(_app("hermes"), "finances_ticklers").status_code == 200
+
+
+def test_hermes_may_not_schedule_a_tickler() -> None:
+    """Scheduling a reminder is a human/advisor act, not an unattended one."""
+    resp = _call(_app("hermes"), "finances_tickler_append")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == -32601
+
+
+@pytest.mark.parametrize("tool", ["finances_ticklers", "finances_tickler_append"])
+def test_advisor_may_do_both(tool: str) -> None:
+    assert _call(_app("advisor"), tool).status_code == 200
+
+
+def test_ticklers_is_visible_in_both_catalogs() -> None:
+    """A tool the agent cannot see is a tool it will never call."""
+    for scope in ("hermes", "advisor"):
+        allowed = resolve_allowlist({"scope": scope}, _settings().restricted_scopes)
+        assert allowed is not None
+        assert "finances_ticklers" in allowed
+    hermes = resolve_allowlist({"scope": "hermes"}, _settings().restricted_scopes)
+    assert hermes is not None
+    assert "finances_tickler_append" not in hermes

@@ -5,13 +5,19 @@ targets and guardrails, DECISIONS.md's dated log of why, PULSE.md's contract
 for what the weekly message says. A session that can read the ledger but not
 the plan gives advice the household has already considered and rejected.
 
-Two append tools write back, because a decision made in a session that never
-reaches DECISIONS.md is a decision the next session will re-litigate, and a
-want that isn't frictionless to queue gets bought instead of queued.
+Three append tools write back, because a decision made in a session that never
+reaches DECISIONS.md is a decision the next session will re-litigate, a want
+that isn't frictionless to queue gets bought instead of queued, and something
+that needs revisiting in November is otherwise trusted to memory.
+
+TICKLERS.md is the one doc read as *data* rather than prose: the morning
+sentinel asks it what has come due. Nothing here marks a tickler done — that
+stays a deliberate human edit, so acknowledging a reminder costs a moment's
+attention rather than happening as a side effect of being mentioned.
 
 Deliberately narrow. There is no doc *editing* tool and no path that writes
 PLAN.md: restructuring a governance document is session-with-git work where a
-human sees the diff. These two tools append, in one documented shape each, to
+human sees the diff. These tools append, in one documented shape each, to
 one file each.
 
 Shelling out (AGENTS.md rule 3): every git invocation uses subprocess with
@@ -32,9 +38,10 @@ import shutil
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
+from zoneinfo import ZoneInfo
 
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -70,26 +77,47 @@ DOCS: tuple[str, ...] = (
     "OPERATIONS.md",
     "PLANNED.md",
     "ARCHITECTURE.md",
+    "TICKLERS.md",
 )
 RESOURCE_SCHEME = "finances"
 
 DECISIONS_DOC = "DECISIONS.md"
 PLANNED_DOC = "PLANNED.md"
+TICKLERS_DOC = "TICKLERS.md"
 LANES = ("WANT", "PROJECT", "MAINTENANCE")
+
+# The household runs on Eastern time, and "is this due today?" must not depend
+# on where the server happens to be. date.today() would silently answer in the
+# host's zone — right on forge today, wrong the moment anything moves.
+HOUSEHOLD_TZ = ZoneInfo("America/New_York")
+TICKLER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,58}[a-z0-9]$")
+
+
+def household_today() -> date:
+    return datetime.now(HOUSEHOLD_TZ).date()
+
 
 INSTRUCTIONS = """\
 The finances repo's governance docs are available as `finances://` resources
 (PLAN.md, DECISIONS.md, PULSE.md, REVIEW.md, OPERATIONS.md, PLANNED.md,
-ARCHITECTURE.md). Read PLAN.md before giving any financial advice — it holds
-the targets, the guardrails and the decisions already made, and advice that
-contradicts it has usually already been considered and rejected.
+ARCHITECTURE.md, TICKLERS.md). Read PLAN.md before giving any financial advice
+— it holds the targets, the guardrails and the decisions already made, and
+advice that contradicts it has usually already been considered and rejected.
 
 Content carries a `stale` flag when the local checkout could not be refreshed.
 Say so rather than quoting a possibly-outdated figure as current.
 
-`finances_decision_append` and `finances_planned_append` are append-only and
-push immediately. Use them so a decision reached in conversation survives into
-the next session, and so adding a want stays frictionless.
+`finances_decision_append`, `finances_planned_append` and
+`finances_tickler_append` are append-only and push immediately. Use them so a
+decision reached in conversation survives into the next session, so adding a
+want stays frictionless, and so anything that needs revisiting on a date gets
+scheduled instead of remembered.
+
+`finances_ticklers` answers "is there anything to raise today?". An empty list
+is the normal answer and needs no comment. Rows under `malformed` are reminders
+that will NOT fire — surface them, because the failure is otherwise invisible
+until the day it mattered. Nothing marks a tickler done: acknowledging one is a
+deliberate edit to the file, which is what keeps the nag honest.
 """
 
 
@@ -112,6 +140,84 @@ _TLS_ENV = (
 
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
+
+
+def _split_row(line: str) -> list[str]:
+    """Cells of a markdown table row, honouring the `\\|` escape."""
+    body = line.strip().strip("|")
+    # Split on pipes that aren't backslash-escaped, then unescape.
+    return [c.strip().replace(r"\|", "|") for c in re.split(r"(?<!\\)\|", body)]
+
+
+def parse_ticklers(text: str, today: date) -> dict[str, Any]:
+    """Parse TICKLERS.md's table into rows, malformed rows, and what's due.
+
+    Every line that looks like a table row is accounted for in exactly one of
+    `ticklers` or `malformed`. A tickler is a reminder someone scheduled for a
+    future self; one that silently fails to parse is a reminder that will never
+    fire, and the failure surfaces on the day it was needed and no earlier. So
+    a row we cannot read is reported loudly rather than skipped.
+    """
+    rows: list[dict[str, Any]] = []
+    malformed: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line.startswith("|"):
+            continue
+        cells = _split_row(line)
+        # The header and its delimiter are structure, not data.
+        if [c.lower() for c in cells[:4]] == ["id", "due", "status", "message"]:
+            continue
+        if all(set(c) <= {"-", ":"} and c for c in cells):
+            continue
+
+        def bad(reason: str, ln: int = lineno, text: str = line) -> None:
+            malformed.append({"line": ln, "reason": reason, "raw": text[:300]})
+
+        if len(cells) != 4:
+            bad(f"expected 4 cells (id | due | status | message), found {len(cells)}")
+            continue
+        tid, due_raw, status_raw, message = cells
+        if not tid:
+            bad("empty id")
+            continue
+        try:
+            due = date.fromisoformat(due_raw)
+        except ValueError:
+            bad(f"due date {due_raw!r} is not YYYY-MM-DD")
+            continue
+        status = status_raw.lower()
+        if not status:
+            bad("empty status")
+            continue
+        if not message:
+            bad("empty message")
+            continue
+        # Duplicate ids are reported, not deduped: which one wins would be an
+        # arbitrary choice, and both are still real reminders.
+        if tid in seen:
+            bad(f"duplicate id {tid!r} (also on line {seen[tid]})")
+            continue
+        seen[tid] = lineno
+        rows.append(
+            {
+                "id": tid,
+                "due": due.isoformat(),
+                "status": status,
+                "message": message,
+                "line": lineno,
+                "is_due": status == "open" and due <= today,
+                "days_until_due": (due - today).days,
+            }
+        )
+
+    return {
+        "ticklers": rows,
+        "malformed": malformed,
+        "due": [r for r in rows if r["is_due"]],
+    }
 
 
 class Repo:
@@ -399,6 +505,158 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "title": clean_title,
             "revision": result.get("head"),
             "anchor": f"#{date.today().isoformat()}-{_slug(clean_title)}",
+        }
+
+    # ── ticklers ──────────────────────────────────────────────────────
+    @mcp.tool(
+        annotations=_RO,
+        name="finances_ticklers",
+        description=(
+            "Future-dated reminders from TICKLERS.md. Call this every morning: "
+            "with due_only=true (the default) it returns only rows whose status "
+            "is 'open' and whose due date has arrived in America/New_York — "
+            "usually an empty list, which means there is nothing to say. A row "
+            "keeps being returned every day until a human or an advisor session "
+            "edits its status, and that repetition is intentional: the reminder "
+            "was scheduled precisely so it would not be forgotten. Use "
+            "due_only=false to review the whole schedule. Rows that could not "
+            "be parsed come back under `malformed` — treat those as reminders "
+            "that will not fire, and say so, because a tickler nobody can read "
+            "is a promise silently broken. No tool marks a tickler done; that "
+            "is a deliberate file edit by design."
+        ),
+    )
+    async def ticklers(
+        due_only: Annotated[
+            bool,
+            Field(description="Only rows that are open and due today or earlier."),
+        ] = True,
+    ) -> dict[str, Any]:
+        try:
+            _require()
+            content, stale = await asyncio.to_thread(repo.read, TICKLERS_DOC)
+        except ToolError as err:
+            return err.payload()
+        today = household_today()
+        parsed = parse_ticklers(content, today)
+        rows = parsed["due"] if due_only else parsed["ticklers"]
+        return {
+            "as_of": today.isoformat(),
+            "timezone": "America/New_York",
+            "due_only": due_only,
+            "ticklers": rows,
+            "due_count": len(parsed["due"]),
+            "total_count": len(parsed["ticklers"]),
+            # Always reported, whatever due_only says: a row that failed to
+            # parse cannot be known to be un-due.
+            "malformed": parsed["malformed"],
+            "stale": stale is not None,
+            "stale_reason": stale,
+            "revision": repo.head(),
+        }
+
+    @mcp.tool(
+        annotations=_APPEND,
+        name="finances_tickler_append",
+        description=(
+            "Schedule a future-dated reminder in TICKLERS.md and push it. Use "
+            "this whenever something needs revisiting on a date rather than "
+            "now — a rate that reprices, a loan that rolls off, a token that "
+            "expires, a decision deferred until a number is known. The row is "
+            "created with status 'open'; from the due date onward the morning "
+            "sentinel surfaces it daily until a human edits the status. The id "
+            "must be unique, lowercase and hyphenated. Append-only: it cannot "
+            "edit, complete or remove an existing tickler."
+        ),
+    )
+    async def tickler_append(
+        id: Annotated[  # noqa: A002 - matches the column name in TICKLERS.md
+            str,
+            Field(description="Unique lowercase-hyphenated key, e.g. 'usaa-auto-reprice'."),
+        ],
+        due: Annotated[str, Field(description="Date it should surface, 'YYYY-MM-DD'.")],
+        message: Annotated[
+            str,
+            Field(min_length=3, description="What the future reader needs to know and do."),
+        ],
+    ) -> dict[str, Any]:
+        try:
+            _require()
+            tid = id.strip().lower()
+            if not TICKLER_ID_RE.match(tid):
+                raise ToolError(
+                    "finances_bad_tickler_id",
+                    f"id {id!r} must be lowercase letters, digits and hyphens.",
+                    "For example: 'usaa-auto-reprice'.",
+                )
+            try:
+                due_date = date.fromisoformat(due.strip())
+            except ValueError as exc:
+                raise ToolError(
+                    "finances_bad_due_date", f"due {due!r} must be 'YYYY-MM-DD'.", ""
+                ) from exc
+            clean_message = " ".join(message.strip().split())
+            if not clean_message:
+                raise ToolError("finances_bad_tickler", "message must not be empty.", "")
+
+            stale = await asyncio.to_thread(repo.refresh, True)
+            if stale:
+                raise ToolError(
+                    "finances_repo_stale",
+                    "Refusing to append: " + stale,
+                    "Appending onto a stale checkout risks a push conflict or a "
+                    "lost reminder. Resolve the checkout first.",
+                )
+
+            path = repo.path / TICKLERS_DOC
+            text = path.read_text(encoding="utf-8")
+            existing = parse_ticklers(text, household_today())
+            if any(r["id"] == tid for r in existing["ticklers"]):
+                raise ToolError(
+                    "finances_duplicate_tickler",
+                    f"A tickler with id {tid!r} already exists.",
+                    "Pick another id, or edit the existing row directly to reschedule it.",
+                )
+
+            lines = text.splitlines()
+            try:
+                header = next(
+                    i
+                    for i, ln in enumerate(lines)
+                    if ln.startswith("|")
+                    and [c.lower() for c in _split_row(ln)[:2]] == ["id", "due"]
+                )
+            except StopIteration as exc:
+                raise ToolError(
+                    "finances_table_not_found",
+                    "Could not find the tickler table in TICKLERS.md.",
+                    "Its header row must be '| id | due | status | message |'.",
+                ) from exc
+            end = header + 1
+            while end + 1 < len(lines) and lines[end + 1].startswith("|"):
+                end += 1
+            # A literal pipe would split the cell and corrupt the table — the
+            # parser would then report this very row as malformed.
+            safe_message = clean_message.replace("|", r"\|")
+            row = f"| {tid} | {due_date.isoformat()} | open | {safe_message} |"
+            lines.insert(end + 1, row)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            result = await asyncio.to_thread(
+                repo.commit_and_push, TICKLERS_DOC, f"tickler: {tid} ({due_date.isoformat()})"
+            )
+        except ToolError as err:
+            return err.payload()
+        audit.info("finances_tickler_append id=%s due=%s", tid, due_date.isoformat())
+        return {
+            "appended": True,
+            "document": TICKLERS_DOC,
+            "id": tid,
+            "due": due_date.isoformat(),
+            "status": "open",
+            "message": clean_message,
+            "row": row,
+            "days_until_due": (due_date - household_today()).days,
+            "revision": result.get("head"),
         }
 
     @mcp.tool(

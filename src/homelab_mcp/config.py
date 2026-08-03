@@ -641,6 +641,8 @@ class Settings(BaseSettings):
                 "finances_clarify_candidates",
                 "finances_decision_append",
                 "finances_planned_append",
+                "finances_ticklers",
+                "finances_tickler_append",
                 "paperless_search",
                 "paperless_get",
                 "paperless_link",
@@ -664,6 +666,9 @@ class Settings(BaseSettings):
                 "finances_context_add",
                 "finances_context_list",
                 "finances_clarify_candidates",
+                # Read-only: the morning sentinel must see what is due, but
+                # scheduling a reminder is a human/advisor act.
+                "finances_ticklers",
             ],
         },
         description=(
