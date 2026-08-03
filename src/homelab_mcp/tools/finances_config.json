@@ -26,6 +26,26 @@
     "  recurring    expected fixed obligations, checked against what posted."
   ],
   "hurdle_rate": 5.0,
+  "floor_excluded_categories": [
+    "Savings/Investments",
+    "Taxes"
+  ],
+  "_floor_excluded_categories_comment": [
+    "Categories that are ALLOCATION or OBLIGATION, not consumption, and so",
+    "are excluded from the floor comparator and reported separately.",
+    "PLAN.md's floor accounting puts these in bucket 3.",
+    "",
+    "Savings/Investments — counting a 529 or brokerage contribution as",
+    "spend would penalize exactly the behaviour the plan wants more of.",
+    "",
+    "Taxes — a prior-year balance or an estimated payment is an obligation",
+    "being settled, not a month's discretionary choice. The $19,116.32 IRS",
+    "payment of 2026-08-03 would otherwise read as a ~$19k overspend in the",
+    "first pulse both partners watch.",
+    "",
+    "One list, consumed by finances_monthly_summary AND finances_room via",
+    "the shared bucketing, so the two can never disagree about what counts."
+  ],
   "debts": {
     "_comment": [
       "rate              APR percent. null means UNKNOWN — the tool refuses to",

@@ -2799,3 +2799,139 @@ async def test_clarify_candidates_respects_max(
     assert out["returned"] == 1
     assert out["total"] == 2
     assert out["truncated"] is True
+
+
+# ── floor exclusions (allocation/obligation, not consumption) ─────────
+
+
+def _excl_cfg(tmp_path: Any, cats: list[str] | None = None, name: str = "excl.json") -> str:
+    cfg = tmp_path / name
+    body: dict[str, Any] = {
+        "recurring": {"items": []},
+        "buffer": {"cash_accounts": [], "card_accounts": []},
+    }
+    if cats is not None:
+        body["floor_excluded_categories"] = cats
+    cfg.write_text(json.dumps(body))
+    return str(cfg)
+
+
+def _excl_tools(tmp_path: Any, cats: list[str] | None = None, name: str = "excl.json") -> Any:
+    mcp = CapturingMCP()
+    register(
+        mcp,  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            oauth_required=False,
+            finances_sidecar_base_url=BASE,
+            finances_config_path=_excl_cfg(tmp_path, cats, name),
+            finances_floor=8400.0,
+        ),
+    )
+    return mcp.tools
+
+
+def _excl_categories() -> dict[str, Any]:
+    return {
+        "categories": [
+            {"id": "c1", "name": "Fixed", "group_name": "H", "is_income": False},
+            {"id": "c2", "name": "Savings/Investments", "group_name": "H", "is_income": False},
+            {"id": "c3", "name": "Taxes", "group_name": "H", "is_income": False},
+            {"id": "c4", "name": "Income", "group_name": "Income", "is_income": True},
+        ]
+    }
+
+
+def _excl_txns() -> list[dict[str, Any]]:
+    return [
+        _txn(id="a", date="2026-07-05", amount_cents=-100_000, category_name="Fixed"),
+        _txn(id="b", date="2026-07-06", amount_cents=-50_000, category_name="Savings/Investments"),
+        # The IRS prior-year balance payment.
+        _txn(id="t", date="2026-07-07", amount_cents=-1_911_632, category_name="Taxes"),
+    ]
+
+
+def _excl_mock(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_excl_categories())
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={"transactions": _excl_txns()},
+    )
+
+
+async def test_taxes_are_excluded_from_the_floor_comparator(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A tax obligation being settled is not a month's discretionary choice.
+
+    Without this a $19,116.32 prior-year balance reads as a ~$19k overspend.
+    """
+    _excl_mock(httpx_mock)
+    out = await _excl_tools(tmp_path)["finances_monthly_summary"](month="2026-07")
+    assert out["total_spend"] == pytest.approx(1000.0 + 500.0 + 19_116.32)
+    assert out["consumption_spend"] == 1000.0
+    assert out["taxes"] == pytest.approx(19_116.32)
+    assert out["savings_contributions"] == 500.0
+    # Reported, never silently dropped.
+    assert out["excluded_from_floor"]["Taxes"] == pytest.approx(19_116.32)
+    assert out["excluded_from_floor_total"] == pytest.approx(19_616.32)
+    assert out["gap_vs_floor"] == pytest.approx(1000.0 - 8400.0)
+
+
+async def test_room_excludes_the_same_categories(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    _excl_mock(httpx_mock)
+    out = await _excl_tools(tmp_path)["finances_room"]()
+    assert out["consumption_mtd"] == 1000.0
+    assert out["taxes_mtd"] == pytest.approx(19_116.32)
+    assert out["savings_mtd"] == 500.0
+    # Pace and room are untouched by the tax payment.
+    assert out["room_this_month"] == pytest.approx(8400.0 - 1000.0)
+
+
+async def test_both_tools_agree_on_the_exclusion_set(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """One config entry drives both, so they cannot drift apart.
+
+    The two tools share the bucketing via the v0.14.2 refactor; this asserts
+    the shared path actually holds rather than being two copies that agree
+    today by coincidence.
+    """
+    tools = _excl_tools(tmp_path)
+    _excl_mock(httpx_mock)
+    summary = await tools["finances_monthly_summary"](month="2026-07")
+    _excl_mock(httpx_mock)
+    room = await tools["finances_room"]()
+
+    assert summary["consumption_spend"] == room["consumption_mtd"]
+    assert summary["savings_contributions"] == room["savings_mtd"]
+    assert summary["taxes"] == room["taxes_mtd"]
+    assert set(summary["excluded_from_floor"]) == set(room["excluded_mtd"])
+    assert summary["excluded_from_floor"] == room["excluded_mtd"]
+
+
+async def test_exclusion_list_is_config_driven(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """Removing Taxes from config puts it straight back into consumption."""
+    _excl_mock(httpx_mock)
+    out = await _excl_tools(tmp_path, cats=["Savings/Investments"], name="savings_only.json")[
+        "finances_monthly_summary"
+    ](month="2026-07")
+    assert out["consumption_spend"] == pytest.approx(1000.0 + 19_116.32)
+    assert out["excluded_from_floor"] == {"Savings/Investments": 500.0}
+
+
+def test_shipped_config_excludes_savings_and_taxes() -> None:
+    cats = _shipped()["floor_excluded_categories"]
+    assert "Savings/Investments" in cats
+    assert "Taxes" in cats
+
+
+async def test_other_categories_are_unaffected(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    _excl_mock(httpx_mock)
+    out = await _excl_tools(tmp_path)["finances_monthly_summary"](month="2026-07")
+    by = {r["category"]: r["spend"] for r in out["spend_by_category"]}
+    # Still itemized in the breakdown — excluded from the comparator, not hidden.
+    assert by["Fixed"] == 1000.0
+    assert by["Taxes"] == pytest.approx(19_116.32)

@@ -201,6 +201,24 @@ def _is_account_setup(txn: dict[str, Any]) -> bool:
 
 
 SAVINGS_CATEGORY = "Savings/Investments"
+TAXES_CATEGORY = "Taxes"
+# Fallback when the config omits the list. Kept in sync with the shipped
+# config; the config is authoritative.
+DEFAULT_FLOOR_EXCLUDED: tuple[str, ...] = (SAVINGS_CATEGORY, TAXES_CATEGORY)
+
+
+def _floor_excluded(cfg: dict[str, Any]) -> list[str]:
+    """Categories that are allocation/obligation, not consumption.
+
+    ONE list, read by both finances_monthly_summary and finances_room, so the
+    two tools can never disagree about what the floor measures. PLAN.md's
+    floor accounting puts these in bucket 3: money going somewhere by
+    decision or obligation, not a discretionary choice this month.
+    """
+    raw = cfg.get("floor_excluded_categories")
+    if isinstance(raw, list) and raw:
+        return [str(x) for x in raw]
+    return list(DEFAULT_FLOOR_EXCLUDED)
 
 
 def _lumpy_monthly(cfg: dict[str, Any]) -> tuple[float, list[dict[str, Any]]]:
@@ -815,8 +833,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         # wealth-building, and counting it as spend would penalize exactly the
         # behaviour the plan wants more of — so it is reported beside the gap,
         # never inside it.
+        excluded_names = _floor_excluded(cfg)
+        excluded_by_category = {name: _d(by_category.get(name, 0)) for name in excluded_names}
+        excluded_cents = sum(by_category.get(name, 0) for name in excluded_names)
         savings_cents = by_category.get(SAVINGS_CATEGORY, 0)
-        consumption_cents = total_cents - savings_cents
+        taxes_cents = by_category.get(TAXES_CATEGORY, 0)
+        consumption_cents = total_cents - excluded_cents
         in_progress = first <= today <= last
         days_elapsed = (today - first).days + 1 if in_progress else (last - first).days + 1
         days_in_month = (last - first).days + 1
@@ -831,11 +853,16 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "total_spend": _d(total_cents),
             "consumption_spend": _d(consumption_cents),
             "savings_contributions": _d(savings_cents),
+            "taxes": _d(taxes_cents),
+            "excluded_from_floor": excluded_by_category,
+            "excluded_from_floor_total": _d(excluded_cents),
             "gap_basis": "consumption_spend",
             "gap_basis_note": (
-                f"The floor is compared against consumption only; the "
-                f"{SAVINGS_CATEGORY!r} category is reported separately rather "
-                "than counted as spend."
+                "The floor is compared against consumption only. These are "
+                "allocation or obligation rather than discretionary spend and "
+                "are reported separately, never silently dropped: "
+                + ", ".join(excluded_names)
+                + "."
             ),
             "uncategorized": _d(uncategorized_cents),
             "spend_by_category": [
@@ -2028,7 +2055,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         # definition of "variable spend" that could drift from this one.
         consumption_by_month: dict[str, int] = defaultdict(int)
         consumption_ids_by_month: dict[str, set[str]] = defaultdict(set)
-        savings_mtd = 0
+        # Same list finances_monthly_summary uses — one config entry, so the
+        # two tools cannot drift on what the floor measures.
+        excluded_names = _floor_excluded(cfg)
+        excluded_mtd: dict[str, int] = {}
         per_month_cat: dict[str, int] = defaultdict(int)
         cat_mtd = 0
         this_month = first.strftime("%Y-%m")
@@ -2039,9 +2069,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             in_month = first.isoformat() <= t["date"] <= last.isoformat()
             name = t["category_name"] or "(uncategorized)"
             amount = -t["amount_cents"]
-            if name == SAVINGS_CATEGORY:
+            if name in excluded_names:
                 if in_month:
-                    savings_mtd += amount
+                    excluded_mtd[name] = excluded_mtd.get(name, 0) + amount
             else:
                 consumption_by_month[bucket] += amount
                 consumption_ids_by_month[bucket].add(t["id"])
@@ -2152,7 +2182,9 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "days_remaining": days_in_month - days_elapsed,
             "month_elapsed_pct": elapsed_pct,
             "consumption_mtd": _d(mtd),
-            "savings_mtd": _d(savings_mtd),
+            "savings_mtd": _d(excluded_mtd.get(SAVINGS_CATEGORY, 0)),
+            "taxes_mtd": _d(excluded_mtd.get(TAXES_CATEGORY, 0)),
+            "excluded_mtd": {n: _d(excluded_mtd.get(n, 0)) for n in excluded_names},
             "floor": floor,
             # Fixed obligations still to land this month. Room is only
             # meaningful net of these: early in the month almost none have
