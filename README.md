@@ -191,9 +191,11 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
 | Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only); employer-stock concentration with components itemized — the 401(k) is a target-date fund and is explicitly excluded |
 | Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
-| Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
+| Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE/TICKLERS) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
 | Finances docs | `finances_decision_append` | Append a dated entry to DECISIONS.md (newest-first), commit and push. Append-only |
 | Finances docs | `finances_planned_append` | Append a row to PLANNED.md's spending queue, commit and push. Append-only |
+| Finances docs | `finances_ticklers` | Future-dated reminders from TICKLERS.md. `due_only=true` (default) returns only rows that are `open` and due today or earlier in America/New_York — normally an empty list. Unparseable rows come back under `malformed` and must be surfaced: a tickler nobody can read is a reminder that will never fire. Nothing marks one done — that stays a deliberate file edit |
+| Finances docs | `finances_tickler_append` | Schedule a reminder against a date rather than trusting it to memory (a rate that reprices, a loan that rolls off, a token that expires). Appends a row with status `open`, commits and pushes. Append-only; advisor scope |
 | Finances context | `finances_context_add` | Record what someone said about a transaction, verbatim. `txn_ref` is a **hint**, not an Actual id — usable before the purchase posts. Rate-limited per author/day |
 | Finances context | `finances_context_list` | Open / consumed / aged-out context. Read before asking anyone about a transaction |
 | Finances context | `finances_context_consume` | Close entries after the categorization they informed actually happened. **Advisor only** |
@@ -331,11 +333,18 @@ plan gives advice the household has already considered and rejected.
 - **A failed `git pull` never becomes an error.** The cached copy is served
   with a leading `> **STALE:**` warning (and `stale: true` from the tool), so
   the caller can say so rather than quoting a possibly-outdated figure.
-- **Append-only, two shapes, two files.** There is no doc-editing tool and no
+- **Append-only, one shape per file.** There is no doc-editing tool and no
   path that writes PLAN.md: restructuring a governance document is
   session-with-git work where a human sees the diff.
+- **TICKLERS.md is read as data, not prose.** `finances_ticklers` parses its
+  table so the morning sentinel can ask what has come due. It is the one
+  finances-repo read hermes has, and it reaches it through the *tool*, not the
+  resource — hermes still gets no `finances://` prefix, so the scoping rule
+  above is unchanged. Nothing marks a tickler done: acknowledging one costs a
+  deliberate human edit, which is what stops the nag being dismissed in
+  passing.
 - The token needs `contents: write` for the append tools; a read-only token
-  serves the docs and fails those two explicitly.
+  serves the docs and fails those three explicitly.
 
 ### Transaction context (the first data-shaped store)
 

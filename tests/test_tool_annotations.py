@@ -127,6 +127,8 @@ EXPECTED: dict[str, tuple[bool, bool, bool]] = {
     # each call appends a NEW entry and pushes, so not repeat-safe
     "finances_decision_append": (False, False, False),
     "finances_planned_append": (False, False, False),
+    "finances_ticklers": (True, False, True),
+    "finances_tickler_append": (False, False, False),
     # ── transaction context (SQLite) ─────────────────────────────────
     # each call records a NEW statement, so not repeat-safe
     "finances_context_add": (False, False, False),
