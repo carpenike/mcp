@@ -57,11 +57,18 @@ MAX_ROWS = 200
 MAX_BATCH_ITEMS = 300
 MAX_CHARGES = 50
 
-# Amazon order numbers are digits and hyphens. Validated at the boundary per
-# AGENTS.md rule 3 even though it reaches SQL as a bound parameter — a strict
-# shape check is cheap and keeps a malformed id from becoming a confusing
-# empty result.
-ORDER_NUMBER = re.compile(r"[0-9-]{10,25}")
+# Amazon order ids. Validated at the boundary per AGENTS.md rule 3 even though
+# it reaches SQL as a bound parameter.
+#
+# Letters are allowed because DIGITAL orders carry them: a Prime renewal or a
+# Kindle purchase is `D01-1234567-1234567`. An earlier version accepted digits
+# and hyphens only and rejected those as "not an Amazon order number", which
+# is simply false — it is one, it just lives on Amazon's separate Digital
+# Orders page, which lading does not scrape. "Not stored, and here is why" is
+# a far more useful answer than "malformed".
+ORDER_NUMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{9,24}")
+# Digital ids are the ones with a letter in the leading group.
+DIGITAL_ORDER = re.compile(r"\A[A-Za-z]")
 
 # Orders are keyed by (account, order_number) everywhere, because the account
 # is part of the primary key in lading's schema — order numbers are believed
@@ -161,6 +168,22 @@ def parse_day(value: str, *, field: str) -> date:
         raise ToolError(
             "bad_date", f"{field} must be YYYY-MM-DD, got {value!r}.", "Example: 2026-08-04."
         ) from None
+
+
+def link_order_id(link: str | None) -> str | None:
+    """Pull the order id out of an order-details URL.
+
+    lading stores `order_number` straight from the upstream parser, and that
+    parser does not recognise the digital order shape — so a Prime renewal
+    lands with a NULL order_number while its details link still carries
+    `orderID=D01-...`. Reading the link back is the difference between
+    telling someone "there is no order behind this charge" and telling them
+    "the order is D01-..., and it is a digital one we do not store".
+    """
+    if not link:
+        return None
+    found = re.search(r"[?&]orderID=([A-Za-z0-9-]+)", link)
+    return found.group(1) if found else None
 
 
 def funding_of(payment_method: str | None, last_4: str | None) -> str:
@@ -505,6 +528,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                             "funding": funding_of(c["payment_method"], c["payment_method_last_4"]),
                             "seller": c["seller"],
                             "order_number": c["order_number"],
+                            "order_details_link": c["order_details_link"],
+                            # Best available id: the stored one, else the one
+                            # in the link. Digital orders only ever have the
+                            # latter.
+                            "order_ref": c["order_number"]
+                            or link_order_id(c["order_details_link"]),
                         }
                         for c in chosen
                     ]
@@ -538,9 +567,24 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 key = (cand["account"], cand["order_number"])
                 order_row = orders.get(key)
                 if order_row is None:
-                    # A charge with no order behind it: a gift-card reload, a
-                    # digital purchase, or an order outside the synced window.
+                    # A charge with no order behind it. Say which kind, since
+                    # "digital, never scraped" and "outside the synced window"
+                    # call for completely different follow-up.
                     cand["order"] = None
+                    ref = cand.get("order_ref")
+                    if ref and DIGITAL_ORDER.match(ref):
+                        cand["order_missing_reason"] = "digital_order"
+                        cand["hint"] = (
+                            f"{ref} is a DIGITAL order (Prime renewal, Kindle, "
+                            "Audible, app). Those live on Amazon's Digital Orders "
+                            "page, which is not synced, so there are no line items "
+                            "and never will be until it is. Look it up under "
+                            "Account > Digital Orders."
+                        )
+                    elif ref:
+                        cand["order_missing_reason"] = "order_not_stored"
+                    else:
+                        cand["order_missing_reason"] = "no_order_reference"
                     continue
                 rendered = order_payload(order_row)
                 rendered["items"] = order_row.get("_items", [])
@@ -610,8 +654,13 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                         "order_number": cleaned,
                         "found": False,
                         "hint": (
-                            "Not in the store. Check amazon_get_sync_status — the month may "
-                            "never have been synced."
+                            f"{cleaned} is a DIGITAL order id (Prime renewal, Kindle, "
+                            "Audible, app). Digital orders live on a separate Amazon "
+                            "page that is not synced, so they have no line items here. "
+                            "Look it up under Account > Digital Orders."
+                            if DIGITAL_ORDER.match(cleaned)
+                            else "Not in the store. Check amazon_get_sync_status — the "
+                            "month may never have been synced."
                         ),
                     }
                 )

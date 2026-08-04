@@ -19,6 +19,7 @@ from homelab_mcp.tools.amazon import (
     Charge,
     flag_oversubscribed,
     funding_of,
+    link_order_id,
     match_charge,
     none_reason,
     register,
@@ -125,6 +126,7 @@ def txn(**over: Any) -> dict[str, Any]:
         "payment_method_last_4": "4772",
         "seller": "Amazon.com",
         "order_number": "111-2223334-4445556",
+        "order_details_link": "https://www.amazon.com/gp/css/order-details?orderID=111-2223334-4445556",
     }
     base.update(over)
     return base
@@ -559,3 +561,80 @@ async def test_match_charges_reports_transaction_id_and_collisions(
     assert first["candidates"][0]["transaction_id"] == 7
     assert first["confidence"] == "ambiguous"
     assert first["shares_with"] == ["t2"]
+
+
+class TestLinkOrderId:
+    """Digital orders arrive with a NULL order_number and a usable link.
+
+    Found in production: the annual Prime renewal (D01-…) matched its charge
+    but reported no order at all, because lading stores order_number straight
+    from an upstream parser that does not recognise the digital shape. The id
+    was in the details link the whole time.
+    """
+
+    def test_reads_the_id_out_of_a_details_link(self) -> None:
+        link = "https://www.amazon.com/gp/css/order-details?orderID=D01-5879804-4921828"
+        assert link_order_id(link) == "D01-5879804-4921828"
+
+    def test_handles_the_id_mid_query_string(self) -> None:
+        assert link_order_id("https://x/?ref=nav&orderID=111-2223334-4445556&z=1") == (
+            "111-2223334-4445556"
+        )
+
+    def test_no_link_no_id(self) -> None:
+        assert link_order_id(None) is None
+        assert link_order_id("") is None
+        assert link_order_id("https://www.amazon.com/gp/css/order-history") is None
+
+
+async def test_digital_charge_reports_the_id_and_why_there_are_no_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Prime renewal: charge matches, order_number is NULL, and the only
+    # trace of the order is in the link.
+    reader = FakeReader(
+        transactions=[
+            txn(
+                amount_cents=-14734,
+                order_number=None,
+                order_details_link=(
+                    "https://www.amazon.com/gp/css/order-details?orderID=D01-5879804-4921828"
+                ),
+            )
+        ],
+        orders=[],
+    )
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_match_charges"](
+        charges=[Charge(ref="t1", date="2026-08-01", amount=-147.34)]
+    )
+    cand = out["matches"][0]["candidates"][0]
+    assert cand["order_number"] is None
+    assert cand["order_ref"] == "D01-5879804-4921828"
+    assert cand["order"] is None
+    assert cand["order_missing_reason"] == "digital_order"
+    assert "Digital Orders" in cand["hint"]
+
+
+async def test_missing_physical_order_is_not_called_digital(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = FakeReader(transactions=[txn()], orders=[])
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_match_charges"](
+        charges=[Charge(ref="t1", date="2026-08-01", amount=-84.31)]
+    )
+    cand = out["matches"][0]["candidates"][0]
+    assert cand["order_missing_reason"] == "order_not_stored"
+    assert "hint" not in cand
+
+
+async def test_get_order_accepts_a_digital_id_and_explains_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Previously rejected as "not an Amazon order number", which was false.
+    tools = build(monkeypatch, FakeReader(orders=[]))
+    out = await tools["amazon_get_order"](order_number="D01-5879804-4921828")
+    assert "error" not in out
+    assert out["found"] is False
+    assert "Digital Orders" in out["hint"]
