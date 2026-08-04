@@ -82,8 +82,23 @@ into several charges. Prime, AWS, Kindle and Audible post as Amazon charges
 with nothing shipped behind them. A `none` match is common and usually not
 an error.
 
-`confidence` is `ambiguous` when several orders fit. Present the options;
-do not pick one.
+`confidence` is `ambiguous` when several orders fit, or when charges
+competed for too few Amazon transactions. Present the options; do not pick
+one.
+
+`probable` is a normal, actionable result — not a warning. Amazon authorizes
+at order and captures at ship, so a bank charge posts one to three days
+AFTER Amazon's completed date; the date gap is expected and does not lower
+confidence. `exact` additionally requires the card last-4 to be verified,
+which needs the account named in your call to appear in the server's
+account->last-4 map. If that map is unconfigured, `exact` is unreachable and
+`probable` is the ceiling.
+
+Check `oversubscribed` on the batch. When set, those charges competed for
+fewer Amazon transactions than there were charges, so at least one of them
+is matched to a row another charge owns — `shares_with` names the others.
+Per-charge confidence CANNOT see this, which is why charges are handed over
+in a batch.
 
 Purchases paid from Amazon BALANCE (`funding: "balance"`) never posted to a
 card, so they are invisible to the bank feed and to Actual. That balance is
@@ -202,6 +217,40 @@ def match_charge(
         # the same order. Not `exact`: the card was never verified.
         return "probable", candidates
     return "ambiguous", candidates
+
+
+def flag_oversubscribed(results: list[dict[str, Any]]) -> int:
+    """Mark charges that competed for too few Amazon transactions.
+
+    Pure, and deliberately separate from `match_charge`: this is the one
+    judgement that cannot be made per charge. Returns how many entries were
+    flagged.
+
+    A flagged entry is downgraded to `ambiguous` because the truthful answer
+    is that we cannot tell which charge owns which row — and at least one of
+    them owns none of them. Leaving it at `probable` would present a wrong
+    answer with a confident label, which is the failure mode this whole
+    category is built to avoid.
+    """
+    claims: dict[Any, set[str]] = {}
+    for entry in results:
+        for cand in entry.get("candidates", []):
+            claims.setdefault(cand["transaction_id"], set()).add(entry["ref"])
+
+    flagged = 0
+    for entry in results:
+        ids = {c["transaction_id"] for c in entry.get("candidates", [])}
+        if not ids:
+            continue
+        sharers: set[str] = set()
+        for i in ids:
+            sharers |= claims[i]
+        if len(sharers) > len(ids):
+            entry["oversubscribed"] = True
+            entry["shares_with"] = sorted(sharers - {entry["ref"]})
+            entry["confidence"] = "ambiguous"
+            flagged += 1
+    return flagged
 
 
 def none_reason(
@@ -443,6 +492,10 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 else:
                     entry["candidates"] = [
                         {
+                            # The identity of the matched charge row. Without
+                            # it two charges resolving to ONE transaction look
+                            # identical to two charges resolving to two.
+                            "transaction_id": c["id"],
                             "account": c["account"],
                             "completed_date": c["completed_date"].isoformat(),
                             "amount": _d(c["amount_cents"]),
@@ -494,8 +547,22 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 item_count += len(rendered["items"])
                 cand["order"] = rendered
 
+        # Cross-charge check. `match_charge` grades each charge in isolation,
+        # so it cannot see that two charges claimed the same Amazon
+        # transaction — and that is a failure the per-charge confidence looks
+        # entirely healthy through. Batching exists precisely so this can be
+        # caught here.
+        #
+        # The signal is over-subscription, not mere sharing: k charges
+        # resolving to a pool of m distinct transaction rows is FINE when
+        # k <= m (one order really can split into several equal charges — seen
+        # in this household's data). It is only wrong when k > m, because then
+        # at least k - m charges are claiming a row that is already spoken for.
+        oversubscribed = flag_oversubscribed(results)
+
         matched = sum(1 for r in results if r["confidence"] != "none")
         out = envelope(results, len(results), "matches")
+        out["oversubscribed"] = oversubscribed
         out["matched"] = matched
         out["window_days"] = window
         out["item_cap"] = MAX_BATCH_ITEMS

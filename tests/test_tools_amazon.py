@@ -17,6 +17,7 @@ from homelab_mcp.config import Settings
 from homelab_mcp.tools import amazon
 from homelab_mcp.tools.amazon import (
     Charge,
+    flag_oversubscribed,
     funding_of,
     match_charge,
     none_reason,
@@ -491,3 +492,70 @@ async def test_sync_status_goes_stale_after_the_window(monkeypatch: pytest.Monke
     tools = build(monkeypatch, reader)
     out = await tools["amazon_get_sync_status"]()
     assert out["stale"] is True
+
+
+class TestOversubscription:
+    """The failure per-charge confidence cannot see.
+
+    Found in production: two same-amount charges both came back `probable`
+    against one order, and one of them was wrong. `match_charge` grades each
+    charge in isolation, so the batch is the only place this is visible —
+    which is the whole reason the tool takes charges in a batch.
+    """
+
+    def _entry(self, ref: str, *ids: int) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "confidence": "probable",
+            "candidates": [{"transaction_id": i, "order_number": "111-A"} for i in ids],
+        }
+
+    def test_two_charges_one_transaction_is_flagged(self) -> None:
+        results = [self._entry("a", 1), self._entry("b", 1)]
+        assert flag_oversubscribed(results) == 2
+        assert results[0]["confidence"] == "ambiguous"
+        assert results[0]["shares_with"] == ["b"]
+        assert results[1]["shares_with"] == ["a"]
+
+    def test_two_charges_two_transactions_is_legitimate(self) -> None:
+        # One order really can split into two equal charges — confirmed in
+        # this household's data. Both charges see both rows as candidates,
+        # and there are enough rows to go round.
+        results = [self._entry("a", 1, 2), self._entry("b", 1, 2)]
+        assert flag_oversubscribed(results) == 0
+        assert all(r["confidence"] == "probable" for r in results)
+        assert all("oversubscribed" not in r for r in results)
+
+    def test_three_charges_two_transactions_is_flagged(self) -> None:
+        results = [self._entry("a", 1, 2), self._entry("b", 1, 2), self._entry("c", 1, 2)]
+        assert flag_oversubscribed(results) == 3
+
+    def test_distinct_charges_are_untouched(self) -> None:
+        results = [self._entry("a", 1), self._entry("b", 2)]
+        assert flag_oversubscribed(results) == 0
+        assert all(r["confidence"] == "probable" for r in results)
+
+    def test_unmatched_entries_are_ignored(self) -> None:
+        results = [{"ref": "a", "confidence": "none", "candidates": []}]
+        assert flag_oversubscribed(results) == 0
+        assert results[0]["confidence"] == "none"
+
+
+async def test_match_charges_reports_transaction_id_and_collisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two ledger charges of the same amount, one Amazon transaction to go
+    # round. Both used to come back `probable`; one of them is wrong.
+    reader = FakeReader(transactions=[txn(id=7)], orders=[])
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_match_charges"](
+        charges=[
+            Charge(ref="t1", date="2026-08-01", amount=-84.31),
+            Charge(ref="t2", date="2026-08-01", amount=-84.31),
+        ]
+    )
+    assert out["oversubscribed"] == 2
+    first = out["matches"][0]
+    assert first["candidates"][0]["transaction_id"] == 7
+    assert first["confidence"] == "ambiguous"
+    assert first["shares_with"] == ["t2"]
