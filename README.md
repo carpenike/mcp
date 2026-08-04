@@ -142,6 +142,11 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | School | `school_get_announcements` | Recent teacher/school activity-feed posts |
 | School | `school_list_staff` | Faculty lookup by name, with the courses they teach these children |
 | School | `school_get_sync_status` | Per-source sync health + staleness (call before saying "nothing is due") |
+| Amazon | `amazon_match_charges` | Batch: bank charges in, the orders and line items behind them out, with a confidence and a reason per charge |
+| Amazon | `amazon_get_order` | One order in full: items, totals breakdown, shipments, recipient |
+| Amazon | `amazon_search_items` | Full-text over purchased item titles ("when did we last buy furnace filters") |
+| Amazon | `amazon_list_orders` | Browse a date window without one call per order |
+| Amazon | `amazon_get_sync_status` | Per-account/source sync health, staleness, and which months were actually fetched |
 | Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then `set`/`add`/`consume`/`open` in one call (by name, id, or `barcode`); price + store on `add`; `create_new` forces a new product past disambiguation |
 | Grocy | `grocy_find_products` | Find products by name across ALL master data ("do we have X?") |
 | Grocy | `grocy_attention` | Planning feed: `kind='expiring'` (due soon / overdue / expired) or `kind='below_minimum'` (quantity-driven restock), summarized (absorbs the old expiring + restock tools) |
@@ -377,6 +382,44 @@ append-heavy, unlike the governance docs which are prose).
 - **`clarify_candidates` is deterministic** (largest first, fixed filters) so
   a model never chooses what to ask, and excludes anything already covered by
   open context — re-asking is how a channel trains people to ignore it.
+
+### Amazon purchases (the second store-backed category)
+
+`amazon_*` reads a Postgres database owned by
+[lading](https://github.com/carpenike/lading), which logs into amazon.com on a
+daily timer and parses the order and transaction pages. Same shape as
+`school_*` / schoolhouse, and for sharper reasons: lading's credential can
+place orders and change shipping addresses, there is no read-only Amazon
+account, and a model that retries a failing tool is precisely how an Amazon
+account gets challenge-locked. None of that belongs in a network-facing OAuth
+resource server, so this process only ever `SELECT`s through a role with
+`readonly` membership.
+
+Three things about the data are worth knowing before reading a response:
+
+**A charge is not an order.** One order splits across shipments into several
+charges. Prime, AWS, Kindle and Audible post as Amazon charges with nothing
+shipped behind them. A `none` match is common and usually not an error —
+which is why `amazon_match_charges` always says *why*, and why
+`outside_coverage` ("we have never synced that month") is a different answer
+from `no_amount_match` ("we looked, there is no such charge").
+
+**Amazon balance is invisible to the ledger.** Purchases marked
+`funding: "balance"` never posted to a card, so no bank transaction exists for
+them. That balance is usually credit from a return — Amazon refunds returns to
+your balance rather than the paying card — but it can also be a received gift
+card, and the data cannot tell the two apart. A fully balance-funded order
+also reports `grand_total` of `$0.00`, so `gift_card` always travels beside it;
+without that an $18 order reads as free.
+
+**Every row carries an `account`.** The household may run more than one Amazon
+account against one shared card, so the matcher searches all of them and says
+which one a purchase came from.
+
+These tools describe purchases and never categorize. Deciding a budget
+category is `finances_categorize`'s job, and the two categories are
+deliberately not wired together — `amazon_*` knows nothing about Actual, and
+the caller hands charges over in a batch.
 
 ### Restricted credentials (tool allowlisting)
 

@@ -725,6 +725,33 @@ class Settings(BaseSettings):
     # Age at which school data is reported as stale in every response.
     schoolhouse_stale_after_hours: int = Field(default=18, ge=1, le=720)
 
+    # ── lading (amazon_* tools) ──────────────────────────────────────
+    # Read-only DSN for the lading store — a database owned by ANOTHER
+    # service (github:carpenike/lading), which holds the Amazon credential and
+    # does the login and HTML parsing. This process only ever SELECTs; point
+    # it at a login role with `readonly` membership.
+    #
+    # The split is sharper than schoolhouse's: lading's credential can place
+    # orders and change shipping addresses, and a model that retries a failing
+    # tool is how an Amazon account gets challenge-locked. Neither belongs in
+    # a network-facing OAuth resource server.
+    #
+    # Unset (the default) means the amazon_* category does not register.
+    amazon_database_url: str = Field(default="")
+    amazon_timezone: str = Field(default="America/New_York")
+    # lading syncs once daily, so 36h tolerates one missed run; two missed
+    # runs is a real outage and should read red.
+    amazon_stale_after_hours: int = Field(default=36, ge=1, le=720)
+    # How far a bank posting date may lag Amazon's completed date and still be
+    # considered the same charge. Widening this raises ambiguity; it does not
+    # raise accuracy.
+    amazon_match_window_days: int = Field(default=3, ge=0, le=10)
+    # Actual account name -> card last 4. Optional. When present it is the
+    # strongest discriminator the matcher has for a household with several
+    # cards; when absent the matcher reports lower confidence rather than
+    # guessing. Env value is a JSON object.
+    amazon_account_last4: dict[str, str] = Field(default_factory=dict)
+
     arcraiders_ardb_base_url: str = Field(
         default="https://ardb.app/api",
         description=(
