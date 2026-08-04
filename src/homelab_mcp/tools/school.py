@@ -26,18 +26,16 @@ Tool name convention: `school_<verb>_<object>`. See AGENTS.md.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
-import asyncpg
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError
+from homelab_mcp.tools._pg import Reader, envelope, load_zone, render_row, store_error
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -79,84 +77,24 @@ unknown.
 """.strip()
 
 
-class _Reader:
-    """A lazily-opened, read-only connection pool."""
+# The Postgres plumbing moved to `_pg` when `amazon_*` became the second
+# category reading a sibling service's store. Re-exported here so existing
+# imports (and tests/test_tools_school.py) keep working — the names are part
+# of this module's surface, the implementation just is not.
+_Reader = Reader
 
-    def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
-        self._pool: asyncpg.Pool[asyncpg.Record] | None = None
-        self._lock = asyncio.Lock()
-
-    async def _ensure(self) -> asyncpg.Pool[asyncpg.Record]:
-        if self._pool is None:
-            async with self._lock:
-                if self._pool is None:
-                    self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=4)
-        return self._pool
-
-    async def fetch(self, query: str, *args: Any) -> list[asyncpg.Record]:
-        """Run a read returning rows."""
-        pool = await self._ensure()
-        rows: list[asyncpg.Record] = await pool.fetch(query, *args)
-        return rows
-
-    async def fetchrow(self, query: str, *args: Any) -> asyncpg.Record | None:
-        """Run a read returning at most one row."""
-        pool = await self._ensure()
-        row: asyncpg.Record | None = await pool.fetchrow(query, *args)
-        return row
-
-    async def fetchval(self, query: str, *args: Any) -> Any:
-        """Run a read returning a single scalar."""
-        pool = await self._ensure()
-        return await pool.fetchval(query, *args)
+_STORE = "schoolhouse"
+_STORE_ENV = "HOMELAB_MCP_SCHOOLHOUSE_DATABASE_URL"
 
 
 def _load_zone(name: str) -> ZoneInfo:
     """Resolve the display timezone, falling back to UTC with a loud warning."""
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        log.error("unknown schoolhouse timezone %r — displaying UTC", name)
-        return ZoneInfo("UTC")
-
-
-def render_row(record: Any, tz: ZoneInfo) -> dict[str, Any]:
-    """Convert a database row to JSON-safe primitives, timestamps in `tz`.
-
-    Storage is UTC; answers are local. A due date of 2026-09-15T23:59Z is
-    7:59pm Eastern — which is also how Schoology renders an all-day item — so
-    rendering UTC would make "due Thursday" wrong at the edges.
-    """
-    out: dict[str, Any] = {}
-    for key, value in dict(record).items():
-        if isinstance(value, Decimal):
-            out[key] = float(value)
-        elif isinstance(value, datetime):
-            out[key] = value.astimezone(tz).isoformat()
-        else:
-            out[key] = value
-    return out
-
-
-def envelope(rows: list[dict[str, Any]], total: int, key: str) -> dict[str, Any]:
-    """Wrap a list result so truncation is always explicit (AGENTS.md rule 6)."""
-    return {
-        key: rows,
-        "returned": len(rows),
-        "total": total,
-        "truncated": len(rows) < total,
-    }
+    return load_zone(name, label=_STORE)
 
 
 def _store_error(exc: Exception) -> ToolError:
     """Map an unexpected storage failure to the shared error contract."""
-    log.warning("schoolhouse read failed: %s", exc.__class__.__name__)
-    return ToolError(
-        "schoolhouse_unreachable",
-        f"Could not read the schoolhouse store ({exc.__class__.__name__}).",
-        "Check HOMELAB_MCP_SCHOOLHOUSE_DATABASE_URL and that Postgres is up.",
-    )
+    return store_error(exc, code="schoolhouse_unreachable", store=_STORE, env_var=_STORE_ENV)
 
 
 def register(mcp: FastMCP, settings: Settings) -> None:
