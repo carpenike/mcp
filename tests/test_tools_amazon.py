@@ -16,6 +16,7 @@ import pytest
 from homelab_mcp.config import Settings
 from homelab_mcp.tools import amazon
 from homelab_mcp.tools.amazon import (
+    TXN_COLUMNS,
     Charge,
     flag_oversubscribed,
     funding_of,
@@ -116,7 +117,10 @@ def build(
 
 
 def txn(**over: Any) -> dict[str, Any]:
-    base = {
+    # Built from TXN_COLUMNS so a column the real SELECT does not ask for
+    # cannot quietly appear here and hide a KeyError in production.
+    base: dict[str, Any] = {c: None for c in TXN_COLUMNS}
+    base |= {
         "id": 1,
         "account": "ryan",
         "completed_date": date(2026, 8, 1),
@@ -129,6 +133,7 @@ def txn(**over: Any) -> dict[str, Any]:
         "order_details_link": "https://www.amazon.com/gp/css/order-details?orderID=111-2223334-4445556",
     }
     base.update(over)
+    assert set(base) == set(TXN_COLUMNS), "fake row drifted from the real query"
     return base
 
 

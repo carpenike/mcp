@@ -75,6 +75,28 @@ DIGITAL_ORDER = re.compile(r"\A[A-Za-z]")
 # globally unique across Amazon, but the store does not bet on it.
 OrderKey = tuple[str, str]
 
+# Every amazon_transactions column the candidate payload reads. SINGLE SOURCE
+# OF TRUTH: the SELECT is built from this, and the tests build their fake rows
+# from it too.
+#
+# It exists because the two drifted the moment they were written separately —
+# `order_details_link` was added to the payload and not to the query, and the
+# tool returned a KeyError on every real call while the whole test suite
+# stayed green, because the hand-written fakes carried a column the real query
+# never asked for. Fakes richer than the query hide exactly this.
+TXN_COLUMNS = (
+    "id",
+    "account",
+    "completed_date",
+    "amount_cents",
+    "is_refund",
+    "payment_method",
+    "payment_method_last_4",
+    "seller",
+    "order_number",
+    "order_details_link",
+)
+
 INSTRUCTIONS = """
 Amazon purchase history for the household, synced once a day from
 amazon.com by a separate service. Nothing here is live: every response
@@ -488,8 +510,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 # Amount is compared EXACTLY, and always in integers. A near
                 # miss is a different purchase, not the same one.
                 cands = await db.fetch(
-                    "SELECT t.id, t.account, t.completed_date, t.amount_cents, t.is_refund,"
-                    " t.payment_method, t.payment_method_last_4, t.seller, t.order_number"
+                    f"SELECT {', '.join('t.' + c for c in TXN_COLUMNS)}"  # noqa: S608
                     " FROM amazon_transactions t"
                     " WHERE t.amount_cents = $1"
                     "   AND t.is_refund = $2"
