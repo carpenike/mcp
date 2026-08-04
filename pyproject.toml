@@ -35,6 +35,9 @@ dependencies = [
     # JWT validation library, kept for the verifier path.
     "pyjwt[crypto]>=2.10",
     "cryptography>=43",
+    # Postgres reader for the school_* tools. Raw SQL, no ORM — this
+    # process only ever SELECTs from a store another service owns.
+    "asyncpg>=0.30",
     # Config / env handling.
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -116,6 +119,13 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # Authlib doesn't ship type stubs.
 module = ["authlib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# asyncpg ships neither stubs nor py.typed, so its generic parameters
+# (Pool[Record]) erase to Any. The annotations in tools/school.py are
+# documentation for humans, not enforcement.
+module = ["asyncpg.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

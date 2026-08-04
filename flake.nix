@@ -72,6 +72,7 @@
               starlette
               uvicorn
               httpx
+              asyncpg
               authlib
               pyjwt
               cryptography

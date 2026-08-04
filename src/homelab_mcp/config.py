@@ -710,6 +710,21 @@ class Settings(BaseSettings):
             "fallback, so no token is needed."
         ),
     )
+    # ── schoolhouse (school_* tools) ─────────────────────────────────
+    # Read-only DSN for the schoolhouse store — a database owned by ANOTHER
+    # service (github:carpenike/schoolhouse), which does the Schoology
+    # scraping. Point this at a login role with `readonly` membership; this
+    # process must not be able to write a child's grade history.
+    #
+    # Unset (the default) means the school_* category does not register.
+    schoolhouse_database_url: str = Field(default="")
+    # Storage is UTC; this is how the tools RENDER timestamps. A due date of
+    # 2026-09-15T23:59Z is 7:59pm Eastern, so UTC output would make "due
+    # Thursday" wrong at the edges.
+    schoolhouse_timezone: str = Field(default="America/New_York")
+    # Age at which school data is reported as stale in every response.
+    schoolhouse_stale_after_hours: int = Field(default=18, ge=1, le=720)
+
     arcraiders_ardb_base_url: str = Field(
         default="https://ardb.app/api",
         description=(

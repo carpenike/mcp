@@ -10,6 +10,7 @@
 , starlette
 , uvicorn
 , httpx
+, asyncpg
 , authlib
 , pyjwt
 , cryptography
@@ -60,6 +61,7 @@ buildPythonApplication {
     starlette
     uvicorn
     httpx
+    asyncpg
     authlib
     pyjwt
     cryptography

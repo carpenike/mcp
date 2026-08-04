@@ -133,6 +133,15 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Cooklang | `cooklang_build_shopping_list` | Combine ingredients across multiple of YOUR recipes, grouped by store aisle |
 | Homelab | `homelab_list_status` | Snapshot of all monitored endpoints via gatus |
 | Homelab | `homelab_get_endpoint_history` | Recent check history for one specific endpoint |
+| School | `school_list_children` | Children tracked by the Schoology sync, with course counts + last sync |
+| School | `school_list_courses` | Active courses with teacher, period and current grade |
+| School | `school_get_upcoming_work` | Assignments due in the next N days ("who has what due this week") |
+| School | `school_get_missing_work` | Missing/overdue work, separating Schoology-reported from inferred-past-due |
+| School | `school_get_grades` | Current grades, or the full trajectory with `since` |
+| School | `school_get_assignment` | One assignment plus its state history and teacher-edit trail |
+| School | `school_get_announcements` | Recent teacher/school activity-feed posts |
+| School | `school_list_staff` | Faculty lookup by name, with the courses they teach these children |
+| School | `school_get_sync_status` | Per-source sync health + staleness (call before saying "nothing is due") |
 | Grocy | `grocy_stock_item` | Keystone walkthrough tool: find-or-create a product then `set`/`add`/`consume`/`open` in one call (by name, id, or `barcode`); price + store on `add`; `create_new` forces a new product past disambiguation |
 | Grocy | `grocy_find_products` | Find products by name across ALL master data ("do we have X?") |
 | Grocy | `grocy_attention` | Planning feed: `kind='expiring'` (due soon / overdue / expired) or `kind='below_minimum'` (quantity-driven restock), summarized (absorbs the old expiring + restock tools) |
