@@ -421,6 +421,30 @@ category is `finances_categorize`'s job, and the two categories are
 deliberately not wired together — `amazon_*` knows nothing about Actual, and
 the caller hands charges over in a batch.
 
+**Reading the confidence, from a real run.** Against 14 live ledger charges:
+3 `exact`, 2 `ambiguous`, 9 `none`.
+
+`probable` is a normal, actionable result and not a warning. Amazon authorises
+at order and captures at ship, so a bank charge posts one to three days AFTER
+Amazon's completed date; that gap is expected and costs no confidence. `exact`
+additionally requires the card last-4 to be verified, which needs the calling
+account to appear in `HOMELAB_MCP_AMAZON_ACCOUNT_LAST4`. **With that map
+unset, `exact` is unreachable and `probable` is the ceiling** — which looked
+exactly like an algorithmic limit until the setting was wired.
+
+**Always check `oversubscribed` on the batch.** Per-charge confidence cannot
+see that two charges claimed the same Amazon transaction, and both come back
+looking healthy. That is why charges are handed over in a batch: the check
+lives across them. It flags only genuine over-subscription — k charges against
+m distinct transaction rows where k > m — because one order really can split
+into several equal charges, which happens in this household's data.
+
+**A `none` is usually coverage, not failure.** In that run all 9 misses were
+`no_amount_match` and every one was correct: those amounts existed nowhere in
+the store, because only one of the household's two Amazon accounts is synced.
+`outside_coverage` (the month was never fetched) is a different answer and
+must never be reported as "there is no such order".
+
 ### Restricted credentials (tool allowlisting)
 
 `HOMELAB_MCP_RESTRICTED_SCOPES` maps an OAuth scope to the exact tools a token
