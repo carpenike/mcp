@@ -24,6 +24,7 @@ from homelab_mcp.scopes import (
     resolve_allowlist,
     resolve_resource_prefixes,
 )
+from homelab_mcp.tools.finances_docs import DOCS
 
 HERMES_TOOLS = {
     "finances_sync_status",
@@ -438,14 +439,22 @@ def test_advisor_may_read_a_finances_resource() -> None:
     assert _read(_app("advisor"), "finances://PLAN.md").status_code == 200
 
 
-@pytest.mark.parametrize(
-    "uri",
-    ["finances://PLAN.md", "finances://DECISIONS.md", "finances://PLANNED.md"],
-)
-def test_hermes_is_403_on_every_finances_resource(uri: str) -> None:
-    resp = _read(_app("hermes"), uri)
+# Swept from DOCS rather than a hand-listed few. For *denial* that derivation
+# is the safe direction: every doc the server learns to serve must also be
+# proven unreachable by hermes, and a newly added one is covered the moment it
+# joins the allowlist. (Registration is tested the other way round — against
+# literal names — since looping over DOCS there could not catch an omission.)
+@pytest.mark.parametrize("doc", DOCS)
+def test_hermes_is_403_on_every_finances_resource(doc: str) -> None:
+    resp = _read(_app("hermes"), f"finances://{doc}")
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == -32601
+
+
+def test_hermes_resource_denial_covers_the_whole_allowlist() -> None:
+    """Guards the sweep above against DOCS shrinking to nothing."""
+    assert len(DOCS) >= 10
+    assert {"MORNING-CHECK.md", "PROTECTION.md"} <= set(DOCS)
 
 
 def test_restricted_token_cannot_reach_an_unlisted_scheme() -> None:

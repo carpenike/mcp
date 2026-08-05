@@ -15,6 +15,11 @@ sentinel asks it what has come due. Nothing here marks a tickler done — that
 stays a deliberate human edit, so acknowledging a reminder costs a moment's
 attention rather than happening as a side effect of being mentioned.
 
+MORNING-CHECK.md is a dependency rather than a reference: the scheduled sweep
+is a thin prompt that fetches the runbook and executes it, so if the resource
+is unavailable the job has nothing to run. Serving it is what makes that job
+exist at all.
+
 Deliberately narrow. There is no doc *editing* tool and no path that writes
 PLAN.md: restructuring a governance document is session-with-git work where a
 human sees the diff. These tools append, in one documented shape each, to
@@ -69,6 +74,12 @@ _APPEND = ToolAnnotations(
 # than a directory listing: it keeps caller input out of path construction
 # entirely, and stops an unrelated file that lands in the repo (an export, a
 # scratch note) from becoming readable over the network by accident.
+#
+# The cost of that choice is this list: a doc added upstream is invisible here
+# until it is named, and the failure is a closed door rather than a wrong
+# answer. That is the trade the v0.15.1 rule accepted deliberately — do not
+# "fix" it with a glob. Adding a governance doc upstream means adding it here.
+# partner-brief.md is family-facing and stays local; it is absent on purpose.
 DOCS: tuple[str, ...] = (
     "PLAN.md",
     "DECISIONS.md",
@@ -78,6 +89,13 @@ DOCS: tuple[str, ...] = (
     "PLANNED.md",
     "ARCHITECTURE.md",
     "TICKLERS.md",
+    # The runbook the scheduled morning sweep fetches and executes. Its
+    # availability as a resource is that job's hard dependency: without it the
+    # sweep has nothing to run and fails closed, which is how it was missed.
+    "MORNING-CHECK.md",
+    # Insurance and estate registry — policies, beneficiaries, where documents
+    # live. Should have been here from the start.
+    "PROTECTION.md",
 )
 RESOURCE_SCHEME = "finances"
 
@@ -100,9 +118,14 @@ def household_today() -> date:
 INSTRUCTIONS = """\
 The finances repo's governance docs are available as `finances://` resources
 (PLAN.md, DECISIONS.md, PULSE.md, REVIEW.md, OPERATIONS.md, PLANNED.md,
-ARCHITECTURE.md, TICKLERS.md). Read PLAN.md before giving any financial advice
-— it holds the targets, the guardrails and the decisions already made, and
-advice that contradicts it has usually already been considered and rejected.
+ARCHITECTURE.md, TICKLERS.md, MORNING-CHECK.md, PROTECTION.md). Read PLAN.md
+before giving any financial advice — it holds the targets, the guardrails and
+the decisions already made, and advice that contradicts it has usually already
+been considered and rejected.
+
+MORNING-CHECK.md is the runbook the scheduled morning sweep executes;
+PROTECTION.md is the insurance and estate registry — policies, beneficiaries
+and where the documents live.
 
 Content carries a `stale` flag when the local checkout could not be refreshed.
 Say so rather than quoting a possibly-outdated figure as current.
@@ -411,12 +434,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Read one of the household finances governance documents: PLAN.md "
             "(targets, guardrails, open questions), DECISIONS.md (dated log of "
             "what was decided and why), PULSE.md, REVIEW.md, OPERATIONS.md, "
-            "PLANNED.md (the spending queue) or ARCHITECTURE.md. Read PLAN.md "
-            "before offering financial advice — advice that contradicts it has "
-            "usually already been considered and rejected. The same content is "
-            "available as `finances://` resources; this tool exists for clients "
-            "that handle resources awkwardly. Content is flagged `stale` if the "
-            "local checkout could not be refreshed."
+            "PLANNED.md (the spending queue), ARCHITECTURE.md, TICKLERS.md "
+            "(future-dated reminders), MORNING-CHECK.md (the runbook the "
+            "scheduled morning sweep executes) or PROTECTION.md (insurance and "
+            "estate registry: policies, beneficiaries, where documents live). "
+            "Read PLAN.md before offering financial advice — advice that "
+            "contradicts it has usually already been considered and rejected. "
+            "The same content is available as `finances://` resources; this "
+            "tool exists for clients that handle resources awkwardly. Content "
+            "is flagged `stale` if the local checkout could not be refreshed."
         ),
     )
     async def docs_get(
