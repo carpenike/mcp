@@ -145,6 +145,50 @@ def test_every_doc_is_registered_as_a_resource(repo_pair: tuple[Path, Path]) -> 
     assert "finances://TICKLERS.md" in mcp.resources
 
 
+# Named literally rather than derived from DOCS. A test that loops over the
+# same constant the code loops over cannot fail when a doc goes missing from
+# it — which is exactly how the scheduled morning sweep came to fail closed on
+# an unserved MORNING-CHECK.md.
+@pytest.mark.parametrize(
+    "doc",
+    [
+        "PLAN.md",
+        "DECISIONS.md",
+        "PULSE.md",
+        "REVIEW.md",
+        "OPERATIONS.md",
+        "PLANNED.md",
+        "ARCHITECTURE.md",
+        "TICKLERS.md",
+        "MORNING-CHECK.md",
+        "PROTECTION.md",
+    ],
+)
+def test_named_governance_docs_are_served(repo_pair: tuple[Path, Path], doc: str) -> None:
+    assert doc in DOCS
+    assert f"finances://{doc}" in _mk(repo_pair).resources
+
+
+async def test_morning_check_is_readable_through_the_fallback_tool(
+    repo_pair: tuple[Path, Path],
+) -> None:
+    """The scheduled sweep fetches the runbook, then executes it.
+
+    Availability is the job's hard dependency: a closed door here means the
+    sweep has nothing to run at all.
+    """
+    out = await _mk(repo_pair).tools["finances_docs_get"](name="MORNING-CHECK.md")
+    assert out["name"] == "MORNING-CHECK.md"
+    assert out["content"]
+    assert out["stale"] is False
+
+
+def test_partner_brief_is_not_served(repo_pair: tuple[Path, Path]) -> None:
+    """Family-facing and local-only — absent on purpose, not by oversight."""
+    assert "partner-brief.md" not in DOCS
+    assert "finances://partner-brief.md" not in _mk(repo_pair).resources
+
+
 async def test_resource_returns_current_content(repo_pair: tuple[Path, Path]) -> None:
     mcp = _mk(repo_pair)
     body = await mcp.resources["finances://DECISIONS.md"]()

@@ -205,7 +205,7 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Finances | `finances_subscriptions` | Recurring-merchant scan with FIRST-SEEN, to surface subscription creep |
 | Finances | `finances_net_worth` | Full rollup incl. off-budget; investable total; home equity (display-only); employer-stock concentration with components itemized — the 401(k) is a target-date fund and is explicitly excluded |
 | Finances | `finances_payoff_projection` | Month-by-month amortization from the live balance, vs a minimum-only baseline |
-| Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE/TICKLERS) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
+| Finances docs | `finances_docs_get` | Read one governance doc (PLAN/DECISIONS/PULSE/REVIEW/OPERATIONS/PLANNED/ARCHITECTURE/TICKLERS/MORNING-CHECK/PROTECTION) from the finances repo; also served as `finances://` **resources**. Flags `stale` if the checkout couldn't refresh |
 | Finances docs | `finances_decision_append` | Append a dated entry to DECISIONS.md (newest-first), commit and push. Append-only |
 | Finances docs | `finances_planned_append` | Append a row to PLANNED.md's spending queue, commit and push. Append-only |
 | Finances docs | `finances_ticklers` | Future-dated reminders from TICKLERS.md. `due_only=true` (default) returns only rows that are `open` and due today or earlier in America/New_York — normally an empty list. Unparseable rows come back under `malformed` and must be surfaced: a tickler nobody can read is a reminder that will never fire. Nothing marks one done — that stays a deliberate file edit |
@@ -357,6 +357,13 @@ plan gives advice the household has already considered and rejected.
   above is unchanged. Nothing marks a tickler done: acknowledging one costs a
   deliberate human edit, which is what stops the nag being dismissed in
   passing.
+- **The allowlist is explicit, and that has a cost worth knowing.** A doc added
+  upstream is invisible here until it is named in `DOCS` — the failure mode is a
+  closed door, not a wrong answer, which is the trade the v0.15.1 rule accepted
+  deliberately. It is not to be replaced with a glob. MORNING-CHECK.md and
+  PROTECTION.md were added in v0.17.1 after the scheduled morning sweep failed
+  closed on the missing runbook. `partner-brief.md` is family-facing and stays
+  local, so it is absent on purpose rather than by oversight.
 - The token needs `contents: write` for the append tools; a read-only token
   serves the docs and fails those three explicitly.
 
