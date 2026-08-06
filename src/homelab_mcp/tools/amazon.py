@@ -611,6 +611,25 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 rendered["items"] = order_row.get("_items", [])
                 item_count += len(rendered["items"])
                 cand["order"] = rendered
+                if not order_row.get("full_details"):
+                    # The order row exists but its per-order page has not been
+                    # fetched, so an empty item list means "not looked at yet",
+                    # NOT "this order had no items". Without saying so, a
+                    # confident `exact` beside `items: []` reads as a finished
+                    # answer and the charge gets explained as nothing.
+                    #
+                    # lading seeds order rows from the transactions that
+                    # reference them, so these can be completely bare — the
+                    # order number and date are real, every total is null. They
+                    # fill in on the next sync as the detail backlog drains.
+                    cand["order_incomplete_reason"] = "awaiting_detail_fetch"
+                    cand["hint"] = (
+                        "This order's detail page has not been fetched yet, so "
+                        "its items and totals are incomplete or absent — do not "
+                        "report it as an order with no items. The sync drains "
+                        "the backlog on a cap per run; check again after the "
+                        "next one."
+                    )
 
         # Cross-charge check. `match_charge` grades each charge in isolation,
         # so it cannot see that two charges claimed the same Amazon

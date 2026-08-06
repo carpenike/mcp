@@ -643,3 +643,114 @@ async def test_get_order_accepts_a_digital_id_and_explains_it(
     assert "error" not in out
     assert out["found"] is False
     assert "Digital Orders" in out["hint"]
+
+
+async def test_undrained_order_is_not_reported_as_an_order_with_no_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seeded stub must not read as a finished answer.
+
+    lading creates order rows from the transactions that reference them, so an
+    order can exist with nothing but its number and date until the detail
+    backlog drains. Rendering that beside `confidence: exact` and `items: []`
+    invites "this charge bought nothing", which is the one wrong answer this
+    whole pipeline exists to prevent.
+
+    Shaped like a real seeded row: identity present, everything else NULL.
+    """
+    reader = FakeReader(
+        transactions=[txn()],
+        orders=[
+            {
+                "account": "ryan",
+                "order_number": "111-2223334-4445556",
+                "order_placed_date": date(2026, 8, 1),
+                "grand_total_cents": None,
+                "gift_card_cents": None,
+                "estimated_tax_cents": None,
+                "shipping_total_cents": None,
+                "promotion_cents": None,
+                "coupon_savings_cents": None,
+                "subscription_discount_cents": None,
+                "refund_total_cents": None,
+                "payment_method": None,
+                "payment_method_last_4": None,
+                "recipient": None,
+                "cancelled": False,
+                "is_whole_foods": False,
+                "item_count": None,
+                "full_details": False,
+            }
+        ],
+        items=[],
+    )
+    tools = build(monkeypatch, reader, last4='{"Visa": "4772"}')
+    out = await tools["amazon_match_charges"](
+        charges=[Charge(ref="t1", date="2026-08-01", amount=-84.31, account="Visa")]
+    )
+    cand = out["matches"][0]["candidates"][0]
+
+    # Genuinely exact: the card is confirmed off the TRANSACTION row, which is
+    # populated even when the order behind it is still a bare stub. That is
+    # exactly why this is dangerous — full confidence, empty basket.
+    assert out["matches"][0]["confidence"] == "exact"
+    assert cand["order"]["items"] == []
+
+    # But the empty list is provisional, and the payload has to say so.
+    assert cand["order_incomplete_reason"] == "awaiting_detail_fetch"
+    assert "not been fetched" in cand["hint"]
+
+
+async def test_a_fully_drained_order_carries_no_incompleteness_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: the warning must not fire on a complete order.
+
+    A hint on every order would be noise, and noise gets ignored — including
+    on the rows where it matters.
+    """
+    reader = FakeReader(
+        transactions=[txn()],
+        orders=[
+            {
+                "account": "ryan",
+                "order_number": "111-2223334-4445556",
+                "order_placed_date": date(2026, 7, 30),
+                "grand_total_cents": 8431,
+                "gift_card_cents": None,
+                "estimated_tax_cents": 633,
+                "shipping_total_cents": 0,
+                "promotion_cents": None,
+                "coupon_savings_cents": None,
+                "subscription_discount_cents": None,
+                "refund_total_cents": None,
+                "payment_method": "Prime Visa ****4772",
+                "payment_method_last_4": "4772",
+                "recipient": "A Person",
+                "cancelled": False,
+                "is_whole_foods": False,
+                "item_count": 1,
+                "full_details": True,
+            }
+        ],
+        items=[
+            {
+                "account": "ryan",
+                "order_number": "111-2223334-4445556",
+                "position": 0,
+                "title": "Furnace Filter",
+                "asin": "B00ABCDEFG",
+                "quantity": 1,
+                "price_cents": 7798,
+                "seller": "FilterCo",
+            }
+        ],
+    )
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_match_charges"](
+        charges=[Charge(ref="t1", date="2026-08-01", amount=-84.31)]
+    )
+    cand = out["matches"][0]["candidates"][0]
+    assert cand["order"]["items"]
+    assert "order_incomplete_reason" not in cand
+    assert "hint" not in cand
