@@ -737,6 +737,11 @@ class Settings(BaseSettings):
     # a network-facing OAuth resource server.
     #
     # Unset (the default) means the amazon_* category does not register.
+    #
+    # DEPRECATED NAME. lading now holds TWO sources in one database — amazon_*
+    # and costco_* read the same store — so the honest name is
+    # `lading_database_url` below, and this is kept as a fallback so an
+    # existing deployment keeps working across the upgrade. Set either.
     amazon_database_url: str = Field(default="")
     amazon_timezone: str = Field(default="America/New_York")
     # lading syncs once daily, so 36h tolerates one missed run; two missed
@@ -751,6 +756,29 @@ class Settings(BaseSettings):
     # cards; when absent the matcher reports lower confidence rather than
     # guessing. Env value is a JSON object.
     amazon_account_last4: dict[str, str] = Field(default_factory=dict)
+
+    # ── lading (shared by amazon_* and costco_*) ─────────────────────
+    # One service, one database, two sources. These are the canonical names;
+    # each falls back to its `amazon_*` predecessor via the properties below,
+    # so nix-config can migrate whenever rather than in lockstep with this.
+    lading_database_url: str = Field(default="")
+    lading_timezone: str = Field(default="")
+    # Actual account name -> card last 4, household-wide rather than
+    # per-retailer: it describes the household's cards, not Amazon's or
+    # Costco's. The strongest discriminator either matcher has.
+    lading_account_last4: dict[str, str] = Field(default_factory=dict)
+
+    # ── costco_* ─────────────────────────────────────────────────────
+    # Registers only when a lading DSN is set AND the store actually has
+    # Costco tables — see tools/costco.py.
+    costco_stale_after_hours: int = Field(default=36, ge=1, le=720)
+    # How far a bank posting may lag the receipt. MUCH tighter than Amazon's 3
+    # days, and that is a property of the source, not a tuning choice: a
+    # warehouse purchase settles at the register, so there is no
+    # authorise-then-capture gap to absorb. 1 covers timezone and
+    # posting-cutoff skew and nothing more. Widening it raises ambiguity
+    # without raising accuracy.
+    costco_match_window_days: int = Field(default=1, ge=0, le=10)
 
     arcraiders_ardb_base_url: str = Field(
         default="https://ardb.app/api",
@@ -781,6 +809,27 @@ class Settings(BaseSettings):
     )
 
     # ── Derived ──────────────────────────────────────────────────────
+    @property
+    def lading_dsn(self) -> str:
+        """Read-only DSN for the lading store, whichever name it was set under.
+
+        `amazon_database_url` predates lading having a second source; both
+        categories read one database, so the canonical name is now
+        `lading_database_url`. The fallback exists so this can ship without a
+        lockstep nix-config change — not as a permanent alias.
+        """
+        return self.lading_database_url or self.amazon_database_url
+
+    @property
+    def lading_zone(self) -> str:
+        """Rendering timezone for lading-backed tools."""
+        return self.lading_timezone or self.amazon_timezone
+
+    @property
+    def lading_last4(self) -> dict[str, str]:
+        """Actual account name -> card last 4. Household-wide, not per-retailer."""
+        return self.lading_account_last4 or self.amazon_account_last4
+
     @property
     def pocketid_redirect_uri(self) -> str:
         """Absolute redirect URI registered in PocketID for our client."""
