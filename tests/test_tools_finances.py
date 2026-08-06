@@ -1319,6 +1319,93 @@ async def test_categorize_clear_sends_explicit_null(tmp_path: Any, httpx_mock: H
     assert sent == {"transaction_id": "t1", "category_id": None}
 
 
+async def test_categorize_surfaces_unknown_ids_rather_than_reporting_success(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """An id matching no transaction must never read as applied work.
+
+    Before the 2026-08-06 fix, `updateTransaction` on a mistyped id resolved
+    without throwing and wrote nothing, so the assignment came back ok:true.
+    Two live batches believed work had happened that had not.
+    """
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(
+        url=f"{BASE}/transactions/categorize",
+        method="POST",
+        json={
+            "results": [
+                {"transaction_id": "t1", "ok": True, "set": ["category"]},
+                {
+                    "transaction_id": "9f0d",
+                    "ok": False,
+                    "error": "unknown transaction id",
+                    "unknown_id": True,
+                },
+            ],
+            "changed": 1,
+        },
+    )
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[
+            {"transaction_id": "t1", "category": "Fixed"},
+            {"transaction_id": "9f0d", "category": "Fixed"},
+        ]
+    )
+    assert out["applied"] == 1
+    assert out["failed"] == 1
+    # Hoisted to the top level: a flag buried in a 200-item list is missable
+    # in exactly the way that let this bug run.
+    assert out["unknown_ids"] == ["9f0d"]
+    assert out["results"][1]["error"] == "unknown transaction id"
+
+
+async def test_categorize_reports_no_unknown_ids_on_a_clean_batch(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(
+        url=f"{BASE}/transactions/categorize",
+        method="POST",
+        json={"results": [{"transaction_id": "t1", "ok": True}], "changed": 1},
+    )
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[{"transaction_id": "t1", "category": "Fixed"}]
+    )
+    assert out["unknown_ids"] == []
+    assert out["applied"] == 1
+
+
+async def test_categorize_distinguishes_unknown_ids_from_other_failures(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A write that failed loudly is a different problem from a phantom id."""
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    httpx_mock.add_response(
+        url=f"{BASE}/transactions/categorize",
+        method="POST",
+        json={
+            "results": [
+                {"transaction_id": "t1", "ok": False, "error": "database is locked"},
+                {
+                    "transaction_id": "t2",
+                    "ok": False,
+                    "error": "unknown transaction id",
+                    "unknown_id": True,
+                },
+            ],
+            "changed": 0,
+        },
+    )
+    out = await _adv_tools(tmp_path)["finances_categorize"](
+        assignments=[
+            {"transaction_id": "t1", "category": "Fixed"},
+            {"transaction_id": "t2", "category": "Fixed"},
+        ]
+    )
+    assert out["failed"] == 2
+    assert out["unknown_ids"] == ["t2"]
+
+
 async def test_categorize_refuses_an_oversized_batch(tmp_path: Any) -> None:
     out = await _adv_tools(tmp_path)["finances_categorize"](
         assignments=[{"transaction_id": f"t{i}", "category": "Fixed"} for i in range(201)]

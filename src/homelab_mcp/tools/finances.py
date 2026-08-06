@@ -1406,9 +1406,14 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "change. It cannot create or delete a transaction, and cannot touch "
             "an amount, payee, account or date; there is no parameter for them. "
             "Unknown category names are rejected with the list of valid ones "
-            "rather than guessed at. The whole batch is committed with a single "
+            "rather than guessed at, and transaction ids are checked to exist "
+            "before anything is written — an id matching no transaction comes "
+            "back as a failed assignment and is listed in `unknown_ids`, never "
+            "as a silent success. The whole batch is committed with a single "
             "sync, so prefer one call with many assignments over many calls. "
-            "Returns a per-assignment result so a partial failure is visible."
+            "Returns a per-assignment result so a partial failure is visible; "
+            "check `applied` and `unknown_ids` rather than assuming the batch "
+            "landed in full."
         ),
     )
     async def categorize(
@@ -1491,10 +1496,21 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         for r, a in zip(results, items, strict=False):
             r["category"] = a.category
         ok = sum(1 for r in results if r.get("ok"))
-        audit.info("finances_categorize applied=%d failed=%d", ok, len(results) - ok)
+        # Pulled out of `results` and named at the top level. An id that matches
+        # no transaction used to report ok:true and write nothing, so a caller
+        # trusting the per-assignment result believed work had happened; a
+        # count buried in a 200-item list is easy to miss the same way.
+        unknown = [str(r.get("transaction_id")) for r in results if r.get("unknown_id")]
+        audit.info(
+            "finances_categorize applied=%d failed=%d unknown_ids=%d",
+            ok,
+            len(results) - ok,
+            len(unknown),
+        )
         return {
             "applied": ok,
             "failed": len(results) - ok,
+            "unknown_ids": unknown,
             "synced": bool((data or {}).get("changed")),
             "results": results,
         }

@@ -297,6 +297,31 @@ async function getTransactions(start, end) {
 }
 
 /**
+ * Which of these transaction ids actually exist?
+ *
+ * `updateTransaction` on an unknown id resolves without throwing and writes
+ * nothing, so without this check a one-character typo reports ok:true and the
+ * intended row stays uncategorized. That happened twice live on 2026-08-06
+ * (DECISIONS.md) and was caught only by a post-batch re-query convention.
+ *
+ * splits:'all' rather than the 'inline' default: 'inline' hides the PARENT of
+ * a split transaction, so a perfectly valid parent id would come back
+ * "unknown" and a legitimate write would be refused. Being wrong in that
+ * direction would be worse than the bug being fixed.
+ */
+async function existingTransactionIds(ids) {
+  if (ids.length === 0) return new Set();
+  const { data } = await api.runQuery(
+    api
+      .q('transactions')
+      .filter({ id: { $oneof: ids } })
+      .select(['id'])
+      .options({ splits: 'all' }),
+  );
+  return new Set(data.map((t) => t.id));
+}
+
+/**
  * Apply category/notes to existing transactions, then push once.
  *
  * The payload is assembled key-by-key rather than spread from the request, so
@@ -305,6 +330,21 @@ async function getTransactions(start, end) {
  * server for no benefit.
  */
 async function categorize(assignments) {
+  await freshen();
+
+  // Resolve every id in one query, before any write. If this lookup fails we
+  // refuse the whole batch rather than falling back to writing blind: the
+  // entire point here is to stop reporting success for writes that did not
+  // land, and an unverified write is exactly that failure again.
+  const wanted = assignments.map((a) => a && a.transaction_id).filter((id) => typeof id === 'string' && id);
+  let existing;
+  try {
+    existing = await existingTransactionIds([...new Set(wanted)]);
+  } catch (e) {
+    // The request handler turns a throw into a 502 with this message.
+    throw new Error(`could not verify transaction ids: ${String(e && e.message)}`);
+  }
+
   const results = [];
   let changed = 0;
   for (const a of assignments) {
@@ -319,6 +359,15 @@ async function categorize(assignments) {
     if (a.notes !== undefined) fields.notes = a.notes;
     if (Object.keys(fields).length === 0) {
       results.push({ transaction_id: id, ok: false, error: 'nothing to set' });
+      continue;
+    }
+    if (!existing.has(id)) {
+      results.push({
+        transaction_id: id,
+        ok: false,
+        error: 'unknown transaction id',
+        unknown_id: true,
+      });
       continue;
     }
     try {
