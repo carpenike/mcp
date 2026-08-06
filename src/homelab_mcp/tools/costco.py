@@ -36,6 +36,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
+import asyncpg
 from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError
@@ -154,6 +155,21 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return render_row(record, zone)
 
     def err(exc: Exception) -> dict[str, Any]:
+        # A MISSING TABLE is not an unreachable store, and conflating them
+        # sends the reader to the wrong place entirely. This is the expected
+        # state during a staggered deploy: homelab-mcp picks up the costco_*
+        # category as soon as it ships (Renovate auto-merges its bumps within
+        # minutes), while the tables only appear when the host applies a lading
+        # new enough to have run migration 0004. Reporting that window as
+        # `lading_unreachable` would have someone checking the DSN, the role
+        # and the network, none of which are wrong.
+        if isinstance(exc, asyncpg.exceptions.UndefinedTableError):
+            return ToolError(
+                "costco_not_migrated",
+                "The lading store has no Costco tables yet.",
+                "Deploy lading >= 0.3.0 on the host; its migrations create them"
+                " on the next run of lading-migrate.",
+            ).payload()
         return store_error(
             exc, code="lading_unreachable", store=_STORE, env_var=_STORE_ENV
         ).payload()
