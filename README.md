@@ -217,7 +217,7 @@ raises), and list-shaped tools report `{returned, total, truncated}`.
 | Paperless | `paperless_search` | Find documents by full-text query, tags, correspondent, date range; metadata only |
 | Paperless | `paperless_get` | One document's full OCR text + metadata — where *terms* (rates, escrow, tax figures) live |
 | Paperless | `paperless_link` | Set a document's `actual_txn` custom field and return its ASN so the caller can stamp `[doc:<ASN>]` into the Actual transaction's notes |
-| Messaging | `signal_send` | Send a message to the ONE configured family Signal group; recipient is config-fixed and not a parameter |
+| Messaging | `signal_send` | Send a message to one of two configured Signal destinations, chosen by alias: `target` omitted/`"family"` (the shared household group) or `"ops"` (Ryan's operational channel, where scheduled sessions post the morning-check report). Recipients resolve server-side from a closed `Literal` enum — no number or group id can be passed in, and none is returned. An unconfigured target fails; it never falls back |
 
 ### Finances posture
 
@@ -265,6 +265,29 @@ Three deliberate refusals to guess, all in `tools/finances_config.json`:
   `quiet_but_healthy`; an account whose feed hasn't run reports `dead` even if
   a transaction posted yesterday. Conflating the two kept the overall verdict
   permanently red, which trains the alert away.
+
+### Signal destinations (aliases, never ids)
+
+`signal_send` reaches two configured groups, chosen by a `target` alias:
+
+| alias | destination | used for |
+|---|---|---|
+| `family` (default) | the shared household group both partners read | the weekly pulse, off-cycle alerts about something genuinely unusual |
+| `ops` | Ryan's operational channel | the daily morning-check report from scheduled sessions |
+
+- **The tool takes an alias, never an id.** `target` is a `Literal["family",
+  "ops"]`, so the JSON schema itself refuses a phone number or group id; a
+  runtime check repeats it for clients that bypass the schema. Ids are resolved
+  server-side and appear in neither the response nor the audit log.
+- **Group ids live only in the sops `environmentFile`** — never in `settings`
+  (which lands in the Nix store and a public nix-config repo), and never in
+  this README, a prompt, or a doc. `HOMELAB_MCP_SIGNAL_OPS_GROUP_ID` is the
+  variable name; the value belongs nowhere in a repo. That is what the
+  fingerprint hardening in nix-config is protecting.
+- **An unconfigured target fails and sends nothing.** It never falls back to
+  another group. A misdirected Signal message cannot be recalled, and the
+  specific failure worth preventing is an ops report quietly landing in the
+  channel both partners read.
 
 ### Paperless credential
 

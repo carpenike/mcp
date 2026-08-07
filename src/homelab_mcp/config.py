@@ -573,10 +573,24 @@ class Settings(BaseSettings):
     signal_group_id: str = Field(
         default="",
         description=(
-            "The ONLY recipient signal_send may target. Fixed in config, never "
-            "a tool parameter — the tool structurally cannot message an "
-            "arbitrary person, which is what makes it safe to hand to an "
-            "unattended agent."
+            "The default recipient signal_send targets — the family group. "
+            "Fixed in config; the tool takes an ALIAS, never an id, so it "
+            "structurally cannot message an arbitrary person. That is what "
+            "makes it safe to hand to an unattended agent."
+        ),
+    )
+    signal_ops_group_id: str = Field(
+        default="",
+        description=(
+            "Recipient for signal_send(target='ops') — Ryan's operational "
+            "channel, where scheduled advisor sessions deliver the daily "
+            "morning-check report. Separate from the family group so routine "
+            "ops chatter never lands in a channel both partners read. "
+            "Supplied by sops and referenced only by the alias 'ops': the id "
+            "itself must not appear in repo docs, prompts or tool output, "
+            "which is the point of the fingerprint hardening in nix-config. "
+            "Empty means target='ops' fails explicitly rather than falling "
+            "back to any other destination."
         ),
     )
     signal_max_message_chars: int = Field(

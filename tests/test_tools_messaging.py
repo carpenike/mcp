@@ -74,11 +74,18 @@ async def test_send_targets_the_configured_group_only(httpx_mock: HTTPXMock) -> 
 
 
 async def test_signature_exposes_no_recipient_parameter() -> None:
-    """Structural guarantee: adding a recipient param would break this."""
+    """Structural guarantee: adding a free-form recipient param breaks this.
+
+    `target` is deliberately not that. It is a closed alias enum resolved
+    server-side (see test_the_schema_itself_refuses_a_raw_id); a phone number
+    or group id still cannot cross this boundary.
+    """
     import inspect
 
     params = set(inspect.signature(_tools()["signal_send"]).parameters)
-    assert params == {"message"}
+    assert params == {"message", "target"}
+    for forbidden in ("recipient", "recipients", "number", "group", "group_id", "to"):
+        assert forbidden not in params
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "\n\t "])
@@ -134,3 +141,128 @@ async def test_every_send_is_audit_logged(
     with caplog.at_level("INFO", logger="homelab_mcp.audit"):
         await _tools()["signal_send"](message="pulse")
     assert any("signal_send ok" in r.getMessage() for r in caplog.records)
+
+
+# ── named targets ─────────────────────────────────────────────────────
+
+OPS_GROUP = "group.b3BzZ3JvdXBpZA=="
+
+
+def _sent_recipients(httpx_mock: HTTPXMock) -> list[str]:
+    import json
+
+    reqs = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    return [json.loads(r.content)["recipients"][0] for r in reqs]
+
+
+async def test_default_target_is_still_the_family_group(httpx_mock: HTTPXMock) -> None:
+    """Existing callers must be untouched by the addition of targets."""
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 1})
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](message="hi")
+    assert out["sent"] is True
+    assert out["target"] == "family"
+    assert _sent_recipients(httpx_mock) == [GROUP]
+
+
+async def test_explicit_family_target(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 1})
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](message="hi", target="family")
+    assert out["target"] == "family"
+    assert _sent_recipients(httpx_mock) == [GROUP]
+
+
+async def test_ops_target_resolves_to_the_ops_group(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 7})
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](
+        message="morning check", target="ops"
+    )
+    assert out["sent"] is True
+    assert out["target"] == "ops"
+    # The ops group, and specifically NOT the family group.
+    assert _sent_recipients(httpx_mock) == [OPS_GROUP]
+    assert GROUP not in _sent_recipients(httpx_mock)
+
+
+async def test_ops_target_fails_explicitly_when_unset(httpx_mock: HTTPXMock) -> None:
+    """No fallback. A misdirected Signal message cannot be recalled.
+
+    The dangerous failure would be quietly delivering an ops report to the
+    channel both partners read.
+    """
+    out = await _tools()["signal_send"](message="morning check", target="ops")
+    assert out["error"]["code"] == "signal_target_not_configured"
+    assert "HOMELAB_MCP_SIGNAL_OPS_GROUP_ID" in out["error"]["hint"]
+    # Nothing was sent anywhere.
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+async def test_unset_ops_does_not_fall_back_to_family(httpx_mock: HTTPXMock) -> None:
+    """The specific regression worth guarding: silent delivery to the family."""
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 1})
+    out = await _tools()["signal_send"](message="ops only", target="ops")
+    assert "error" in out
+    assert GROUP not in _sent_recipients(httpx_mock)
+
+
+async def test_unknown_target_is_refused_at_the_tool_boundary(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """Re-checked even though the schema is a Literal.
+
+    A client that bypasses the JSON-schema layer must not be able to smuggle a
+    raw group id in through `target`.
+    """
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](
+        message="hi", target="group.c29tZW9uZWVsc2U="
+    )
+    assert out["error"]["code"] == "signal_unknown_target"
+    assert "family" in out["error"]["hint"] and "ops" in out["error"]["hint"]
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+async def test_target_takes_no_phone_number(httpx_mock: HTTPXMock) -> None:
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](
+        message="hi", target="+12405550199"
+    )
+    assert out["error"]["code"] == "signal_unknown_target"
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+async def test_group_ids_never_appear_in_the_response(httpx_mock: HTTPXMock) -> None:
+    """The id is the thing being protected; it must not leak back out."""
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 3})
+    out = await _tools(signal_ops_group_id=OPS_GROUP)["signal_send"](message="x", target="ops")
+    blob = repr(out)
+    assert OPS_GROUP not in blob
+    assert GROUP not in blob
+
+
+async def test_ops_works_when_only_ops_is_configured(httpx_mock: HTTPXMock) -> None:
+    """Each destination stands alone; family being unset must not block ops."""
+    httpx_mock.add_response(url=f"{BASE}/v2/send", method="POST", json={"timestamp": 9})
+    out = await _tools(signal_group_id="", signal_ops_group_id=OPS_GROUP)["signal_send"](
+        message="x", target="ops"
+    )
+    assert out["sent"] is True
+    assert _sent_recipients(httpx_mock) == [OPS_GROUP]
+
+
+async def test_family_still_fails_when_unset(httpx_mock: HTTPXMock) -> None:
+    out = await _tools(signal_group_id="")["signal_send"](message="x")
+    assert out["error"]["code"] == "signal_target_not_configured"
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+def test_the_schema_itself_refuses_a_raw_id() -> None:
+    """Structural, not just a runtime check: the annotation is a closed enum.
+
+    Resolved through get_type_hints because `from __future__ import
+    annotations` leaves the raw annotation as a string.
+    """
+    import typing
+
+    hints = typing.get_type_hints(_tools()["signal_send"], include_extras=False)
+    args = typing.get_args(hints["target"])  # Literal[...] | None
+    literals = [a for a in args if typing.get_origin(a) is typing.Literal]
+    assert literals, f"target must be a Literal enum, got {hints['target']!r}"
+    assert set(typing.get_args(literals[0])) == {"family", "ops"}
