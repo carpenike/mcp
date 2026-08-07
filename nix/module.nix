@@ -39,8 +39,9 @@
 #         HOMELAB_MCP_FINANCES_REPO_URL         = "https://github.com/carpenike/finances.git";
 #         HOMELAB_MCP_PAPERLESS_BASE_URL        = "https://paperless.holthome.net";
 #         HOMELAB_MCP_SIGNAL_BASE_URL           = "http://127.0.0.1:8484";
-#         HOMELAB_MCP_SIGNAL_NUMBER             = "<E.164 registered number>";
-#         HOMELAB_MCP_SIGNAL_GROUP_ID           = "group.<base64 id>";
+#         # Signal identifiers are NOT set here. `settings` lands in the Nix
+#         # store and in a public nix-config repo; put the number and both
+#         # group ids in the sops environmentFile below.
 #       };
 #
 #       # sops-managed file containing:
@@ -48,8 +49,14 @@
 #       #   HOMELAB_MCP_GROCY_API_KEY=<from Grocy: Settings -> Manage API keys>
 #       #   HOMELAB_MCP_FINANCES_SIDECAR_TOKEN=<shared with the sidecar>
 #       #   HOMELAB_MCP_PAPERLESS_TOKEN=<dedicated paperless token>
+#       #   HOMELAB_MCP_SIGNAL_NUMBER=<E.164 registered number>
+#       #   HOMELAB_MCP_SIGNAL_GROUP_ID=<family group, signal_send default>
 #       # and optionally:
 #       #   HOMELAB_MCP_OAUTH_SIGNING_KEY=<RSA PEM, escaped newlines>
+#       #   # signal_send(target="ops") — the operational channel scheduled
+#       #   # sessions report to. Unset means that target fails explicitly;
+#       #   # it never falls back to the family group.
+#       #   HOMELAB_MCP_SIGNAL_OPS_GROUP_ID=<ops group>
 #       environmentFile = config.sops.secrets."homelab-mcp/env".path;
 #
 #       # The finances_* tools need this; everything else works without it.
