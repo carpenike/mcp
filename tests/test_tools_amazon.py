@@ -164,33 +164,68 @@ def test_registers_all_five_tools(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestMatchCharge:
     def test_one_candidate_with_matching_card_is_exact(self) -> None:
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), [txn()], expected_last_4="4772")
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            [txn()],
+            expected_last_4="4772",
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "exact"
         assert len(chosen) == 1
 
     def test_unknown_card_is_probable_not_exact(self) -> None:
         # The account was not named, or has no configured last-4. One
         # plausible answer, but the card was never verified.
-        conf, _ = match_charge(-8431, date(2026, 8, 1), [txn()], expected_last_4=None)
+        conf, _ = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            [txn()],
+            expected_last_4=None,
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "probable"
 
     def test_candidate_without_a_card_cannot_be_verified(self) -> None:
         # A balance-funded row has no last-4, so the filter is unusable and
         # must not silently drop it.
         cands = [txn(payment_method="Amazon Gift Card", payment_method_last_4=None)]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4="4772")
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4="4772",
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "probable"
         assert len(chosen) == 1
 
     def test_two_candidates_same_order_is_probable(self) -> None:
         cands = [txn(id=1), txn(id=2)]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4=None)
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4=None,
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "probable"
         assert len(chosen) == 2
 
     def test_two_candidates_different_orders_is_ambiguous(self) -> None:
         cands = [txn(id=1, order_number="111-A"), txn(id=2, order_number="111-B")]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4=None)
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4=None,
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "ambiguous"
         # Both returned; the tool must never pick.
         assert len(chosen) == 2
@@ -200,19 +235,40 @@ class TestMatchCharge:
             txn(id=1, order_number="111-A", payment_method_last_4="4772"),
             txn(id=2, order_number="111-B", payment_method_last_4="1111"),
         ]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4="4772")
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4="4772",
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "exact"
         assert [c["order_number"] for c in chosen] == ["111-A"]
 
     def test_no_candidate_matches_the_known_card(self) -> None:
         # Evidence against all of them, not for one.
         cands = [txn(id=1, order_number="111-A", payment_method_last_4="1111")]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4="4772")
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4="4772",
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "ambiguous"
         assert len(chosen) == 1
 
     def test_no_candidates_is_none(self) -> None:
-        assert match_charge(-8431, date(2026, 8, 1), [], expected_last_4="4772") == ("none", [])
+        assert match_charge(
+            -8431,
+            date(2026, 8, 1),
+            [],
+            expected_last_4="4772",
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        ) == ("none", [])
 
     def test_two_accounts_same_amount_is_ambiguous(self) -> None:
         # A joint card and two Amazon accounts. Both are real possibilities.
@@ -220,7 +276,14 @@ class TestMatchCharge:
             txn(id=1, account="ryan", order_number="111-A"),
             txn(id=2, account="steffi", order_number="111-B"),
         ]
-        conf, chosen = match_charge(-8431, date(2026, 8, 1), cands, expected_last_4=None)
+        conf, chosen = match_charge(
+            -8431,
+            date(2026, 8, 1),
+            cands,
+            expected_last_4=None,
+            last_4_key="payment_method_last_4",
+            group_key="order_number",
+        )
         assert conf == "ambiguous"
         assert {c["account"] for c in chosen} == {"ryan", "steffi"}
 
@@ -519,7 +582,7 @@ class TestOversubscription:
 
     def test_two_charges_one_transaction_is_flagged(self) -> None:
         results = [self._entry("a", 1), self._entry("b", 1)]
-        assert flag_oversubscribed(results) == 2
+        assert flag_oversubscribed(results, id_key="transaction_id") == 2
         assert results[0]["confidence"] == "ambiguous"
         assert results[0]["shares_with"] == ["b"]
         assert results[1]["shares_with"] == ["a"]
@@ -529,22 +592,22 @@ class TestOversubscription:
         # this household's data. Both charges see both rows as candidates,
         # and there are enough rows to go round.
         results = [self._entry("a", 1, 2), self._entry("b", 1, 2)]
-        assert flag_oversubscribed(results) == 0
+        assert flag_oversubscribed(results, id_key="transaction_id") == 0
         assert all(r["confidence"] == "probable" for r in results)
         assert all("oversubscribed" not in r for r in results)
 
     def test_three_charges_two_transactions_is_flagged(self) -> None:
         results = [self._entry("a", 1, 2), self._entry("b", 1, 2), self._entry("c", 1, 2)]
-        assert flag_oversubscribed(results) == 3
+        assert flag_oversubscribed(results, id_key="transaction_id") == 3
 
     def test_distinct_charges_are_untouched(self) -> None:
         results = [self._entry("a", 1), self._entry("b", 2)]
-        assert flag_oversubscribed(results) == 0
+        assert flag_oversubscribed(results, id_key="transaction_id") == 0
         assert all(r["confidence"] == "probable" for r in results)
 
     def test_unmatched_entries_are_ignored(self) -> None:
         results = [{"ref": "a", "confidence": "none", "candidates": []}]
-        assert flag_oversubscribed(results) == 0
+        assert flag_oversubscribed(results, id_key="transaction_id") == 0
         assert results[0]["confidence"] == "none"
 
 

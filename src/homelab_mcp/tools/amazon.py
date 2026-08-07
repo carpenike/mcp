@@ -24,14 +24,24 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 
-from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from homelab_mcp.tools._http import ToolError
 from homelab_mcp.tools._pg import Reader, envelope, load_zone, render_row, store_error
+from homelab_mcp.tools._purchases import (
+    MAX_CHARGES,
+    READ_ONLY,
+    Charge,
+    flag_oversubscribed,
+    match_charge,
+    none_reason,
+    parse_day,
+    to_cents,
+)
+from homelab_mcp.tools._purchases import dollars as _d
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -41,21 +51,13 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _STORE = "lading"
-_STORE_ENV = "HOMELAB_MCP_AMAZON_DATABASE_URL"
-
-# Every tool here is a read against a local database: read-only, idempotent,
-# and closed-world *because the scraping happens in another service*. That is
-# the concrete payoff of the split — see the module docstring.
-_RO = ToolAnnotations(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
-)
+_STORE_ENV = "HOMELAB_MCP_LADING_DATABASE_URL (or the older _AMAZON_ name)"
 
 # Hard cap on any list response.
 MAX_ROWS = 200
 # Cap on line items returned across a whole match batch. Fifty orders of line
 # items would flood the context and bury the answer.
 MAX_BATCH_ITEMS = 300
-MAX_CHARGES = 50
 
 # Amazon order ids. Validated at the boundary per AGENTS.md rule 3 even though
 # it reaches SQL as a bound parameter.
@@ -139,57 +141,14 @@ Actual, and whatever the credit later bought never enters it.
 
 Whole Foods orders arrive through the same feed and are groceries.
 
+COSTCO WAREHOUSE PURCHASES ARE NOT IN THIS DATA. Use costco_match_charges
+for those; the two categories read different tables and neither falls back
+to the other. A charge sweep that only calls this one will report Costco
+charges as unexplained.
+
 These tools describe purchases. They never categorize — pair them with
 finances_categorize, which is the tool that decides.
 """.strip()
-
-
-def _d(cents: int | None) -> float | None:
-    """Integer cents to dollars, rounded to the cent.
-
-    Mirrors `finances._d`. Cents are authoritative and stay on the wire
-    everywhere inside this module; dollars are for the reader. Every amount
-    comparison happens in integers — see `match_charge`.
-    """
-    return None if cents is None else round(cents / 100.0, 2)
-
-
-def to_cents(dollars: float) -> int:
-    """Dollars to integer cents, half-up, without trusting binary floats."""
-    return int(round(dollars * 100))
-
-
-class Charge(BaseModel):
-    """One bank charge to explain.
-
-    `extra="forbid"` for the same reason `finances.Assignment` uses it: a
-    caller that tries to pass a category, a payee or an instruction has
-    misunderstood what this tool does, and should get a validation error
-    rather than have the field silently ignored.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    ref: str = Field(
-        min_length=1, description="Your id, echoed back. Use the Actual transaction id."
-    )
-    date: str = Field(description="Bank posting date, 'YYYY-MM-DD'.")
-    amount: float = Field(
-        description="Dollars, signed as Actual signs it: spend negative, refund positive."
-    )
-    account: str | None = Field(
-        default=None, description="Actual account name, for card last-4 disambiguation."
-    )
-
-
-def parse_day(value: str, *, field: str) -> date:
-    """Parse a YYYY-MM-DD date, or raise the shared error contract."""
-    try:
-        return date.fromisoformat(value.strip())
-    except (ValueError, AttributeError):
-        raise ToolError(
-            "bad_date", f"{field} must be YYYY-MM-DD, got {value!r}.", "Example: 2026-08-04."
-        ) from None
 
 
 def link_order_id(link: str | None) -> str | None:
@@ -223,112 +182,16 @@ def funding_of(payment_method: str | None, last_4: str | None) -> str:
     return "unknown"
 
 
-def match_charge(
-    charge_cents: int,
-    charge_day: date,
-    candidates: list[dict[str, Any]],
-    *,
-    expected_last_4: str | None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Pick among same-amount candidates. Returns (confidence, chosen).
-
-    Pure: no database, no clock. The SQL has already narrowed to rows whose
-    amount matches EXACTLY and whose date is inside the window; this decides
-    how much to believe the result.
-
-    The last-4 filter is applied only when it can actually be applied — the
-    caller named an account, that account has a configured card, and the
-    candidate row knows its card. Any of those missing lowers confidence
-    instead of dropping candidates: never discard a row over a comparison you
-    could not make.
-    """
-    if not candidates:
-        return "none", []
-
-    usable = [c for c in candidates if c.get("payment_method_last_4")]
-    if expected_last_4 and usable:
-        narrowed = [c for c in usable if c["payment_method_last_4"] == expected_last_4]
-        if narrowed:
-            if len({c.get("order_number") for c in narrowed}) == 1:
-                return "exact", narrowed
-            return "ambiguous", narrowed
-        # The account's card is known and NO candidate matches it. That is
-        # evidence against every candidate, not for one of them.
-        return "ambiguous", candidates
-
-    orders = {c.get("order_number") for c in candidates}
-    if len(orders) == 1:
-        # One order, whether that is one candidate or several charges against
-        # the same order. Not `exact`: the card was never verified.
-        return "probable", candidates
-    return "ambiguous", candidates
-
-
-def flag_oversubscribed(results: list[dict[str, Any]]) -> int:
-    """Mark charges that competed for too few Amazon transactions.
-
-    Pure, and deliberately separate from `match_charge`: this is the one
-    judgement that cannot be made per charge. Returns how many entries were
-    flagged.
-
-    A flagged entry is downgraded to `ambiguous` because the truthful answer
-    is that we cannot tell which charge owns which row — and at least one of
-    them owns none of them. Leaving it at `probable` would present a wrong
-    answer with a confident label, which is the failure mode this whole
-    category is built to avoid.
-    """
-    claims: dict[Any, set[str]] = {}
-    for entry in results:
-        for cand in entry.get("candidates", []):
-            claims.setdefault(cand["transaction_id"], set()).add(entry["ref"])
-
-    flagged = 0
-    for entry in results:
-        ids = {c["transaction_id"] for c in entry.get("candidates", [])}
-        if not ids:
-            continue
-        sharers: set[str] = set()
-        for i in ids:
-            sharers |= claims[i]
-        if len(sharers) > len(ids):
-            entry["oversubscribed"] = True
-            entry["shares_with"] = sorted(sharers - {entry["ref"]})
-            entry["confidence"] = "ambiguous"
-            flagged += 1
-    return flagged
-
-
-def none_reason(
-    charge_day: date,
-    covered_periods: set[date],
-    *,
-    today: date,
-    stale: bool,
-) -> str:
-    """Why nothing matched — the distinction the household's money rests on.
-
-    `outside_coverage` and `no_amount_match` mean opposite things and must
-    never be collapsed: one is "we have never looked at that month", the other
-    is "we looked and there is genuinely no such charge". Reporting the first
-    as the second is a confident lie.
-    """
-    if charge_day.replace(day=1) not in covered_periods:
-        return "outside_coverage"
-    if stale and (today - charge_day).days <= 2:
-        return "stale_sync"
-    return "no_amount_match"
-
-
 def register(mcp: FastMCP, settings: Settings) -> None:
     """Register amazon_* tools, if a lading database is configured."""
-    dsn = settings.amazon_database_url
+    dsn = settings.lading_dsn
     if not dsn:
         log.info("%s unset — amazon tools not registered", _STORE_ENV)
         return
 
     db = Reader(dsn)
-    zone = load_zone(settings.amazon_timezone, label=_STORE)
-    last4_by_account = {k.strip().lower(): v for k, v in settings.amazon_account_last4.items()}
+    zone = load_zone(settings.lading_zone, label=_STORE)
+    last4_by_account = {k.strip().lower(): v for k, v in settings.lading_last4.items()}
 
     def row(record: Any) -> dict[str, Any]:
         return render_row(record, zone)
@@ -434,7 +297,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     # ── tools ────────────────────────────────────────────────────────
 
     @mcp.tool(
-        annotations=_RO,
+        annotations=READ_ONLY,
         name="amazon_get_sync_status",
         description=(
             "When the Amazon sync last succeeded, per account and source, and "
@@ -464,7 +327,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         }
 
     @mcp.tool(
-        annotations=_RO,
+        annotations=READ_ONLY,
         name="amazon_match_charges",
         description=(
             "Given bank charges from the ledger, find the Amazon orders and "
@@ -525,7 +388,15 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 )
                 expected = last4_by_account.get((ch.account or "").strip().lower())
                 confidence, chosen = match_charge(
-                    cents, day, [dict(c) for c in cands], expected_last_4=expected
+                    cents,
+                    day,
+                    [dict(c) for c in cands],
+                    expected_last_4=expected,
+                    # This category's own column names. Explicit rather than
+                    # defaulted, so a schema rename here cannot silently
+                    # change what the shared matcher groups on.
+                    last_4_key="payment_method_last_4",
+                    group_key="order_number",
                 )
                 entry: dict[str, Any] = {"ref": ch.ref, "confidence": confidence}
                 if confidence == "none":
@@ -642,7 +513,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         # k <= m (one order really can split into several equal charges — seen
         # in this household's data). It is only wrong when k > m, because then
         # at least k - m charges are claiming a row that is already spoken for.
-        oversubscribed = flag_oversubscribed(results)
+        oversubscribed = flag_oversubscribed(results, id_key="transaction_id")
 
         matched = sum(1 for r in results if r["confidence"] != "none")
         out = envelope(results, len(results), "matches")
@@ -654,7 +525,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return await stamped(out)
 
     @mcp.tool(
-        annotations=_RO,
+        annotations=READ_ONLY,
         name="amazon_get_order",
         description=(
             "One order in full: line items, the totals breakdown, shipments "
@@ -732,7 +603,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return await stamped({"found": True, "orders": payloads})
 
     @mcp.tool(
-        annotations=_RO,
+        annotations=READ_ONLY,
         name="amazon_search_items",
         description=(
             "Full-text search over purchased item titles, newest first — "
@@ -802,7 +673,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         return await stamped(envelope(items, int(total or 0), "items"))
 
     @mcp.tool(
-        annotations=_RO,
+        annotations=READ_ONLY,
         name="amazon_list_orders",
         description=(
             "Browse orders in a date window — 'what did we order in July' — "

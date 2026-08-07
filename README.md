@@ -428,6 +428,39 @@ category is `finances_categorize`'s job, and the two categories are
 deliberately not wired together — `amazon_*` knows nothing about Actual, and
 the caller hands charges over in a batch.
 
+### Costco receipts (the same store, a different retailer)
+
+`costco_*` reads the *same* lading database — one service now syncs two
+sources — and answers the same question about warehouse purchases.
+
+**Separate tools, shared judgement.** The two categories import their
+confidence vocabulary from `tools/_purchases.py`, so `exact`, `probable`,
+`ambiguous`, `none`, `outside_coverage` and `oversubscribed` mean exactly the
+same thing whichever retailer answered. What they do not share is their
+caveats, and merging them would have meant a description that forks on source
+for almost every sentence:
+
+| | Amazon | Costco |
+|---|---|---|
+| a charge is | not an order — one order splits across shipments | the receipt itself |
+| posts | one to three days after the order | same day; it settles at the register |
+| card on the row | sometimes; `exact` is a lucky result | always; `exact` is the norm |
+| quantity | usually unknown | on every line |
+| invisible spending | Amazon balance | none |
+| history | years | about two |
+
+Costco matches on the **tender**, not the receipt total: a receipt paid with
+two cards produces two bank charges, neither equal to the total. `tender_count`
+above 1 says that happened.
+
+Returns are not represented — every receipt in the store is a sale, and how
+Costco renders a return has never been observed — so a refund on the ledger
+gets `refund_unsupported` rather than being paired with a same-amount purchase.
+
+Neither category falls back to the other, and both say so in their
+instructions: a charge sweep that calls only one will report the other
+retailer's charges as unexplained.
+
 **Reading the confidence, from a real run.** Against 14 live ledger charges:
 3 `exact`, 2 `ambiguous`, 9 `none`.
 
