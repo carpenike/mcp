@@ -815,6 +815,118 @@ def test_shipped_config_progressive_posts_on_the_fifth() -> None:
     assert prog["amount"] == 338.68
 
 
+# ── NOT_DUE ──────────────────────────────────────────────────────────
+
+
+def _no_txns(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"), json={"transactions": []}
+    )
+
+
+async def test_obligation_not_yet_due_is_not_missing(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """MISSING means 'should have happened and did not'.
+
+    The MacBook installment posts on the last day of the month, so calling it
+    MISSING from the 1st reads as a late payment for thirty days running —
+    which is how a checklist gets tuned out.
+    """
+    _no_txns(httpx_mock)
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "MacBook", "amount": 200.33, "expected_day": 31, "match_any": ["apple"]}],
+    )
+    # Frozen today is 2026-07-31: the draft day itself, still not overdue.
+    out = await tools["finances_recurring"](month="2026-07")
+    row = out["obligations"][0]
+    assert row["status"] == "NOT_DUE"
+    assert "not due yet" in row["note"].lower()
+    # Not news, so it must not be raised.
+    assert out["needs_attention"] == []
+
+
+async def test_obligation_past_its_day_is_missing(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Once the day has passed, absence IS news."""
+    _no_txns(httpx_mock)
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Early bill", "amount": 100.0, "expected_day": 1, "match_any": ["x"]}],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["obligations"][0]["status"] == "MISSING"
+    assert out["needs_attention"] == ["Early bill"]
+
+
+async def test_a_completed_month_never_reports_not_due(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """Nothing is still 'upcoming' in July once July is over."""
+    _no_txns(httpx_mock)
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "MacBook", "amount": 200.33, "expected_day": 31, "match_any": ["apple"]}],
+    )
+    # June is over; nothing in it is still upcoming.
+    out = await tools["finances_recurring"](month="2026-06")
+    assert out["obligations"][0]["status"] == "MISSING"
+
+
+async def test_no_expected_day_keeps_previous_behaviour(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """With no declared day there is nothing to be early relative to."""
+    _no_txns(httpx_mock)
+    tools = _rec_tools(tmp_path, [{"name": "Whenever", "amount": 50.0, "match_any": ["x"]}])
+    out = await tools["finances_recurring"](month="2026-08")
+    assert out["obligations"][0]["status"] == "MISSING"
+
+
+async def test_grace_days_absorb_a_slightly_late_draft(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    _no_txns(httpx_mock)
+    # Frozen today is 2026-07-31; day 30 + 1 grace day still counts as not due.
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "Just past", "amount": 10.0, "expected_day": 30, "match_any": ["x"]}],
+    )
+    out = await tools["finances_recurring"](month="2026-07")
+    assert out["obligations"][0]["status"] == "NOT_DUE"
+
+
+async def test_not_due_still_counts_against_room(
+    tmp_path: Any, httpx_mock: HTTPXMock, frozen_now: None
+) -> None:
+    """The regression this refactor most easily introduces.
+
+    Renaming MISSING to NOT_DUE must not drop the obligation out of
+    remaining_committed — that would silently hand back headroom for money
+    that is about to leave the account.
+    """
+    _no_txns(httpx_mock)
+    httpx_mock.add_response(url=f"{BASE}/categories", json=_cats())
+    tools = _rec_tools(
+        tmp_path,
+        [{"name": "MacBook", "amount": 200.33, "expected_day": 31, "match_any": ["apple"]}],
+    )
+    out = await tools["finances_room"]()
+    assert out["remaining_committed"] == 200.33
+    names = [c["name"] for c in out["remaining_committed_items"]]
+    assert "MacBook" in names
+    statuses = {c["status"] for c in out["remaining_committed_items"]}
+    assert "NOT_DUE" in statuses
+
+
+def test_shipped_macbook_declares_its_draft_day() -> None:
+    """NOT_DUE needs a day to compare against."""
+    mb = next(i for i in _shipped()["recurring"]["items"] if "MacBook" in i["name"])
+    assert mb["expected_day"] == 31
+
+
 # ── debt ─────────────────────────────────────────────────────────────
 
 

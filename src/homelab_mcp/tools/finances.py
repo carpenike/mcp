@@ -253,6 +253,27 @@ def _lumpy_monthly(cfg: dict[str, Any]) -> tuple[float, list[dict[str, Any]]]:
     return round(total, 2), detail
 
 
+def _not_yet_due(item: dict[str, Any], first: date, last: date, today: date) -> bool:
+    """Is this obligation's draft day still ahead of us in the current month?
+
+    Absence before the due date is expected; absence after it is news. Without
+    this the MacBook installment — which posts on the last day of the month —
+    reads MISSING for thirty days out of every thirty-one.
+
+    Returns False for a completed month (nothing is still "upcoming" in July
+    once July is over), and False when the item declares no expected_day,
+    because there is then nothing to be early relative to. `grace_days`
+    tolerates a draft that lands a day or two late without immediately
+    escalating to MISSING.
+    """
+    day = item.get("expected_day")
+    if not day or not (first <= today <= last):
+        return False
+    due = first.replace(day=min(int(day), calendar.monthrange(first.year, first.month)[1]))
+    grace = int(item.get("grace_days", 1))
+    return today <= due + timedelta(days=grace)
+
+
 def _match_obligations(
     cfg: dict[str, Any],
     txns: list[dict[str, Any]],
@@ -370,28 +391,47 @@ def _match_obligations(
                 best = {**t, "_amt": amt}
 
         if best is None:
-            # On a monthly-statement account with no activity yet this
-            # month, the charge hasn't been REPORTED — which is not
-            # evidence it wasn't paid. Only say MISSING once the statement
-            # has actually dropped, or the month is over.
+            # Three different things can look like "no charge found", and
+            # calling them all MISSING is what trains a checklist away.
+            #
+            #   NOT_DUE            the month is still running and the day it
+            #                      drafts on has not arrived
+            #   PENDING_STATEMENT  it may well have been paid, but the account
+            #                      only reports on a monthly statement drop
+            #   MISSING            it should have happened by now and did not
+            #
+            # Only the last one is news. The money is treated identically in
+            # all three cases — finances_room counts every un-posted
+            # obligation against remaining_committed — so this changes what
+            # is SAID, never what is owed.
             pending = _awaiting_statement(acct_filter)
+            not_due = _not_yet_due(item, first, last, today)
+            if not_due:
+                status = "NOT_DUE"
+            elif pending:
+                status = "PENDING_STATEMENT"
+            else:
+                status = "MISSING"
+            note = None
+            if not_due:
+                note = (
+                    "Not due yet: this obligation drafts on day "
+                    f"{item.get('expected_day')} and the month is still running. "
+                    "Absence is expected, not a missed payment."
+                )
+            elif pending:
+                note = (
+                    "This account reports on a monthly statement export; "
+                    "nothing has posted yet this cycle. Not evidence of "
+                    "a missed payment."
+                )
             rows.append(
                 {
                     "name": name,
-                    "status": "PENDING_STATEMENT" if pending else "MISSING",
+                    "status": status,
                     "expected_amount": expected,
                     "expected_day": item.get("expected_day"),
-                    **(
-                        {
-                            "note": (
-                                "This account reports on a monthly statement export; "
-                                "nothing has posted yet this cycle. Not evidence of "
-                                "a missed payment."
-                            )
-                        }
-                        if pending
-                        else {}
-                    ),
+                    **({"note": note} if note else {}),
                 }
             )
             continue
@@ -429,7 +469,14 @@ def _match_obligations(
             }
         )
 
-    order = {"MISSING": 0, "CHANGED": 1, "PENDING_STATEMENT": 2, "MATCHED": 3, "ENDED": 4}
+    order = {
+        "MISSING": 0,
+        "CHANGED": 1,
+        "PENDING_STATEMENT": 2,
+        "NOT_DUE": 3,
+        "MATCHED": 4,
+        "ENDED": 5,
+    }
     rows.sort(key=lambda r: (order.get(str(r["status"]), 9), str(r["name"])))
     return rows, claimed
 
@@ -926,8 +973,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "Check this month's expected fixed obligations (mortgage, car loan, "
             "HELOC, utilities, insurance, financed purchases) against what has "
             "actually posted. Returns one row per obligation marked MATCHED, "
-            "CHANGED (posted, but outside the tolerance band), MISSING (nothing "
-            "posted yet), or ENDED (past its final month). Use for late-fee "
+            "CHANGED (posted, but outside the tolerance band), NOT_DUE (its "
+            "draft day has not arrived yet — expected, not news), "
+            "PENDING_STATEMENT (the account only reports on a monthly "
+            "statement drop, so absence proves nothing), MISSING (it should "
+            "have posted by now and did not — the only one worth raising), or "
+            "ENDED (past its final month). Use for late-fee "
             "prevention in the weekly pulse and to catch silent price rises. "
             "The expected list is operator-maintained config, not inferred from "
             "history. Also returns genuinely new payees whose month-to-date "
@@ -962,7 +1013,14 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         default_pct = float(rec_cfg.get("default_tolerance_pct", 10.0))
         in_progress = first <= date.today() <= last
 
-        order = {"MISSING": 0, "CHANGED": 1, "PENDING_STATEMENT": 2, "MATCHED": 3, "ENDED": 4}
+        order = {
+            "MISSING": 0,
+            "CHANGED": 1,
+            "PENDING_STATEMENT": 2,
+            "NOT_DUE": 3,
+            "MATCHED": 4,
+            "ENDED": 5,
+        }
         rows.sort(key=lambda r: (order.get(str(r["status"]), 9), str(r["name"])))
         counts: dict[str, int] = defaultdict(int)
         for r in rows:
@@ -2141,7 +2199,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 continue
             expected = float(row.get("expected_amount") or 0.0)
             fixed_expected_total += expected
-            if row["status"] in ("MISSING", "PENDING_STATEMENT"):
+            if row["status"] in ("MISSING", "PENDING_STATEMENT", "NOT_DUE"):
                 committed.append(
                     {
                         "name": row["name"],
