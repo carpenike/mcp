@@ -123,17 +123,28 @@ Match on the TENDER, not the receipt total. A receipt paid with two cards
 produces two bank charges, neither equal to the total. `tender_count` above 1
 says that happened.
 
-`exact` means the card last-4 was verified; every Costco receipt carries a
-card, so `exact` is the normal result here rather than a lucky one — which is
-the opposite of the Amazon side. `probable` means the amount and date fit but
-no card could be checked.
+FOR ITEM PRICE HISTORY, search by DESCRIPTION and read `unit_price`, not
+`amount`. Costco renumbers its own items over time — the same product carries
+different `item_number`s across years — so an item-number query silently
+truncates at the renumbering. On weighed goods `quantity` is 1 and the weight
+is implicit: `amount / unit_price`. `unit_price` is the per-pound series.
+
+`probable` IS THE CEILING HERE, and that is correct rather than a limitation.
+Every Costco receipt does carry a card, but the household's card map holds one
+card per ledger account while the real data holds ten distinct card last-4s for
+one member and five for another — the Costco Visa is reissued over the years,
+and wallet, rebate, shop-card and cash tenders appear beside it. A configured
+expected card that matches no candidate is evidence AGAINST every candidate, so
+populating that map would downgrade most Costco matches to `ambiguous`. Do not
+read `probable` here as weak: it means the amount and date matched exactly.
 
 RETURNS ARE NOT REPRESENTED. Every receipt observed is a sale. A refund on
 the ledger (a positive amount) gets `refund_unsupported` rather than being
 matched to a same-amount purchase, which would be a confident lie.
 
-Costco only publishes about two years of history, so older charges are
-`outside_coverage` permanently, not temporarily.
+Costco retains about three years (measured), so charges older than that are
+`outside_coverage` permanently rather than temporarily — no backfill will
+recover them.
 
 These tools describe purchases. They never categorize — pair them with
 finances_categorize, which is the tool that decides.
