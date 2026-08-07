@@ -324,6 +324,14 @@ def _match_obligations(
         win_lo, win_hi = win_start.isoformat(), win_end.isoformat()
         needles = [str(s).lower() for s in (item.get("match_any") or [])]
         acct_filter = [str(s).lower() for s in (item.get("accounts") or [])]
+        # Floor below which a charge cannot BE this obligation, however well
+        # its payee matches. "Closest to expected" picks the least-wrong
+        # candidate, but when every candidate is wrong it still picks one: a
+        # $6.35 apple.com charge was reported as the $200.33 MacBook
+        # installment "CHANGED", which reads as a repricing that never
+        # happened. A wrong number is worse than an absent one.
+        raw_floor = item.get("min_amount")
+        min_amount = float(raw_floor) if raw_floor is not None else None
 
         best: dict[str, Any] | None = None
         for t in candidates:
@@ -344,6 +352,8 @@ def _match_obligations(
                 if t["amount_cents"] >= 0:
                     continue
                 amt = _d(-t["amount_cents"])
+            if min_amount is not None and amt < min_amount:
+                continue
             hay = f"{t.get('payee_name') or ''} {t.get('notes') or ''}".lower()
             # Identify by payee, OR — on an account dedicated to this one
             # obligation — by the amount landing in the tolerance band.
