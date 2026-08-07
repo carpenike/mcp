@@ -684,6 +684,137 @@ async def test_recurring_reports_ended_not_missing_past_end_month(
     assert out["needs_attention"] == []
 
 
+async def test_min_amount_stops_a_small_charge_claiming_a_large_obligation(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """A wrong number is worse than an absent one.
+
+    A $6.35 apple.com charge was reported as the $200.33 MacBook installment
+    "CHANGED" — which reads as a repricing that never happened. "Closest to
+    expected" picks the least-wrong candidate, but when every candidate is
+    wrong it still picks one.
+    """
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="tiny",
+                    date="2026-08-07",
+                    amount_cents=-635,
+                    payee_name="APPLE.COM/BILL",
+                    account_name="Apple Card",
+                )
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "MacBook Pro installment (Apple Card)",
+                "amount": 200.33,
+                "min_amount": 100.0,
+                "match_any": ["apple.com"],
+                "accounts": ["Apple Card"],
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-08")
+    row = out["obligations"][0]
+    assert row["status"] != "CHANGED"
+    assert row.get("actual_amount") is None
+
+
+async def test_min_amount_still_admits_the_real_charge(
+    tmp_path: Any, httpx_mock: HTTPXMock
+) -> None:
+    """The floor must not hide the obligation it is protecting."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="tiny",
+                    date="2026-08-07",
+                    amount_cents=-635,
+                    payee_name="APPLE.COM/BILL",
+                    account_name="Apple Card",
+                ),
+                _txn(
+                    id="real",
+                    date="2026-08-31",
+                    amount_cents=-20_033,
+                    payee_name="APPLE.COM/BILL",
+                    account_name="Apple Card",
+                ),
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "MacBook Pro installment (Apple Card)",
+                "amount": 200.33,
+                "min_amount": 100.0,
+                "match_any": ["apple.com"],
+                "accounts": ["Apple Card"],
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-08")
+    row = out["obligations"][0]
+    assert row["status"] == "MATCHED"
+    assert row["actual_amount"] == 200.33
+
+
+async def test_no_min_amount_keeps_previous_behaviour(tmp_path: Any, httpx_mock: HTTPXMock) -> None:
+    """The floor is opt-in; every other obligation is unaffected."""
+    httpx_mock.add_response(
+        url=re.compile(re.escape(BASE) + r"/transactions.*"),
+        json={
+            "transactions": [
+                _txn(
+                    id="tiny",
+                    date="2026-08-07",
+                    amount_cents=-635,
+                    payee_name="APPLE.COM/BILL",
+                    account_name="Apple Card",
+                )
+            ]
+        },
+    )
+    tools = _rec_tools(
+        tmp_path,
+        [
+            {
+                "name": "MacBook Pro installment (Apple Card)",
+                "amount": 200.33,
+                "match_any": ["apple.com"],
+                "accounts": ["Apple Card"],
+            }
+        ],
+    )
+    out = await tools["finances_recurring"](month="2026-08")
+    assert out["obligations"][0]["actual_amount"] == 6.35
+
+
+def test_shipped_config_floors_the_macbook_installment() -> None:
+    items = _shipped()["recurring"]["items"]
+    mb = next(i for i in items if "MacBook" in i["name"])
+    assert mb["min_amount"] == 100.0
+    assert mb["min_amount"] < mb["amount"]
+
+
+def test_shipped_config_progressive_posts_on_the_fifth() -> None:
+    """Six of eight observed posts are day 5; only May and June were day 4."""
+    items = _shipped()["recurring"]["items"]
+    prog = next(i for i in items if "Progressive" in i["name"])
+    assert prog["expected_day"] == 5
+    assert prog["amount"] == 338.68
+
+
 # ── debt ─────────────────────────────────────────────────────────────
 
 

@@ -339,7 +339,7 @@
       {
         "name": "RV insurance — Progressive",
         "amount": 338.68,
-        "expected_day": 4,
+        "expected_day": 5,
         "match_any": [
           "progressive"
         ],
@@ -352,6 +352,7 @@
       {
         "name": "MacBook Pro installment (Apple Card)",
         "amount": 200.33,
+        "min_amount": 100.0,
         "expected_day": null,
         "match_any": [
           "apple card monthly installment",
