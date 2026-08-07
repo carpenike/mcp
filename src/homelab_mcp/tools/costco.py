@@ -123,11 +123,15 @@ Match on the TENDER, not the receipt total. A receipt paid with two cards
 produces two bank charges, neither equal to the total. `tender_count` above 1
 says that happened.
 
-FOR ITEM PRICE HISTORY, search by DESCRIPTION and read `unit_price`, not
-`amount`. Costco renumbers its own items over time — the same product carries
-different `item_number`s across years — so an item-number query silently
-truncates at the renumbering. On weighed goods `quantity` is 1 and the weight
-is implicit: `amount / unit_price`. `unit_price` is the per-pound series.
+FOR ANY PRICE QUESTION use costco_price_history, not costco_search_items. It
+groups by product (a broad word matches several, and one averaged trend for
+two products is a confident answer to a question nobody asked), reads
+unit_price rather than the line total, keeps a renumbered item as one
+continuous series, and recovers the weight on weighed goods where `quantity`
+is 1 and the pounds are implicit in amount / unit_price.
+
+Never search by item_number for history: Costco renumbers its own products
+over the years, so the series silently truncates at the renumbering.
 
 `probable` IS THE CEILING HERE, and that is correct rather than a limitation.
 Every Costco receipt does carry a card, but the household's card map holds one
@@ -523,9 +527,17 @@ def register(mcp: FastMCP, settings: Settings) -> None:
     )
     async def search_items(
         query: Annotated[str, Field(min_length=2, description="Words to search for.")],
+        since: Annotated[
+            str | None, Field(default=None, description="Earliest receipt date, 'YYYY-MM-DD'.")
+        ] = None,
+        until: Annotated[
+            str | None, Field(default=None, description="Latest receipt date, 'YYYY-MM-DD'.")
+        ] = None,
         limit: Annotated[int, Field(default=25, ge=1, le=MAX_ROWS)] = 25,
     ) -> dict[str, Any]:
         try:
+            start = parse_day(since, field="since") if since else None
+            end = parse_day(until, field="until") if until else None
             # websearch_to_tsquery, and the SAME to_tsvector expression as the
             # GIN index in lading's migration 0004 — a mismatch here does not
             # error, it silently drops to a sequential scan.
@@ -537,16 +549,27 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 " JOIN costco_receipts r USING (account, transaction_barcode)"
                 " WHERE to_tsvector('english', i.description)"
                 "       @@ websearch_to_tsquery('english', $1)"
-                " ORDER BY r.transaction_date DESC, i.position LIMIT $2",
+                "   AND ($2::date IS NULL OR r.transaction_date >= $2)"
+                "   AND ($3::date IS NULL OR r.transaction_date <= $3)"
+                " ORDER BY r.transaction_date DESC, i.position LIMIT $4",
                 query,
+                start,
+                end,
                 limit,
             )
             total = await db.fetchval(
-                "SELECT count(*) FROM costco_items"
-                " WHERE to_tsvector('english', description)"
-                "       @@ websearch_to_tsquery('english', $1)",
+                "SELECT count(*) FROM costco_items i"
+                " JOIN costco_receipts r USING (account, transaction_barcode)"
+                " WHERE to_tsvector('english', i.description)"
+                "       @@ websearch_to_tsquery('english', $1)"
+                "   AND ($2::date IS NULL OR r.transaction_date >= $2)"
+                "   AND ($3::date IS NULL OR r.transaction_date <= $3)",
                 query,
+                start,
+                end,
             )
+        except ToolError as exc:
+            return exc.payload()
         except Exception as exc:  # noqa: BLE001 — mapped to the error contract
             return err(exc)
 
@@ -568,6 +591,139 @@ def register(mcp: FastMCP, settings: Settings) -> None:
 
     @mcp.tool(
         annotations=READ_ONLY,
+        name="costco_price_history",
+        description=(
+            "How the price of something has moved over the years — 'is olive "
+            "oil more expensive than it was?'. Give the words as they appear "
+            "on a receipt. Returns one price series PER DISTINCT PRODUCT "
+            "matched, oldest first, with the per-unit price, and reports when "
+            "Costco renumbered an item mid-series. Use this rather than "
+            "costco_search_items for any price question: it reads unit_price "
+            "(not the line total, which varies with weight), never mixes two "
+            "products into one trend, and says when a series is incomplete."
+        ),
+    )
+    async def price_history(
+        query: Annotated[
+            str, Field(min_length=2, description="Words as they appear on a receipt.")
+        ],
+        since: Annotated[
+            str | None, Field(default=None, description="Earliest receipt date, 'YYYY-MM-DD'.")
+        ] = None,
+        until: Annotated[
+            str | None, Field(default=None, description="Latest receipt date, 'YYYY-MM-DD'.")
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            start = parse_day(since, field="since") if since else None
+            end = parse_day(until, field="until") if until else None
+            rows = await db.fetch(
+                "SELECT i.description, i.item_number, i.quantity, i.amount_cents,"
+                " i.unit_price_cents, i.fuel_quantity,"
+                " r.transaction_date, r.warehouse_name, i.account"
+                " FROM costco_items i"
+                " JOIN costco_receipts r USING (account, transaction_barcode)"
+                " WHERE to_tsvector('english', i.description)"
+                "       @@ websearch_to_tsquery('english', $1)"
+                # A price series is made of prices. Discount lines carry a
+                # negative amount and a zero unit price, and a refund or
+                # correction can go negative too — none of them are what
+                # something cost, and averaging them in would understate the
+                # trend without ever looking wrong.
+                "   AND i.unit_price_cents > 0"
+                "   AND ($2::date IS NULL OR r.transaction_date >= $2)"
+                "   AND ($3::date IS NULL OR r.transaction_date <= $3)"
+                " ORDER BY i.description, r.transaction_date, i.position"
+                " LIMIT $4",
+                query,
+                start,
+                end,
+                MAX_ROWS,
+            )
+        except ToolError as exc:
+            return exc.payload()
+        except Exception as exc:  # noqa: BLE001 — mapped to the error contract
+            return err(exc)
+
+        # Grouped by description on purpose. A query like "chicken" matches
+        # several genuinely different products, and folding them into one
+        # series would produce a confident trend for a thing that does not
+        # exist. Costco's own item_number cannot do the grouping: it CHANGES
+        # for the same product over the years, which is also why a caller must
+        # never search by it.
+        products: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            p = products.setdefault(
+                r["description"],
+                {"description": r["description"], "item_numbers": [], "series": []},
+            )
+            if r["item_number"] and r["item_number"] not in p["item_numbers"]:
+                p["item_numbers"].append(r["item_number"])
+            unit = _d(r["unit_price_cents"])
+            amount = _d(r["amount_cents"])
+            # On weighed goods `quantity` is 1 and the real measure is implicit
+            # in the line: amount / unit_price is the pounds. Reporting it is
+            # the difference between "$23.21" and "5.17 lb at $4.49".
+            units = None
+            if unit and amount is not None and unit > 0:
+                units = round(amount / unit, 3)
+            p["series"].append(
+                {
+                    "date": r["transaction_date"].isoformat(),
+                    "unit_price": unit,
+                    "amount": amount,
+                    "units": units,
+                    "account": r["account"],
+                    "warehouse": r["warehouse_name"],
+                    "item_number": r["item_number"],
+                }
+            )
+
+        out = []
+        for p in products.values():
+            series = p["series"]
+            prices = [x["unit_price"] for x in series if x["unit_price"] is not None]
+            first, last = (prices[0], prices[-1]) if prices else (None, None)
+            change = None
+            if first and last and first > 0:
+                change = {
+                    "absolute": round(last - first, 2),
+                    "percent": round(100.0 * (last - first) / first, 1),
+                }
+            out.append(
+                {
+                    **p,
+                    # More than one item number for one description means
+                    # Costco renumbered it. The series is still continuous —
+                    # this flag exists so nobody reads the change as a
+                    # different product.
+                    "renumbered": len(p["item_numbers"]) > 1,
+                    "observations": len(series),
+                    "first": series[0] if series else None,
+                    "latest": series[-1] if series else None,
+                    "min_unit_price": min(prices) if prices else None,
+                    "max_unit_price": max(prices) if prices else None,
+                    "change": change,
+                }
+            )
+        out.sort(key=lambda x: -x["observations"])
+
+        return await stamped(
+            {
+                "query": query,
+                "products": out,
+                "distinct_products": len(out),
+                "observations": len(rows),
+                # The cap is on LINES, and the series is ordered oldest-first,
+                # so hitting it drops the RECENT end of a trend — the half a
+                # price question is usually about. Said out loud rather than
+                # left for the reader to infer from a count.
+                "truncated": len(rows) >= MAX_ROWS,
+            }
+        )
+
+    @mcp.tool(
+        annotations=READ_ONLY,
         name="costco_list_receipts",
         description=(
             "Recent warehouse receipts, newest first — the shopping trips "
@@ -579,22 +735,30 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         since: Annotated[
             str | None, Field(default=None, description="Earliest date, 'YYYY-MM-DD'.")
         ] = None,
+        until: Annotated[
+            str | None, Field(default=None, description="Latest date, 'YYYY-MM-DD'.")
+        ] = None,
         limit: Annotated[int, Field(default=25, ge=1, le=MAX_ROWS)] = 25,
     ) -> dict[str, Any]:
         try:
             start = parse_day(since, field="since") if since else None
+            end = parse_day(until, field="until") if until else None
             rows = await db.fetch(
                 "SELECT account, transaction_barcode, transaction_date, warehouse_name,"
                 " total_cents, total_item_count, tender_count FROM costco_receipts"
                 " WHERE ($1::date IS NULL OR transaction_date >= $1)"
-                " ORDER BY transaction_date DESC, account LIMIT $2",
+                "   AND ($2::date IS NULL OR transaction_date <= $2)"
+                " ORDER BY transaction_date DESC, account LIMIT $3",
                 start,
+                end,
                 limit,
             )
             total = await db.fetchval(
                 "SELECT count(*) FROM costco_receipts"
-                " WHERE ($1::date IS NULL OR transaction_date >= $1)",
+                " WHERE ($1::date IS NULL OR transaction_date >= $1)"
+                "   AND ($2::date IS NULL OR transaction_date <= $2)",
                 start,
+                end,
             )
         except ToolError as exc:
             return exc.payload()
