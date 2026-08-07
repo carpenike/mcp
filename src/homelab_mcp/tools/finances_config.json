@@ -337,6 +337,19 @@
         "note": "Drafts on the 28th and posts anywhere from the 28th to the 3rd of the following month, so its billing window is anchored on the 28th rather than the calendar month. Under calendar months the observed series (9/30, 10/30, 12/2, 12/30, 1/30, 3/3, 3/31, 4/30, 6/1, 6/30) read as three MISSING months (Nov, Feb, May) with three other months holding two payments — the charge attributed to the month it CLEARED rather than the one it is for. Consecutive anchored windows cannot overlap, so a slipped payment is claimable by exactly one month. Two payee forms: the clean 'USAA Life Insurance' and the raw descriptor 'USAA.COM PAY INT LIFE' + masked account, which lands in the NOTES field; matching spans payee and notes, substring and case-insensitive."
       },
       {
+        "name": "RV insurance — Progressive",
+        "amount": 338.68,
+        "expected_day": 4,
+        "match_any": [
+          "progressive"
+        ],
+        "accounts": [
+          "Apple Card"
+        ],
+        "ends": null,
+        "note": "Progressive Select policy 968303393, verified against the renewal declarations page dated 2026-02-09. CONFIRMED 12-MONTH TERM, 2026-04-04 to 2027-04-04, so 338.68 is locked until April 2027 — the earlier 'provisional, might be a 6-month term' caveat is retired. Covers ONE vehicle: the 2021 Entegra Coach Aspire, VIN 4VZAU1D9XMC089960. Nothing else rides on it. Amount reconciles, per the renewal cover letter's printed payment schedule: 12-month premium and fees are 4,015.85 (4,004.00 premium + 11.85 MAIF recoupment), plus a flat 5.00 installment fee on each of 12 payments = 60.00, for a total term cost of 4,075.85. The payments are NOT uniform — 350.39 on 2026-04-04, then 338.68 for ten months, then 338.66 on 2027-03-04 — so do not expect 338.68 x 12. The expectation is set to 338.68 because that is 10 of the 12; the 338.66 sits 2 cents inside the band, and the odd first payment of each term is absorbed the same way. The CASH number is the right expectation here; the declared premium would read as a permanent CHANGED. Added 2026-08-07 after the RV-as-consumption decision found it absent from both this config and PLAN.md's fixed table, landing in the register categorized Fixed while nothing watched it for repricing. It hid because it charges the Apple Card — worst-covered account, history starts 2026-05-03, monthly statement export — leaving only the 5/4 and 6/4 observations. Standard 10% band for the USAA P&C reason: contractually flat between terms, so any variance is signal. DO NOT move this draft to checking to tidy the floor: one of its five discounts is Automatic Card Payments, and it must stay on a card to keep it. Next reprice is the renewal declarations page ~Feb 2027, effective 2027-04-04."
+      },
+      {
         "name": "MacBook Pro installment (Apple Card)",
         "amount": 200.33,
         "expected_day": null,
