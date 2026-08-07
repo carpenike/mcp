@@ -353,7 +353,7 @@
         "name": "MacBook Pro installment (Apple Card)",
         "amount": 200.33,
         "min_amount": 100.0,
-        "expected_day": null,
+        "expected_day": 31,
         "match_any": [
           "apple card monthly installment",
           "installment",
