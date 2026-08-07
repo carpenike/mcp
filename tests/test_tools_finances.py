@@ -927,6 +927,60 @@ def test_shipped_macbook_declares_its_draft_day() -> None:
     assert mb["expected_day"] == 31
 
 
+def test_shipped_noisy_obligations_declare_a_draft_day() -> None:
+    """Without a day, NOT_DUE cannot fire and these read MISSING all month.
+
+    Days derived 2026-08-08 from register history using each item's OWN
+    match_any needles — a looser search conflates payees (an `energy`
+    substring pulls in unrelated merchants and puts FirstEnergy's apparent
+    spread at 3-31 rather than its true 8-20).
+    """
+    items = {i["name"]: i for i in _shipped()["recurring"]["items"]}
+    for name, day in (
+        ("Phones — T-Mobile", 16),
+        ("Phone/watch — Verizon", 23),
+        ("Internet — Starlink", 11),
+        ("Electric — FirstEnergy", 14),
+    ):
+        assert items[name]["expected_day"] == day, name
+        # A grace window sized to that obligation's observed tail.
+        assert items[name]["grace_days"] >= 1, name
+
+
+def test_firstenergy_grace_covers_its_observed_spread() -> None:
+    """Observed days run 8-20; day 14 + 7 holds NOT_DUE through the 21st."""
+    fe = next(i for i in _shipped()["recurring"]["items"] if "FirstEnergy" in i["name"])
+    assert fe["expected_day"] + fe["grace_days"] >= 20
+
+
+def test_variable_day_obligations_do_not_narrow_their_match_window() -> None:
+    """grace_days, never window_slip_days, for a bill that drifts within a month.
+
+    window_slip_days re-anchors the billing window to [day-before, day+after],
+    which NARROWS matching from the full calendar month — a future bill outside
+    the anchor would stop matching entirely. grace_days changes only when
+    absence becomes news.
+    """
+    items = {i["name"]: i for i in _shipped()["recurring"]["items"]}
+    for name in (
+        "Phones — T-Mobile",
+        "Phone/watch — Verizon",
+        "Internet — Starlink",
+        "Electric — FirstEnergy",
+    ):
+        assert "window_slip_days" not in items[name], name
+
+
+def test_apple_card_note_is_not_stale() -> None:
+    """The OFX backfill retired the 'only two observations' caveat."""
+    prog = next(i for i in _shipped()["recurring"]["items"] if "Progressive" in i["name"])
+    note = prog["note"]
+    assert "2025-01-02" in note
+    # The old claim must survive only as history, never as a present-tense fact.
+    assert "at the time was the worst-covered" in note
+    assert "no longer true" in note
+
+
 # ── debt ─────────────────────────────────────────────────────────────
 
 
