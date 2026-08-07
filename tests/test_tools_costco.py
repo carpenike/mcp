@@ -163,6 +163,7 @@ class TestRegistration:
             "costco_get_receipt",
             "costco_search_items",
             "costco_list_receipts",
+            "costco_price_history",
         }
 
 
@@ -452,3 +453,147 @@ class TestSyncStatus:
         out = await tools["costco_get_sync_status"]()
         assert out["stale"] is True
         assert out["data_as_of"] is None
+
+
+def price_row(
+    *,
+    description: str = "PORK BELLY",
+    item_number: str = "10299",
+    day: date | None = None,
+    unit_cents: int = 349,
+    amount_cents: int = 3049,
+    account: str = "ryan",
+) -> dict[str, Any]:
+    """One priced line, shaped as the price_history query selects it."""
+    return {
+        "description": description,
+        "item_number": item_number,
+        "quantity": 1,
+        "amount_cents": amount_cents,
+        "unit_price_cents": unit_cents,
+        "fuel_quantity": None,
+        "transaction_date": day or TODAY,
+        "warehouse_name": "TESTVILLE",
+        "account": account,
+    }
+
+
+class TestPriceHistory:
+    """The question this data actually gets asked.
+
+    Every case here is a way the naive approach (search_items plus arithmetic
+    in the model) gets a confident wrong answer.
+    """
+
+    async def test_two_products_do_not_become_one_trend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broad query matches several products; averaging them is nonsense."""
+        reader = FakeReader(
+            items=[
+                price_row(description="CHICKEN THIGH", unit_cents=299, day=date(2024, 1, 1)),
+                price_row(description="CHICKEN THIGH", unit_cents=399, day=date(2026, 1, 1)),
+                price_row(description="CHICKEN STOCK", unit_cents=999, day=date(2024, 1, 1)),
+            ]
+        )
+        tools = build(monkeypatch, reader)
+        out = await tools["costco_price_history"](query="chicken")
+        assert out["distinct_products"] == 2
+        by = {p["description"]: p for p in out["products"]}
+        assert by["CHICKEN THIGH"]["observations"] == 2
+        assert by["CHICKEN STOCK"]["observations"] == 1
+
+    async def test_change_is_computed_from_unit_price(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reader = FakeReader(
+            items=[
+                price_row(unit_cents=349, day=date(2023, 10, 23)),
+                price_row(unit_cents=449, day=date(2025, 9, 19)),
+            ]
+        )
+        tools = build(monkeypatch, reader)
+        out = await tools["costco_price_history"](query="pork belly")
+        p = out["products"][0]
+        assert p["first"]["unit_price"] == 3.49
+        assert p["latest"]["unit_price"] == 4.49
+        assert p["change"] == {"absolute": 1.0, "percent": 28.7}
+
+    async def test_series_is_oldest_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A trend reads left to right; newest-first would invert the sign."""
+        reader = FakeReader(
+            items=[
+                price_row(unit_cents=349, day=date(2023, 10, 23)),
+                price_row(unit_cents=449, day=date(2025, 9, 19)),
+            ]
+        )
+        tools = build(monkeypatch, reader)
+        out = await tools["costco_price_history"](query="pork belly")
+        dates = [x["date"] for x in out["products"][0]["series"]]
+        assert dates == sorted(dates)
+
+    async def test_a_renumbered_item_is_flagged_not_split(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Costco renumbers products; the series must stay continuous."""
+        reader = FakeReader(
+            items=[
+                price_row(item_number="10299", unit_cents=349, day=date(2024, 2, 9)),
+                price_row(item_number="18316", unit_cents=449, day=date(2025, 2, 2)),
+            ]
+        )
+        tools = build(monkeypatch, reader)
+        p = (await tools["costco_price_history"](query="pork belly"))["products"][0]
+        assert p["renumbered"] is True
+        assert sorted(p["item_numbers"]) == ["10299", "18316"]
+        assert p["observations"] == 2
+
+    async def test_weight_is_recovered_for_weighed_goods(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`quantity` is 1 on weighed items; the pounds are amount/unit_price."""
+        reader = FakeReader(items=[price_row(unit_cents=449, amount_cents=2321)])
+        tools = build(monkeypatch, reader)
+        p = (await tools["costco_price_history"](query="pork belly"))["products"][0]
+        assert p["series"][0]["units"] == 5.169
+        assert p["series"][0]["unit_price"] == 4.49
+
+    async def test_both_accounts_feed_one_series(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two memberships, one household, one price history."""
+        reader = FakeReader(
+            items=[
+                price_row(day=date(2024, 1, 1), account="ryan"),
+                price_row(day=date(2025, 1, 1), account="steffi"),
+            ]
+        )
+        tools = build(monkeypatch, reader)
+        p = (await tools["costco_price_history"](query="pork belly"))["products"][0]
+        assert {x["account"] for x in p["series"]} == {"ryan", "steffi"}
+
+    async def test_a_bad_date_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        tools = build(monkeypatch, FakeReader())
+        out = await tools["costco_price_history"](query="pork belly", since="10/23/2023")
+        assert out["error"]["code"] == "bad_date"
+
+    async def test_no_matches_is_empty_not_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        tools = build(monkeypatch, FakeReader(items=[]))
+        out = await tools["costco_price_history"](query="unobtainium")
+        assert out["products"] == []
+        assert out["distinct_products"] == 0
+        assert out["truncated"] is False
+
+
+class TestSearchDateFilters:
+    async def test_search_accepts_a_date_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reader = FakeReader(items=[], count=0)
+        tools = build(monkeypatch, reader)
+        out = await tools["costco_search_items"](
+            query="olive oil", since="2024-01-01", until="2025-01-01"
+        )
+        assert out["returned"] == 0
+        assert any("transaction_date >=" in q for q in reader.queries)
+
+    async def test_search_rejects_a_bad_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        tools = build(monkeypatch, FakeReader())
+        out = await tools["costco_search_items"](query="olive oil", since="not-a-date")
+        assert out["error"]["code"] == "bad_date"
