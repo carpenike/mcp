@@ -527,9 +527,20 @@ class Settings(BaseSettings):
         ge=0,
         le=86400,
         description=(
-            "How long the checkout is served before the next access triggers a "
-            "`git pull`. A pull failure never fails the read: the cached copy "
-            "is served with an explicit staleness warning instead."
+            "How long the checkout is served before the next access refreshes "
+            "it from the remote. A refresh failure never fails the read: the "
+            "cached copy is served with an explicit staleness warning instead."
+        ),
+    )
+    finances_repo_min_refresh_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=3600,
+        description=(
+            "Floor under the refresh rate for the finances checkout, which the "
+            "append tools' forced refresh does NOT lift. A scheduled sweep "
+            "reads several docs in a burst; without this it pays a fetch per "
+            "read. Set to 0 only in tests that need a refresh per call."
         ),
     )
 

@@ -367,9 +367,24 @@ plan gives advice the household has already considered and rejected.
   restricted scope with no entry is denied, fail-closed. Before this the
   middleware ignored `resources/*` entirely and any authenticated token could
   have read every document.
-- **A failed `git pull` never becomes an error.** The cached copy is served
+- **A failed refresh never becomes an error.** The cached copy is served
   with a leading `> **STALE:**` warning (and `stale: true` from the tool), so
   the caller can say so rather than quoting a possibly-outdated figure.
+- **One checkout, one lock, and a floor under the refresh rate.** Every git
+  command for the checkout — refreshes and appends alike — runs under a single
+  in-process lock, so concurrent readers wait for the in-flight refresh instead
+  of starting their own in the same working tree. Refreshing is
+  `fetch` + `reset --hard origin/<branch>` rather than a bare `git pull`: a
+  pull picks its merge target out of `.git/FETCH_HEAD`, which git rewrites
+  wholesale on every fetch and does not lock, and two of them racing is what
+  produced intermittent "Cannot fast-forward to multiple branches" and "no such
+  ref was fetched" during scheduled sweeps. `reset` reads the remote-tracking
+  ref instead, which git updates atomically. Discarding local state is safe by
+  construction: the checkout is a mirror plus, briefly, an append's own commit,
+  which already rolls back when its push fails.
+  `HOMELAB_MCP_FINANCES_REPO_MIN_REFRESH_SECONDS` (default 60) then caps how
+  often a refresh can happen at all — the append tools' forced refresh
+  included — so a sweep that reads ten docs pays for one fetch, not ten.
 - **Append-only, one shape per file.** There is no doc-editing tool and no
   path that writes PLAN.md: restructuring a governance document is
   session-with-git work where a human sees the diff.

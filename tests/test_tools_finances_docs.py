@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
@@ -18,6 +20,7 @@ from typing import Any
 import pytest
 
 from homelab_mcp.config import Settings
+from homelab_mcp.tools import finances_docs
 from homelab_mcp.tools.finances_docs import DOCS, Repo, parse_ticklers, register
 
 DECISIONS = """# Decision Log
@@ -98,6 +101,27 @@ def repo_pair(tmp_path: Path) -> tuple[Path, Path]:
     return remote, tmp_path / "checkout"
 
 
+def _upstream_edit(remote: Path, name: str, text: str) -> str:
+    """Commit a change to a doc from outside, the way a human edit arrives.
+
+    The checkout under test is a mirror — a refresh resets it — so a test that
+    needs new content must put that content on the remote, not in the clone.
+    Returns the new upstream commit's full sha.
+    """
+    work = remote.parent / "seed"
+    (work / name).write_text(text)
+    _git("add", name, cwd=work)
+    _git("commit", "-qm", f"upstream edit: {name}", cwd=work)
+    _git("push", "-q", "origin", "main", cwd=work)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=work,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 class CapturingMCP:
     def __init__(self) -> None:
         self.tools: dict[str, Callable[..., Any]] = {}
@@ -118,7 +142,12 @@ class CapturingMCP:
         return deco
 
 
-def _mk(repo_pair: tuple[Path, Path]) -> CapturingMCP:
+def _mk(repo_pair: tuple[Path, Path], min_refresh: int = 0) -> CapturingMCP:
+    """Register the tools against the fixture pair.
+
+    Both caches are off by default so each call exercises a real refresh. The
+    rate limit gets its own tests, which pass a floor explicitly.
+    """
     remote, checkout = repo_pair
     mcp = CapturingMCP()
     register(
@@ -129,6 +158,7 @@ def _mk(repo_pair: tuple[Path, Path]) -> CapturingMCP:
             finances_repo_url=str(remote),
             finances_repo_path=str(checkout),
             finances_repo_ttl_seconds=0,
+            finances_repo_min_refresh_seconds=min_refresh,
         ),
     )
     return mcp
@@ -363,6 +393,199 @@ def test_token_never_appears_in_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert seen, "expected a git invocation"
 
 
+# ── concurrency ───────────────────────────────────────────────────────
+#
+# Two errors were seen on 2026-08-09 during scheduled-run bursts and never on
+# a single manual read: "Cannot fast-forward to multiple branches", then "no
+# such ref was fetched" on the re-run. Both are what a `git pull` produces
+# when a second pull rewrites `.git/FETCH_HEAD` underneath it — one checkout,
+# several reads, each running its own pull. These tests pin the three things
+# that make that impossible: git runs one command at a time per checkout, an
+# append holds the lock across its whole read-modify-commit, and the refresh
+# no longer consults FETCH_HEAD at all.
+
+
+def _git_verb(argv: list[str]) -> str:
+    """The subcommand in one of our argv lists, past any leading `-c` pairs."""
+    args = list(argv[1:])
+    while args[:1] == ["-c"]:
+        args = args[2:]
+    return args[0] if args else ""
+
+
+class GitSpy:
+    """Counts the tools' own git invocations and how many run at once.
+
+    Hooks `subprocess.run` rather than `Repo._run`, so what it measures is the
+    span *inside* the lock — the whole question being whether two git
+    processes can ever be alive in one checkout at the same time. Git calls
+    made by this file's own helpers carry no `GIT_CONFIG_GLOBAL` and pass
+    straight through.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        delay_on: str = "",
+        delay: float = 0.0,
+    ) -> None:
+        self.verbs: list[str] = []
+        self.peak = 0
+        self._live = 0
+        self._guard = threading.Lock()
+        original = subprocess.run
+
+        def wrapper(argv: Any, **kw: Any) -> Any:
+            if "GIT_CONFIG_GLOBAL" not in (kw.get("env") or {}):
+                return original(argv, **kw)
+            verb = _git_verb(argv)
+            with self._guard:
+                self._live += 1
+                self.peak = max(self.peak, self._live)
+                self.verbs.append(verb)
+            try:
+                # Widen the window a competing caller could slip into.
+                if delay and verb == delay_on:
+                    time.sleep(delay)
+                return original(argv, **kw)
+            finally:
+                with self._guard:
+                    self._live -= 1
+
+        monkeypatch.setattr(subprocess, "run", wrapper)
+
+    def count(self, verb: str) -> int:
+        return self.verbs.count(verb)
+
+
+async def test_parallel_reads_never_run_two_git_commands_at_once(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression: a burst of reads used to mean a burst of pulls."""
+    mcp = _mk(repo_pair)  # no rate limit, so every read really refreshes
+    await mcp.tools["finances_docs_get"](name="PLAN.md")  # clone, before the burst
+    spy = GitSpy(monkeypatch, delay_on="fetch", delay=0.05)
+
+    bodies = await asyncio.gather(*(mcp.resources[f"finances://{d}"]() for d in DOCS))
+
+    assert spy.peak == 1, f"{spy.peak} git commands ran concurrently in one checkout"
+    assert spy.count("fetch") >= 1, "expected the reads to refresh at all"
+    # Every reader got real content, and none of them was told it was stale.
+    assert len(bodies) == len(DOCS)
+    assert not [b for b in bodies if b.startswith("> **STALE:**")]
+
+
+async def test_a_sweeps_burst_of_reads_costs_one_refresh(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ten docs read back to back should pay for one refresh, not ten."""
+    spy = GitSpy(monkeypatch)
+    mcp = _mk(repo_pair, min_refresh=60)
+
+    await asyncio.gather(*(mcp.resources[f"finances://{d}"]() for d in DOCS))
+    assert spy.count("clone") == 1
+    assert spy.count("fetch") == 0  # the clone is the refresh; the rest reuse it
+
+    # And `force` does not lift the floor: an append landing inside the window
+    # rides the refresh the sweep already paid for.
+    out = await mcp.tools["finances_tickler_append"](
+        id="floor-check", due="2027-03-01", message="Appended inside the refresh window"
+    )
+    assert out["appended"] is True
+    assert spy.count("fetch") == 0
+
+
+def test_the_refresh_floor_is_a_floor_not_a_ceiling(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rate-limited inside the window; refreshed again once it passes."""
+    remote, checkout = repo_pair
+    repo = Repo(checkout, str(remote), "", 0, min_refresh_seconds=60)
+    spy = GitSpy(monkeypatch)
+
+    repo.refresh()  # clones
+    assert repo.refresh(force=True) is None
+    assert spy.count("fetch") == 0
+
+    class _Clock:
+        def monotonic(self) -> float:
+            return time.monotonic() + 61
+
+    monkeypatch.setattr(finances_docs, "time", _Clock())
+    assert repo.refresh() is None
+    assert spy.count("fetch") == 1
+
+
+async def test_an_append_is_never_reset_away_by_a_concurrent_refresh(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The append writes, commits and pushes without a refresh cutting in.
+
+    A `reset --hard` landing between the file write and the commit would
+    discard the new row and the tool would report an append that never
+    existed. The lock spans the whole sequence, so it cannot.
+    """
+    remote, checkout = repo_pair
+    mcp = _mk(repo_pair)  # no rate limit: the concurrent reads really refresh
+    await mcp.tools["finances_docs_get"](name="PLAN.md")  # clone, before the burst
+    spy = GitSpy(monkeypatch, delay_on="fetch", delay=0.05)
+
+    appended, *_ = await asyncio.gather(
+        mcp.tools["finances_tickler_append"](
+            id="race-check", due="2027-02-01", message="Written under the lock"
+        ),
+        *(mcp.resources[f"finances://{d}"]() for d in DOCS),
+    )
+
+    assert appended["appended"] is True
+    assert spy.peak == 1
+    assert "race-check" in (checkout / "TICKLERS.md").read_text()
+    log = (
+        await asyncio.to_thread(
+            subprocess.run,
+            ["git", "log", "--oneline", "-1", "main"],
+            cwd=remote,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    ).stdout
+    assert "tickler: race-check" in log
+
+
+async def test_refresh_recovers_from_a_garbled_fetch_head(
+    repo_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interleaved pulls left FETCH_HEAD unusable; the refresh must not care.
+
+    `git pull` decides what to merge by reading that file, which is how a
+    raced fetch turned into "Cannot fast-forward to multiple branches".
+    `reset --hard origin/<branch>` reads the remote-tracking ref instead,
+    which git updates atomically, so even this deliberately unusable
+    FETCH_HEAD costs nothing.
+    """
+    remote, checkout = repo_pair
+    mcp = _mk(repo_pair)
+    await mcp.tools["finances_docs_get"](name="PLAN.md")  # clone
+    (checkout / ".git" / "FETCH_HEAD").write_text(
+        f"{'0' * 40}\t\tbranch 'main' of {remote}\n"
+        f"{'1' * 40}\t\tbranch 'other' of {remote}\n"
+        "not a ref at all\n"
+    )
+    sha = _upstream_edit(remote, "PLAN.md", "# PLAN.md\n\nBuffer floor raised to $15k.\n")
+
+    spy = GitSpy(monkeypatch)
+    out = await mcp.tools["finances_docs_get"](name="PLAN.md")
+
+    assert out["stale"] is False
+    assert out["stale_reason"] is None
+    assert "Buffer floor raised to $15k" in out["content"]
+    assert sha.startswith(out["revision"])
+    # The mechanism, not just the outcome: nothing on this path runs `pull`.
+    assert spy.count("pull") == 0
+    assert spy.count("reset") == 1
+
+
 # ── ticklers ──────────────────────────────────────────────────────────
 
 TODAY = date(2026, 8, 3)
@@ -461,8 +684,9 @@ async def test_malformed_surfaces_even_when_due_only(repo_pair: tuple[Path, Path
     remote, checkout = repo_pair
     mcp = _mk(repo_pair)
     await mcp.tools["finances_ticklers"]()  # clone
-    path = checkout / "TICKLERS.md"
-    path.write_text(path.read_text() + "| broken | not-a-date | open | oh no |\n")
+    # Injected upstream, not into the checkout: a refresh resets the working
+    # tree, so a local scribble would not survive to be read back.
+    _upstream_edit(remote, "TICKLERS.md", TICKLERS + "| broken | not-a-date | open | oh no |\n")
     out = await mcp.tools["finances_ticklers"]()
     assert out["ticklers"] == []
     assert len(out["malformed"]) == 1
