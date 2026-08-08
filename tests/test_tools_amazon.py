@@ -817,3 +817,79 @@ async def test_a_fully_drained_order_carries_no_incompleteness_warning(
     assert cand["order"]["items"]
     assert "order_incomplete_reason" not in cand
     assert "hint" not in cand
+
+
+async def test_manual_backfill_is_not_listed_beside_the_scheduled_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed one-off must not read as a broken nightly sync.
+
+    `backfill` only runs when a human starts it, so its newest row is whatever
+    was last done by hand. A backfill that has never succeeded therefore
+    leaves a `failed` row sitting at the top of that source forever. Listed
+    beside three nightly sources with no distinction, it reads as a live
+    alarm — which is exactly how it was read, three days after the fact.
+    """
+    now = datetime.now(UTC)
+    reader = FakeReader(
+        runs=[
+            {
+                "account": "steffi",
+                "source": "orders",
+                "finished_at": now - timedelta(hours=5),
+                "status": "ok",
+                "records_changed": 19,
+                "parsers_pending": 0,
+                "error": None,
+            },
+            {
+                "account": "steffi",
+                "source": "backfill",
+                "finished_at": now - timedelta(days=3),
+                "status": "failed",
+                "records_changed": 0,
+                "parsers_pending": 0,
+                "error": "backfill fetch: AmazonOrdersEntityError",
+            },
+        ]
+    )
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_get_sync_status"]()
+
+    assert [r["source"] for r in out["runs"]] == ["orders"]
+    assert [r["source"] for r in out["manual_runs"]] == ["backfill"]
+
+    # The failure is still reported — it is segregated, not swallowed.
+    entry = out["manual_runs"][0]
+    assert entry["status"] == "failed"
+    assert "not scheduled" in entry["note"]
+
+    # And its age is stated, which is the fact that settles "is this current?".
+    # render_row has already turned finished_at into an ISO string by here, so
+    # a helper that only accepts datetime would return None for every row and
+    # type-check clean. That is the bug this assertion exists to catch.
+    assert entry["age_hours"] is not None
+    assert 71 <= entry["age_hours"] <= 73
+
+
+async def test_a_healthy_store_reports_no_manual_runs_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No manual run ever performed is an empty list, not a missing key."""
+    reader = FakeReader(
+        runs=[
+            {
+                "account": "ryan",
+                "source": "transactions",
+                "finished_at": datetime.now(UTC) - timedelta(hours=2),
+                "status": "ok",
+                "records_changed": 1,
+                "parsers_pending": 0,
+                "error": None,
+            }
+        ]
+    )
+    tools = build(monkeypatch, reader)
+    out = await tools["amazon_get_sync_status"]()
+    assert out["manual_runs"] == []
+    assert len(out["runs"]) == 1

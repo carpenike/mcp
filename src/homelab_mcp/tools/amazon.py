@@ -151,6 +151,37 @@ finances_categorize, which is the tool that decides.
 """.strip()
 
 
+#: Sources that only ever run when a human invokes them. Their newest row is
+#: whatever someone last did by hand, which for a source that has never
+#: succeeded means a failure sits there permanently. Listed beside three
+#: nightly sources with no distinction, that reads as a live alarm — it did,
+#: for three days. `/healthz` in lading already excludes these for the same
+#: reason: a service nobody has backfilled is not unhealthy.
+MANUAL_SOURCES = frozenset({"backfill"})
+
+
+def age_in_hours(finished_at: object) -> float | None:
+    """Hours since a run finished, or None if it never did.
+
+    Takes the ISO string, not the datetime: `render_row` has already been over
+    these rows and converted every timestamp. Accepting only `datetime` here
+    type-checks fine and silently returns None for every row in production —
+    which is precisely the shape of bug that made this function necessary.
+    """
+    if isinstance(finished_at, datetime):
+        moment = finished_at
+    elif isinstance(finished_at, str):
+        try:
+            moment = datetime.fromisoformat(finished_at)
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return round((datetime.now(UTC) - moment).total_seconds() / 3600, 1)
+
+
 def link_order_id(link: str | None) -> str | None:
     """Pull the order id out of an order-details URL.
 
@@ -304,7 +335,12 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             "which calendar months have actually been fetched. CALL THIS "
             "BEFORE telling anyone a charge has no Amazon order behind it — "
             "an empty match and a scraper that broke a week ago are "
-            "indistinguishable otherwise."
+            "indistinguishable otherwise. Judge health by `runs` (the "
+            "scheduled sources) and `coverage`. `manual_runs` is separate and "
+            "is NOT a health signal: those only run when a human starts them, "
+            "so the entry is simply whatever was last done by hand, however "
+            "long ago, and nothing will ever retry or replace it. Do not "
+            "report a stale failure there as a broken sync."
         ),
     )
     async def get_sync_status() -> dict[str, Any]:
@@ -317,12 +353,23 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             )
         except Exception as exc:  # noqa: BLE001 — never raise to the transport
             return err(exc)
+        scheduled = [r for r in fresh["runs"] if r["source"] not in MANUAL_SOURCES]
+        manual = [r for r in fresh["runs"] if r["source"] in MANUAL_SOURCES]
+        for entry in manual:
+            entry["age_hours"] = age_in_hours(entry.get("finished_at"))
+            entry["note"] = (
+                "Manual one-off, not scheduled. This is the last time anyone "
+                "ran it, however long ago — nothing will replace or retry it, "
+                "so a failure here is history, not a live alarm. Judge the "
+                "sync by `runs` and `coverage`."
+            )
         return {
             "data_as_of": fresh["data_as_of"],
             "stale": fresh["stale"],
             "age_hours": fresh["age_hours"],
             "stale_after_hours": settings.amazon_stale_after_hours,
-            "runs": fresh["runs"],
+            "runs": scheduled,
+            "manual_runs": manual,
             "coverage": [row(c) for c in coverage],
         }
 
