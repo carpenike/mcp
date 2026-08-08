@@ -30,6 +30,13 @@ shell=False and a fully-built argv list. Doc names come from a fixed
 allowlist, never from caller input, so no value can select a path. The token
 is passed through the environment to a credential helper — never in argv,
 where `ps` would show it.
+
+One checkout, one lock (2026-08-09): every git command in this module runs
+under a single process-wide lock per Repo, and refreshes are rate-limited.
+A scheduled sweep reads several docs in quick succession; before the lock,
+those reads each ran their own `git pull` in the same working tree and raced
+on `.git/FETCH_HEAD`, producing "Cannot fast-forward to multiple branches"
+and "no such ref was fetched" under load and never on a single manual read.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
@@ -244,21 +252,43 @@ def parse_ticklers(text: str, today: date) -> dict[str, Any]:
 
 
 class Repo:
-    """A local clone kept lazily fresh, with honest staleness reporting."""
+    """A local clone kept lazily fresh, with honest staleness reporting.
 
-    def __init__(self, path: Path, url: str, token: str, ttl_seconds: int) -> None:
+    Every git command runs under `self._lock`. One checkout is one working
+    tree, one index and one FETCH_HEAD, none of which git guards against
+    concurrent use by separate processes; two `git pull`s in the same
+    directory corrupt each other's fetch state rather than queueing. The lock
+    is re-entrant so a compound operation (refresh, append) can hold it across
+    several commands without deadlocking on the per-command acquire.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        url: str,
+        token: str,
+        ttl_seconds: int,
+        min_refresh_seconds: int = 60,
+    ) -> None:
         self.path = path
         self.url = url
         self.token = token
         self.ttl = ttl_seconds
+        # A floor under the refresh rate that `force` does NOT lift. A sweep
+        # that reads eight docs and appends a tickler should cost one fetch,
+        # not nine; a minute of staleness is well inside what any consumer of
+        # these documents needs.
+        self.min_refresh = min_refresh_seconds
         self._checked = 0.0
         self._stale_reason: str | None = None
+        self._branch_name: str | None = None
+        self._lock = threading.RLock()
 
     # ── git plumbing ──────────────────────────────────────────────────
     def _run(
         self, *args: str, check: bool = True, timeout: int = 60
     ) -> subprocess.CompletedProcess[str]:
-        """Run one git command. shell=False, argv fully built here."""
+        """Run one git command, serialized against every other. shell=False."""
         # Built from scratch rather than inheriting os.environ, so unrelated
         # secrets in the service's environment never reach a subprocess — but
         # the TLS trust store MUST be carried through. Omitting it made HTTPS
@@ -292,15 +322,30 @@ class Repo:
                 'echo "password=$HOMELAB_MCP_GIT_TOKEN"; }; f',
             ]
         argv += list(args)
-        return subprocess.run(  # noqa: S603 - shell=False, argv built above
-            argv,
-            cwd=str(self.path) if self.path.exists() else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=check,
-            env=env,
-        )
+        with self._lock:
+            return subprocess.run(  # noqa: S603 - shell=False, argv built above
+                argv,
+                cwd=str(self.path) if self.path.exists() else None,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=check,
+                env=env,
+            )
+
+    def _branch(self) -> str:
+        """The checked-out branch, cached. Falls back to 'main'.
+
+        Resolved from the clone rather than hardcoded so a repo whose default
+        branch is not `main` refreshes instead of failing on every fetch.
+        """
+        if self._branch_name is None:
+            name = ""
+            with contextlib.suppress(subprocess.SubprocessError, OSError):
+                name = self._run("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            # Detached HEAD reports the literal string "HEAD".
+            self._branch_name = name if name and name != "HEAD" else "main"
+        return self._branch_name
 
     def _clone(self) -> None:
         """Clone through the SAME credentialed path as every other command.
@@ -310,39 +355,67 @@ class Repo:
         repo.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._branch_name = None  # resolved from whatever the clone checks out
         self._run("clone", "--depth", "50", "--", self.url, str(self.path), timeout=180)
 
     def refresh(self, force: bool = False) -> str | None:
-        """Pull if the cache has expired. Returns a staleness reason, or None.
+        """Refresh if the cache has expired. Returns a staleness reason, or None.
 
-        A pull failure is never an error to the caller: the last-known content
-        is still the best answer available, and refusing to serve it would be
-        worse than serving it labelled. What must never happen is serving it
-        silently as current.
+        Held under the lock end to end, so concurrent callers wait for the
+        in-flight refresh and then see its result rather than starting their
+        own in the same working tree.
+
+        Fetch-then-reset, never a bare `git pull`. A pull resolves what to
+        merge by reading `.git/FETCH_HEAD`, a file git rewrites wholesale on
+        every fetch and does not lock; `reset --hard` reads the
+        remote-tracking ref instead, which git updates atomically, so a
+        FETCH_HEAD left garbled by an earlier crash or race cannot break the
+        next refresh. Discarding local state is safe here by construction:
+        this checkout is a mirror of the remote plus, briefly, an append's own
+        commit — and `commit_and_push` already rolls that back when the push
+        fails, so a reset can only ever drop what the remote already has.
+
+        A refresh failure is never an error to the caller: the last-known
+        content is still the best answer available, and refusing to serve it
+        would be worse than serving it labelled. What must never happen is
+        serving it silently as current.
         """
-        now = time.monotonic()
-        if not force and self._checked and now - self._checked < self.ttl:
+        with self._lock:
+            now = time.monotonic()
+            if self._checked:
+                # `force` lifts the TTL but not the floor.
+                window = self.min_refresh if force else max(self.ttl, self.min_refresh)
+                if now - self._checked < window:
+                    return self._stale_reason
+            try:
+                if not (self.path / ".git").is_dir():
+                    self._clone()
+                else:
+                    branch = self._branch()
+                    # An explicit refspec, so the remote-tracking ref `reset`
+                    # reads is updated whatever the remote's fetch config says.
+                    self._run(
+                        "fetch",
+                        "--quiet",
+                        "origin",
+                        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    )
+                    self._run("reset", "--hard", "--quiet", f"origin/{branch}")
+                self._checked = now
+                self._stale_reason = None
+            except (subprocess.SubprocessError, OSError) as exc:
+                detail = ""
+                if isinstance(exc, subprocess.CalledProcessError):
+                    tail = (exc.stderr or "").strip().splitlines()
+                    detail = tail[-1] if tail else ""
+                self._stale_reason = (
+                    f"Could not refresh the finances checkout ({exc.__class__.__name__}"
+                    f"{': ' + detail if detail else ''}). Serving the last cached copy; "
+                    "it may be out of date."
+                )
+                log.warning("finances repo refresh failed: %s", self._stale_reason)
+                self._checked = now  # don't retry on every single call
             return self._stale_reason
-        try:
-            if not (self.path / ".git").is_dir():
-                self._clone()
-            else:
-                self._run("pull", "--ff-only", "--quiet")
-            self._checked = now
-            self._stale_reason = None
-        except (subprocess.SubprocessError, OSError) as exc:
-            detail = ""
-            if isinstance(exc, subprocess.CalledProcessError):
-                tail = (exc.stderr or "").strip().splitlines()
-                detail = tail[-1] if tail else ""
-            self._stale_reason = (
-                f"Could not refresh the finances checkout ({exc.__class__.__name__}"
-                f"{': ' + detail if detail else ''}). Serving the last cached copy; "
-                "it may be out of date."
-            )
-            log.warning("finances repo refresh failed: %s", self._stale_reason)
-            self._checked = now  # don't retry on every single call
-        return self._stale_reason
 
     def head(self) -> str | None:
         try:
@@ -353,36 +426,67 @@ class Repo:
     # ── reads ─────────────────────────────────────────────────────────
     def read(self, name: str) -> tuple[str, str | None]:
         """(content, staleness_reason). `name` must already be allowlisted."""
-        stale = self.refresh()
-        target = self.path / name
-        if not target.is_file():
-            raise ToolError(
-                "finances_doc_missing",
-                f"{name} is not present in the checkout.",
-                "It may not exist yet upstream, or the clone failed.",
-            )
-        return target.read_text(encoding="utf-8"), stale
+        # Under the lock: a refresh resets the working tree and an append
+        # rewrites a doc in place, so an unguarded read can catch either
+        # mid-flight and return a half-written file.
+        with self._lock:
+            stale = self.refresh()
+            target = self.path / name
+            if not target.is_file():
+                raise ToolError(
+                    "finances_doc_missing",
+                    f"{name} is not present in the checkout.",
+                    "It may not exist yet upstream, or the clone failed.",
+                )
+            return target.read_text(encoding="utf-8"), stale
 
     # ── appends ───────────────────────────────────────────────────────
+    def append(
+        self,
+        name: str,
+        message: str,
+        mutate: Callable[[str], str],
+        stale_hint: str = "",
+    ) -> dict[str, Any]:
+        """Refresh, rewrite one doc, commit and push — all under one lock.
+
+        `mutate` takes the document's current text and returns its replacement;
+        it may raise `ToolError` to abort, in which case nothing is written.
+
+        The whole sequence is atomic against other git work in this checkout.
+        Split apart, a refresh landing between the rewrite and the commit would
+        `reset --hard` the pending edit away, and the tool would report an
+        append that only ever existed in memory.
+        """
+        with self._lock:
+            stale = self.refresh(force=True)
+            if stale:
+                raise ToolError("finances_repo_stale", "Refusing to append: " + stale, stale_hint)
+            path = self.path / name
+            new_text = mutate(path.read_text(encoding="utf-8"))
+            path.write_text(new_text, encoding="utf-8")
+            return self.commit_and_push(name, message)
+
     def commit_and_push(self, name: str, message: str) -> dict[str, Any]:
-        try:
-            self._run("add", "--", name)
-            self._run("commit", "-m", message)
-            self._run("push")
-        except subprocess.CalledProcessError as exc:
-            err = ((exc.stderr or "") + (exc.stdout or "")).strip()
-            # Roll the working tree back so a failed push doesn't leave a
-            # local-only commit that silently diverges from the remote.
-            with contextlib.suppress(subprocess.SubprocessError, OSError):
-                self._run("reset", "--hard", "origin/HEAD", check=False)
-            hint = (
-                "The configured token needs contents:write on the repo. A "
-                "read-only token can serve the docs but cannot append to them."
-                if "denied" in err.lower() or "403" in err or "authentication" in err.lower()
-                else "Check the checkout's remote and network access."
-            )
-            raise ToolError("finances_push_failed", f"git failed: {err[:300]}", hint) from exc
-        return {"head": self.head()}
+        with self._lock:
+            try:
+                self._run("add", "--", name)
+                self._run("commit", "-m", message)
+                self._run("push")
+            except subprocess.CalledProcessError as exc:
+                err = ((exc.stderr or "") + (exc.stdout or "")).strip()
+                # Roll the working tree back so a failed push doesn't leave a
+                # local-only commit that silently diverges from the remote.
+                with contextlib.suppress(subprocess.SubprocessError, OSError):
+                    self._run("reset", "--hard", f"origin/{self._branch()}", check=False)
+                hint = (
+                    "The configured token needs contents:write on the repo. A "
+                    "read-only token can serve the docs but cannot append to them."
+                    if "denied" in err.lower() or "403" in err or "authentication" in err.lower()
+                    else "Check the checkout's remote and network access."
+                )
+                raise ToolError("finances_push_failed", f"git failed: {err[:300]}", hint) from exc
+            return {"head": self.head()}
 
 
 def register(mcp: FastMCP, settings: Settings) -> None:
@@ -392,6 +496,7 @@ def register(mcp: FastMCP, settings: Settings) -> None:
         settings.finances_repo_url,
         settings.finances_repo_token,
         settings.finances_repo_ttl_seconds,
+        settings.finances_repo_min_refresh_seconds,
     )
     configured = bool(settings.finances_repo_path and settings.finances_repo_url)
 
@@ -502,24 +607,22 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                     "phantom decision entry.",
                     "Use '###' or bullets for sub-structure.",
                 )
-            stale = await asyncio.to_thread(repo.refresh, True)
-            if stale:
-                raise ToolError(
-                    "finances_repo_stale",
-                    "Refusing to append: " + stale,
-                    "Appending onto a stale checkout risks a push conflict or a "
-                    "lost entry. Resolve the checkout first.",
-                )
             entry = f"## {date.today().isoformat()} — {clean_title}\n\n{clean_body}\n"
-            path = repo.path / DECISIONS_DOC
-            text = path.read_text(encoding="utf-8")
-            # Newest-first: insert before the first existing entry, after the
-            # file's header prose.
-            match = re.search(r"^## ", text, flags=re.M)
-            cut = match.start() if match else len(text)
-            path.write_text(text[:cut] + entry + "\n" + text[cut:], encoding="utf-8")
+
+            def _mutate(text: str) -> str:
+                # Newest-first: insert before the first existing entry, after
+                # the file's header prose.
+                match = re.search(r"^## ", text, flags=re.M)
+                cut = match.start() if match else len(text)
+                return text[:cut] + entry + "\n" + text[cut:]
+
             result = await asyncio.to_thread(
-                repo.commit_and_push, DECISIONS_DOC, f"decision: {clean_title}"
+                repo.append,
+                DECISIONS_DOC,
+                f"decision: {clean_title}",
+                _mutate,
+                "Appending onto a stale checkout risks a push conflict or a "
+                "lost entry. Resolve the checkout first.",
             )
         except ToolError as err:
             return err.payload()
@@ -625,50 +728,46 @@ def register(mcp: FastMCP, settings: Settings) -> None:
             if not clean_message:
                 raise ToolError("finances_bad_tickler", "message must not be empty.", "")
 
-            stale = await asyncio.to_thread(repo.refresh, True)
-            if stale:
-                raise ToolError(
-                    "finances_repo_stale",
-                    "Refusing to append: " + stale,
-                    "Appending onto a stale checkout risks a push conflict or a "
-                    "lost reminder. Resolve the checkout first.",
-                )
-
-            path = repo.path / TICKLERS_DOC
-            text = path.read_text(encoding="utf-8")
-            existing = parse_ticklers(text, household_today())
-            if any(r["id"] == tid for r in existing["ticklers"]):
-                raise ToolError(
-                    "finances_duplicate_tickler",
-                    f"A tickler with id {tid!r} already exists.",
-                    "Pick another id, or edit the existing row directly to reschedule it.",
-                )
-
-            lines = text.splitlines()
-            try:
-                header = next(
-                    i
-                    for i, ln in enumerate(lines)
-                    if ln.startswith("|")
-                    and [c.lower() for c in _split_row(ln)[:2]] == ["id", "due"]
-                )
-            except StopIteration as exc:
-                raise ToolError(
-                    "finances_table_not_found",
-                    "Could not find the tickler table in TICKLERS.md.",
-                    "Its header row must be '| id | due | status | message |'.",
-                ) from exc
-            end = header + 1
-            while end + 1 < len(lines) and lines[end + 1].startswith("|"):
-                end += 1
             # A literal pipe would split the cell and corrupt the table — the
             # parser would then report this very row as malformed.
             safe_message = clean_message.replace("|", r"\|")
             row = f"| {tid} | {due_date.isoformat()} | open | {safe_message} |"
-            lines.insert(end + 1, row)
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            def _mutate(text: str) -> str:
+                existing = parse_ticklers(text, household_today())
+                if any(r["id"] == tid for r in existing["ticklers"]):
+                    raise ToolError(
+                        "finances_duplicate_tickler",
+                        f"A tickler with id {tid!r} already exists.",
+                        "Pick another id, or edit the existing row directly to reschedule it.",
+                    )
+                lines = text.splitlines()
+                try:
+                    header = next(
+                        i
+                        for i, ln in enumerate(lines)
+                        if ln.startswith("|")
+                        and [c.lower() for c in _split_row(ln)[:2]] == ["id", "due"]
+                    )
+                except StopIteration as exc:
+                    raise ToolError(
+                        "finances_table_not_found",
+                        "Could not find the tickler table in TICKLERS.md.",
+                        "Its header row must be '| id | due | status | message |'.",
+                    ) from exc
+                end = header + 1
+                while end + 1 < len(lines) and lines[end + 1].startswith("|"):
+                    end += 1
+                lines.insert(end + 1, row)
+                return "\n".join(lines) + "\n"
+
             result = await asyncio.to_thread(
-                repo.commit_and_push, TICKLERS_DOC, f"tickler: {tid} ({due_date.isoformat()})"
+                repo.append,
+                TICKLERS_DOC,
+                f"tickler: {tid} ({due_date.isoformat()})",
+                _mutate,
+                "Appending onto a stale checkout risks a push conflict or a "
+                "lost reminder. Resolve the checkout first.",
             )
         except ToolError as err:
             return err.payload()
@@ -727,31 +826,29 @@ def register(mcp: FastMCP, settings: Settings) -> None:
                 if lane_up == "MAINTENANCE"
                 else ("needs estimate" if not safe[2] or "tbd" in safe[2].lower() else "queued")
             )
-            stale = await asyncio.to_thread(repo.refresh, True)
-            if stale:
-                raise ToolError("finances_repo_stale", "Refusing to append: " + stale, "")
-
-            path = repo.path / PLANNED_DOC
-            lines = path.read_text(encoding="utf-8").splitlines()
-            # Find the queue table's last contiguous row.
-            try:
-                header = next(
-                    i for i, ln in enumerate(lines) if ln.startswith("| Item") and "Lane" in ln
-                )
-            except StopIteration as exc:
-                raise ToolError(
-                    "finances_table_not_found",
-                    "Could not find the queue table in PLANNED.md.",
-                    "Its header row must start '| Item' and contain 'Lane'.",
-                ) from exc
-            end = header + 1
-            while end + 1 < len(lines) and lines[end + 1].startswith("|"):
-                end += 1
             row = "| " + " | ".join([*safe, status]) + " |"
-            lines.insert(end + 1, row)
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            def _mutate(text: str) -> str:
+                lines = text.splitlines()
+                # Find the queue table's last contiguous row.
+                try:
+                    header = next(
+                        i for i, ln in enumerate(lines) if ln.startswith("| Item") and "Lane" in ln
+                    )
+                except StopIteration as exc:
+                    raise ToolError(
+                        "finances_table_not_found",
+                        "Could not find the queue table in PLANNED.md.",
+                        "Its header row must start '| Item' and contain 'Lane'.",
+                    ) from exc
+                end = header + 1
+                while end + 1 < len(lines) and lines[end + 1].startswith("|"):
+                    end += 1
+                lines.insert(end + 1, row)
+                return "\n".join(lines) + "\n"
+
             result = await asyncio.to_thread(
-                repo.commit_and_push, PLANNED_DOC, f"planned: {safe[0]}"
+                repo.append, PLANNED_DOC, f"planned: {safe[0]}", _mutate
             )
         except ToolError as err:
             return err.payload()
